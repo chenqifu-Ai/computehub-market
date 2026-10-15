@@ -400,11 +400,31 @@ function handleLogout(req, res) {
 
 async function handleUserUpdate(req, res, u) {
   const b = await readJson(req) || {};
-  if (b.password && String(b.password).length >= 6) {
-    await store.setPassword(db, u.id, String(b.password));
+  let changed = [];
+
+  // 改密码：必须验证旧密码
+  if (b.password !== undefined && String(b.password) !== '') {
+    const np = String(b.password);
+    if (np.length < 6) return json(res, 400, { success: false, message: '新密码至少 6 位' });
+    const oldpw = String(b.old_password || '');
+    if (!oldpw) return json(res, 400, { success: false, message: '请输入当前密码' });
+    if (!(await store.verifyPassword(oldpw, u.salt, u.pass_hash)))
+      return json(res, 403, { success: false, message: '当前密码不正确' });
+    await store.setPassword(db, u.id, np);
+    changed.push('密码');
   }
-  if (b.display_name) store.setDisplayName(db, u.id, String(b.display_name).slice(0, 32));
-  return json(res, 200, { success: true, message: '已更新' });
+
+  // 改昵称
+  if (b.display_name !== undefined) {
+    const dn = String(b.display_name).trim().slice(0, 32);
+    if (!dn) return json(res, 400, { success: false, message: '昵称不能为空' });
+    store.setDisplayName(db, u.id, dn);
+    changed.push('昵称');
+  }
+
+  if (!changed.length) return json(res, 400, { success: false, message: '没有要修改的内容' });
+  console.log(`[user] ${u.username} 修改了 ${changed.join('、')}`);
+  return json(res, 200, { success: true, message: '已更新 ' + changed.join('、'), data: store.publicUser(db, store.getUserById(db, u.id)) });
 }
 
 async function handleTokenCreate(req, res, u) {

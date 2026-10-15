@@ -47,6 +47,7 @@
       <a data-page="logs">📜 使用日志</a>
       <a data-page="topup">💰 充值兑换</a>
       <a data-page="invite">🎁 邀请返利</a>
+      <a data-page="profile">👤 个人设置</a>
       <a data-page="channels" class="admin-only">🔌 渠道管理</a>
       <a data-page="users" class="admin-only">👥 用户管理</a>
       <a data-page="settings" class="admin-only">⚙️ 系统设置</a>
@@ -263,6 +264,39 @@
       <div class="panel">
         <h3>📊 全站统计</h3>
         <div class="mini-row" id="sysStats"></div>
+      </div>
+    </section>
+
+    <!-- 个人设置 -->
+    <section class="page hidden" id="page-profile">
+      <div class="grid2">
+        <div class="panel">
+          <h3>👤 账号信息</h3>
+          <div class="kv">
+            <div><span>用户名</span><b id="pfUser">—</b></div>
+            <div><span>用户 ID</span><b id="pfId">—</b></div>
+            <div><span>角色</span><b id="pfRole">—</b></div>
+            <div><span>分组</span><b id="pfGroup">—</b></div>
+            <div><span>邀请码</span><b id="pfAff" class="mono">—</b></div>
+            <div><span>注册时间</span><b id="pfCreated">—</b></div>
+          </div>
+          <label>昵称 / 显示名</label>
+          <input id="pfName" placeholder="用于界面展示">
+          <button class="btn-primary" id="btnSaveName" style="margin-top:14px">保存昵称</button>
+        </div>
+
+        <div class="panel">
+          <h3>🔒 修改密码</h3>
+          <p class="muted">修改后当前会话立即失效，请用新密码重新登录。</p>
+          <label>当前密码</label>
+          <input id="pwOld" type="password" placeholder="请输入当前密码" autocomplete="current-password">
+          <label>新密码（至少 6 位）</label>
+          <input id="pwNew" type="password" placeholder="请输入新密码" autocomplete="new-password">
+          <label>确认新密码</label>
+          <input id="pwNew2" type="password" placeholder="再次输入新密码" autocomplete="new-password">
+          <div id="pwMsg" class="auth-msg"></div>
+          <button class="btn-primary" id="btnChangePw">修改密码</button>
+        </div>
       </div>
     </section>
 

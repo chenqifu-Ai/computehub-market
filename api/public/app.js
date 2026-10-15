@@ -145,8 +145,8 @@ async function loadAnnounce() {
 // ---------- 导航 ----------
 const TITLES = {
   dashboard: '仪表盘', tokens: '令牌管理', models: '模型目录', logs: '使用日志',
-  topup: '充值兑换', invite: '邀请返利', channels: '渠道管理', users: '用户管理',
-  settings: '系统设置', docs: '接入文档',
+  topup: '充值兑换', invite: '邀请返利', profile: '个人设置', channels: '渠道管理',
+  users: '用户管理', settings: '系统设置', docs: '接入文档',
 };
 document.querySelectorAll('.side-nav a').forEach(a => { a.onclick = () => goto(a.dataset.page); });
 function goto(page) {
@@ -155,8 +155,8 @@ function goto(page) {
   $('pageTitle').textContent = TITLES[page] || page;
   const fn = {
     dashboard: loadDashboard, tokens: loadTokens, models: loadModels, logs: () => loadLogs(1),
-    topup: loadTopup, invite: loadInvite, channels: loadChannels, users: loadUsers,
-    settings: loadSettings, docs: () => {},
+    topup: loadTopup, invite: loadInvite, profile: loadProfile, channels: loadChannels,
+    users: loadUsers, settings: loadSettings, docs: () => {},
   }[page];
   if (fn) fn();
 }
@@ -622,6 +622,55 @@ $('btnSaveSettings').onclick = async () => {
   $('sideSite').textContent = b.site_name || '算力商城';
   document.title = b.site_name || '算力商城';
   loadAnnounce();
+};
+
+// ---------- 个人设置 ----------
+async function loadProfile() {
+  const j = await api('/api/user/self');
+  if (!j.success) return;
+  ME = j.data;
+  $('pfUser').textContent = ME.username;
+  $('pfId').textContent = ME.id;
+  $('pfRole').textContent = ME.role >= 100 ? '管理员' : '普通用户';
+  $('pfGroup').textContent = ME.group;
+  $('pfAff').textContent = ME.aff_code;
+  $('pfCreated').textContent = fmtTime(ME.created_at);
+  $('pfName').value = ME.display_name || '';
+  $('pwOld').value = ''; $('pwNew').value = ''; $('pwNew2').value = '';
+  $('pwMsg').textContent = '';
+}
+
+$('btnSaveName').onclick = async () => {
+  const dn = $('pfName').value.trim();
+  if (!dn) return toast('昵称不能为空', 'err');
+  const j = await api('/api/user/update', { method: 'POST', body: JSON.stringify({ display_name: dn }) });
+  if (!j.success) return toast(j.message, 'err');
+  ME = j.data;
+  $('sideUser').innerHTML = `<b>${esc(ME.display_name || ME.username)}</b>ID: ${ME.id}${IS_ADMIN ? ' · 管理员' : ''}`;
+  toast('✅ ' + j.message);
+};
+
+$('btnChangePw').onclick = async () => {
+  const oldpw = $('pwOld').value;
+  const np = $('pwNew').value;
+  const np2 = $('pwNew2').value;
+  const msg = $('pwMsg');
+  msg.className = 'auth-msg err';
+  if (!oldpw) { msg.textContent = '请输入当前密码'; return; }
+  if (np.length < 6) { msg.textContent = '新密码至少 6 位'; return; }
+  if (np !== np2) { msg.textContent = '两次输入的新密码不一致'; return; }
+  if (np === oldpw) { msg.textContent = '新密码不能与当前密码相同'; return; }
+  $('btnChangePw').disabled = true;
+  const j = await api('/api/user/update', { method: 'POST', body: JSON.stringify({ old_password: oldpw, password: np }) });
+  $('btnChangePw').disabled = false;
+  if (!j.success) { msg.textContent = j.message; return; }
+  msg.className = 'auth-msg';
+  msg.textContent = '✅ 密码已修改，正在退出登录…';
+  toast('✅ 密码已修改，请用新密码重新登录');
+  setTimeout(async () => {
+    try { await api('/api/user/logout', { method: 'POST' }); } catch {}
+    SESSION = null; localStorage.removeItem(SKEY); location.reload();
+  }, 1500);
 };
 
 // ---------- Modal / copy ----------
