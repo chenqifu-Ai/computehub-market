@@ -434,6 +434,30 @@ function listLogs(db, { userId, p = 1, size = 20 }) {
   const items = db.prepare('SELECT * FROM logs WHERE user_id=? ORDER BY id DESC LIMIT ? OFFSET ?').all(userId, size, off);
   return { items, total, page: p, page_size: size };
 }
+
+// 导出用：明细 + 汇总（userId=null 表示全站）
+function exportLogs(db, { userId, since = 0 } = {}) {
+  if (userId) {
+    return db.prepare('SELECT * FROM logs WHERE user_id=? AND created_at>=? ORDER BY created_at DESC').all(userId, since);
+  }
+  return db.prepare('SELECT * FROM logs WHERE created_at>=? ORDER BY created_at DESC').all(since);
+}
+function exportSummary(db, { userId, since = 0 } = {}) {
+  const cond = []; const v = [];
+  if (userId) { cond.push('user_id=?'); v.push(userId); }
+  cond.push('created_at>=?'); v.push(since);
+  return db.prepare(`
+    SELECT user_id, username, token_id, token_name, model_name,
+           COUNT(*) AS req_count,
+           COALESCE(SUM(prompt_tokens),0) AS prompt_tokens,
+           COALESCE(SUM(completion_tokens),0) AS completion_tokens,
+           COALESCE(SUM(total_tokens),0) AS total_tokens,
+           COALESCE(SUM(quota),0) AS quota
+    FROM logs WHERE ${cond.join(' AND ')}
+    GROUP BY user_id, username, token_id, token_name, model_name
+    ORDER BY user_id, token_id, model_name
+  `).all(...v);
+}
 function logStatsByModel(db, userId) {
   return db.prepare(`
     SELECT model_name, COUNT(*) AS count, SUM(prompt_tokens) AS prompt_tokens,
@@ -573,7 +597,7 @@ module.exports = {
   listChannels, listChannelsRaw, getChannel, channelsForModel, addChannelUsage,
   addChannel, updateChannel, deleteChannel, touchChannel,
   publicModelCatalog, pricingCatalog, maskKey,
-  insertLog, listLogs, logStatsByModel,
+  insertLog, listLogs, logStatsByModel, exportLogs, exportSummary,
   listUsers, adminUpdateUser, systemStats, userByAff,
   createRedemptions, getRedemption, redeemCode, listRedemptions, setRedemptionStatus, deleteRedemption,
   DEFAULT_SETTINGS, getSettings, getSetting, setSettings,

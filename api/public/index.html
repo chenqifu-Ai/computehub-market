@@ -136,8 +136,9 @@
       <div class="panel">
         <div class="panel-head">
           <h3>使用日志</h3>
-          <div>
+          <div class="head-actions">
             <span class="muted" id="logTotal"></span>
+            <button class="btn-ghost sm" id="btnExportXlsx">导出 Excel</button>
             <button class="btn-ghost sm" id="btnExportLogs">导出 CSV</button>
           </div>
         </div>
@@ -228,7 +229,10 @@
       <div class="panel">
         <div class="panel-head">
           <h3>用户管理 <span class="badge" id="userCount">-</span></h3>
-          <button class="btn-ghost sm" id="btnReloadUsers">刷新</button>
+          <div class="head-actions">
+            <button class="btn-ghost sm" id="btnExportAll">导出全站用量 Excel</button>
+            <button class="btn-ghost sm" id="btnReloadUsers">刷新</button>
+          </div>
         </div>
         <table class="tbl">
           <thead><tr><th>ID</th><th>用户名</th><th>角色</th><th>状态</th><th>余额</th><th>已用</th><th>请求</th><th>邀请</th><th>操作</th></tr></thead>

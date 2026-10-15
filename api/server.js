@@ -189,6 +189,15 @@ const server = http.createServer(async (req, res) => {
       const u = requireUser(req, res); if (!u) return;
       return json(res, 200, { success: true, data: store.logStatsByModel(db, u.id) });
     }
+    // 导出使用日志（xlsx 双 sheet：明细 + 按模型汇总）
+    if (pathname === '/api/log/export') {
+      const u = requireUser(req, res); if (!u) return;
+      const all = query.get('all') === '1' && store.isAdmin(u);
+      const userId = all ? null : u.id;
+      const days = Math.min(parseInt(query.get('days') || '0', 10), 3650);
+      const since = days > 0 ? Date.now() - days * 86400000 : 0;
+      return exportUsageXlsx(res, { userId, since, all });
+    }
 
     // ---------- 模型 / 渠道（对外目录：不含密钥） ----------
     if (pathname === '/api/models') {
@@ -466,6 +475,72 @@ function handleTokenReveal(res, u, id) {
 }
 
 // 探测上游渠道可用模型
+// ============ 使用日志 Excel 导出（仿 SLCH usage-logs xlsx）============
+function pad2(n) { return String(n).padStart(2, '0'); }
+function fmtTs(ms) {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} `
+    + `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+function fmtYuan(quota) { return '¥' + (quota / QUOTA_PER_USD).toFixed(6); }
+
+function exportUsageXlsx(res, { userId, since, all }) {
+  const xlsx = require('./lib/xlsx');
+  const rows = store.exportLogs(db, { userId, since });
+  const summary = store.exportSummary(db, { userId, since });
+
+  const detail = [
+    ['时间', '类型', '用户', '用户ID', '令牌名称', '模型', '输入token数', '输出token数', '花费金额', '用时(秒)', '流式'],
+  ];
+  for (const l of rows) {
+    detail.push([
+      fmtTs(l.created_at),
+      l.quota < 0 ? '返利' : '消费',
+      l.username,
+      String(l.user_id),
+      l.token_name || '',
+      l.model_name || '',
+      l.prompt_tokens, l.completion_tokens,
+      fmtYuan(l.quota),
+      Math.round(l.use_time || 0),
+      l.is_stream ? '是' : '否',
+    ]);
+  }
+
+  const sum = [
+    ['用户', '用户ID', '令牌名称', '令牌ID', '模型', '请求次数', '输入token数', '输出token数', '总token数', '消费金额'],
+  ];
+  let tReq = 0, tIn = 0, tOut = 0, tTok = 0, tQ = 0;
+  for (const s of summary) {
+    sum.push([
+      s.username, String(s.user_id), s.token_name || '-', String(s.token_id || ''),
+      s.model_name, s.req_count, s.prompt_tokens, s.completion_tokens,
+      s.total_tokens, fmtYuan(s.quota),
+    ]);
+    tReq += s.req_count; tIn += s.prompt_tokens; tOut += s.completion_tokens; tTok += s.total_tokens; tQ += s.quota;
+  }
+  sum.push(['合计', '', '', '', '', tReq, tIn, tOut, tTok, fmtYuan(tQ)]);
+
+  const sheet1Name = all ? '全部明细' : '使用日志';
+  const buf = xlsx.build([
+    { name: sheet1Name, rows: detail, colWidths: [20, 8, 14, 9, 16, 24, 13, 13, 13, 10, 8], freezeHeader: true },
+    { name: '按模型汇总', rows: sum, colWidths: [14, 9, 16, 9, 24, 10, 13, 13, 13, 13], freezeHeader: true },
+  ]);
+
+  const d = new Date();
+  const stamp = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+  const fname = `${all ? 'all' : 'usage'}-logs-${stamp}.xlsx`;
+  res.writeHead(200, {
+    'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'Content-Disposition': `attachment; filename="${fname}"`,
+    'Content-Length': buf.length,
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*',
+  });
+  res.end(buf);
+  console.log(`[export] ${all ? 'ALL' : 'uid'} xlsx: ${rows.length} 条明细 / ${summary.length} 行汇总`);
+}
+
 async function handleChannelModels(res, b) {
   const base = String(b.base_url).replace(/\/+$/, '');
   const key = String(b.api_key || '');

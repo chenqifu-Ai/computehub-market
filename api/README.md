@@ -20,7 +20,8 @@ New-API 式中转站：**一个 OpenAI 兼容的 API 网关**，把多个上游�
 | **限流** | 每令牌每分钟滑窗限流（可配），429 带 `Retry-After`，管理员豁免 |
 | **充值** | 兑换码生成/兑换/禁用、每日签到 |
 | **邀请返利** | 邀请码绑定，被邀请人消费按比例回馈邀请人 |
-| **控制台** | 仪表盘/令牌/模型/日志(CSV导出)/充值/邀请/渠道/用户/设置/文档 |
+| **控制台** | 仪表盘/令牌/模型/日志/充值/邀请/个人设置/渠道/用户/设置/文档 |
+| **Excel 导出** | 使用日志导出 `.xlsx`（明细 + 按模型汇总双 sheet），管理员可导全站 |
 | **系统设置** | 站点名、注册赠送、签到额度、限流阈值、返利比例、公告 |
 
 ---
@@ -100,6 +101,7 @@ print(r.choices[0].message.content)
 | GET  | `/api/token/key?id=` | 查看令牌明文 Key |
 | GET  | `/api/log/self` | 使用日志（分页） |
 | GET  | `/api/log/model` | 按模型统计 |
+| GET  | `/api/log/export` | **导出 Excel**（双 sheet：明细 + 按模型汇总）；`?all=1` 仅管理员可导全站 |
 | GET  | `/api/models` | 公开模型目录 |
 | GET  | `/api/pricing` | 模型价格表 |
 | GET  | `/api/channel/` | 渠道列表（仅管理员） |
@@ -115,6 +117,19 @@ print(r.choices[0].message.content)
 - **优先采用上游返回的真实 `usage`**；上游不给 usage 时按字符估算兜底
   - 中文 ≈ 1 token/字，英文 ≈ 1 token/4 字符
 - 扣费三方同步：用户余额 → 令牌用量 → 渠道用量，并写入 `logs`
+
+### 📊 使用日志 Excel 导出
+
+`GET /api/log/export` 返回 `.xlsx`（双 sheet，结构与 New-API/SLCH 导出对齐）：
+
+- **Sheet1 使用日志**（明细，冻结首行）
+  `时间 | 类型 | 用户 | 用户ID | 令牌名称 | 模型 | 输入token数 | 输出token数 | 花费金额 | 用时(秒) | 流式`
+- **Sheet2 按模型汇总**
+  `用户 | 用户ID | 令牌名称 | 令牌ID | 模型 | 请求次数 | 输入token数 | 输出token数 | 总token数 | 消费金额` + **合计行**
+
+参数：`?days=N` 仅导最近 N 天；`?all=1` 导全站（**仅管理员**，非管理员自动降级为仅自己）。
+
+> 通过 `lib/xlsx.js` 零依赖生成（zlib deflateRaw + 手写 ZIP），无需任何 npm 包。
 
 ---
 
@@ -163,9 +178,12 @@ sudo systemctl restart computehub-api
 api/
 ├── server.js             # 入口：路由 + 控制台 API + 静态服务
 ├── lib/
-│   ├── store.js          # SQLite 数据层（users/tokens/channels/logs）
-│   ├── relay.js          # 中继核心（鉴权/渠道路由/转发/流式/计费）
-│   └── billing.js        # 计费引擎（价格表/token 估算/quota 计算）
+│   ├── store.js          # SQLite 数据层（users/tokens/channels/logs/redemptions/settings/checkins）
+│   ├── relay.js          # 中继核心（鉴权/渠道路由/转发/流式/计费/返利）
+│   ├── billing.js        # 计费引擎（价格表/token 估算/quota 计算）
+│   ├── ratelimit.js      # 令牌级滑动窗口限流
+│   ├── health.js         # 渠道健康检查 + 自动熔断 + 主动探活
+│   └── xlsx.js           # 零依赖 Excel 生成器（手写 zip+XML，导出用）
 ├── public/               # 控制台前端（原生 HTML/CSS/JS）
 │   ├── index.html
 │   ├── app.js

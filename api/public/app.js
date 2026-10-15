@@ -350,6 +350,18 @@ $('btnExportLogs').onclick = () => {
   toast('已导出当前页');
 };
 
+// 服务端生成 xlsx（双 sheet：明细 + 按模型汇总）
+function downloadXlsx(all) {
+  const url = `/api/log/export${all ? '?all=1' : ''}`;
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = '';
+  document.body.appendChild(a); a.click(); a.remove();
+  toast(all ? '正在导出全站用量…' : '正在导出使用日志…');
+}
+$('btnExportXlsx').onclick = () => downloadXlsx(false);
+if ($('btnExportAll')) $('btnExportAll').onclick = () => downloadXlsx(true);
+
 // ---------- 充值 / 签到 ----------
 async function loadTopup() {
   const j = await api('/api/settings');
