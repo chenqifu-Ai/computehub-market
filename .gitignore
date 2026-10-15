@@ -13,3 +13,6 @@ node_modules/
 # 系统
 .DS_Store
 Thumbs.db
+
+# 运行日志目录
+logs/

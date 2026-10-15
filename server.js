@@ -18,6 +18,65 @@ const { DatabaseSync } = require('node:sqlite');
 const PORT = parseInt(process.env.PORT || '5800', 10);
 const HOST = process.env.HOST || '127.0.0.1';
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'market.db');
+// ComputeHub Gateway 上游：算力节点 / 下单 / 订单查询都从这里取
+const UPSTREAM = process.env.UPSTREAM || 'http://127.0.0.1:8282';
+
+// 与 ComputeHub src/kernel/task_econ.go 完全一致的计价系数（本地报价，不依赖上游）
+const TOKEN_COEFF = { CPU: 1.0, GPU: 10.0, LLM: 0.02, IO: 0.1 };
+const CONFIDENCE = 0.6;
+const PRICING = {
+  unit: '1 token = 1 核 CPU × 1 分钟',
+  coeff: TOKEN_COEFF,
+  note: 'GPU 任务按 卡数×时长×10 计；LLM 按输入 token 量；IO 按数据量+时长',
+};
+
+function normalizeCommandType(ct) {
+  switch (String(ct || '').toLowerCase().trim()) {
+    case 'gpu': return 'gpu';
+    case 'llm': case 'infer': case 'inference': return 'llm';
+    case 'io': case 'data': case 'transfer': return 'io';
+    case 'cpu': return 'cpu';
+    default: return 'cpu';
+  }
+}
+
+function inferCommandTypeFromText(cmd) {
+  const c = String(cmd || '').toLowerCase();
+  const has = arr => arr.some(k => c.includes(k));
+  if (has(['nvidia', 'cuda', 'gpu', 'llava', 'ollama', 'stable-diffusion', 'whisper', 'yolo', 'comfyui'])) return 'gpu';
+  if (has(['llm', 'gpt', 'chat', 'claude', 'deepseek', 'infer', 'token', 'glm', 'qwen'])) return 'llm';
+  if (has(['cp ', 'rsync', 'scp', 'wget', 'curl', 'download', 'upload', 'mv ', 'tar '])) return 'io';
+  return 'cpu';
+}
+
+// 复刻 kernel.EstimateTokens：区间 min/mid/max + 置信度
+function estimateTokens(ct, r) {
+  const cores = Math.max(1, Number(r.cpu_cores) || 0);
+  const dur = Number(r.est_duration) > 0 ? Number(r.est_duration) : 60;
+  const dataMB = Number(r.data_mb) || 0;
+  const gpuCount = Number(r.gpu && r.gpu.count) || 0;
+  let mid;
+  switch (ct) {
+    case 'gpu': {
+      let cardMin = (dur / 60.0) * TOKEN_COEFF.GPU;
+      if (gpuCount > 0) cardMin *= gpuCount; else cardMin = 1;
+      mid = cardMin + cores * dur / 60.0 * TOKEN_COEFF.CPU;
+      break;
+    }
+    case 'llm': {
+      const kIn = (dataMB * 2500) / 1000.0;
+      mid = kIn * TOKEN_COEFF.LLM * dur / 60.0;
+      break;
+    }
+    case 'io':
+      mid = (dataMB / 100.0) * TOKEN_COEFF.IO + (dur / 60.0) * TOKEN_COEFF.CPU;
+      break;
+    default:
+      mid = cores * dur / 60.0 * TOKEN_COEFF.CPU;
+  }
+  if (mid < 1) mid = 1;
+  return { min: mid * 0.7, mid, max: mid * 1.8, confidence: CONFIDENCE, basis: 'v1-estimator' };
+}
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 会话 7 天
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
@@ -101,6 +160,58 @@ function tokenFromReq(req) {
   return (req.url || '').includes('token=')
     ? new URLSearchParams((req.url.split('?')[1] || '')).get('token')
     : null;
+}
+
+// ============ ComputeHub 反向代理 ============
+// 前端只跟本服务同源通信，/api/v1/* 全部转发给 ComputeHub Gateway，
+// 避免浏览器直连 8282 的跨域 + 硬编码端口问题。
+function proxyToUpstream(req, res, pathname) {
+  let target;
+  try { target = new URL(UPSTREAM); } catch { return json(res, 500, { ok: false, error: 'UPSTREAM 配置无效' }); }
+  const opts = {
+    hostname: target.hostname,
+    port: target.port || 80,
+    path: pathname + (req.url.includes('?') ? '?' + req.url.split('?').slice(1).join('?') : ''),
+    method: req.method,
+    headers: { ...req.headers, host: target.host },
+    timeout: 60000,
+  };
+  const preq = http.request(opts, pres => {
+    res.writeHead(pres.statusCode, {
+      'Content-Type': pres.headers['content-type'] || 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Access-Control-Allow-Origin': '*',
+    });
+    pres.pipe(res);
+  });
+  preq.on('timeout', () => { preq.destroy(new Error('上游超时')); });
+  preq.on('error', e => {
+    if (!res.headersSent) json(res, 502, { ok: false, error: 'ComputeHub 上游不可达: ' + e.message, upstream: UPSTREAM });
+  });
+  req.pipe(preq);
+}
+
+// ============ 本地报价 ============
+// POST /api/v1/tasks/estimate — 不依赖上游，直接算（与 kernel 同公式）
+async function handleEstimate(req, res) {
+  if (req.method !== 'POST') return json(res, 405, { ok: false, error: '仅支持 POST' });
+  let body;
+  try { body = JSON.parse((await readBody(req)) || '{}'); }
+  catch { return json(res, 400, { ok: false, error: 'JSON 格式错误' }); }
+
+  const res_ = body.resources || {};
+  let ct = body.command_type || '';
+  if (!ct && body.command) ct = inferCommandTypeFromText(body.command);
+  if (!ct) ct = 'cpu';
+  ct = normalizeCommandType(ct);
+  if (!(Number(res_.cpu_cores) > 0)) res_.cpu_cores = 1;
+  if (!(Number(res_.est_duration) > 0)) res_.est_duration = 60;
+
+  const est = estimateTokens(ct, res_);
+  return json(res, 200, {
+    id: '', success: true,
+    data: { command_type: ct, resources: res_, estimate: est, pricing: PRICING },
+  });
 }
 
 // ============ 静态文件 ============
@@ -214,6 +325,13 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/api/me') return handleMe(req, res);
     if (pathname === '/api/logout') return handleLogout(req, res);
     if (pathname === '/api/health') return json(res, 200, { ok: true, ts: Date.now() });
+    if (pathname === '/api/config') return json(res, 200, { ok: true, upstream: UPSTREAM, port: PORT });
+
+    // 报价走本地（生产 gateway 尚未编译 market handler）
+    if (pathname === '/api/v1/tasks/estimate') return await handleEstimate(req, res);
+
+    // 其余 ComputeHub API 反代（节点/下单/订单）
+    if (pathname.startsWith('/api/v1/')) return proxyToUpstream(req, res, pathname);
 
     // 其余走静态文件
     return serveStatic(req, res, pathname);
@@ -227,6 +345,7 @@ server.listen(PORT, HOST, () => {
   console.log(`\n⚡ 算力商城 (Compute Market) 已启动`);
   console.log(`   本地访问: http://${HOST}:${PORT}`);
   console.log(`   数据库:   ${DB_PATH}`);
+  console.log(`   上游网关: ${UPSTREAM}`);
   console.log(`\n`);
 });
 
