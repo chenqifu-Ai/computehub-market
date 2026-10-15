@@ -483,6 +483,11 @@ function fmtTs(ms) {
     + `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 }
 function fmtYuan(quota) { return '¥' + (quota / QUOTA_PER_USD).toFixed(6); }
+const TYPE_LABEL = { consume: '消费', recharge: '充值', reward: '返利', system: '系统', admin: '管理' };
+function typeLabel(l) {
+  if (l.log_type && TYPE_LABEL[l.log_type]) return TYPE_LABEL[l.log_type];
+  return l.quota < 0 ? '返利' : '消费';
+}
 
 function exportUsageXlsx(res, { userId, since, all }) {
   const xlsx = require('./lib/xlsx');
@@ -495,7 +500,7 @@ function exportUsageXlsx(res, { userId, since, all }) {
   for (const l of rows) {
     detail.push([
       fmtTs(l.created_at),
-      l.quota < 0 ? '返利' : '消费',
+      typeLabel(l),
       l.username,
       String(l.user_id),
       l.token_name || '',

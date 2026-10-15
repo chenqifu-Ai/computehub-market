@@ -133,6 +133,32 @@ print(r.choices[0].message.content)
 
 ---
 
+## 📥 历史数据导入（从 SLCH / New-API 迁移）
+
+```bash
+# 干跑预览（不写库）
+node import-logs.js /path/usage-logs-xxx.xlsx --dry-run
+
+# 正式导入
+node import-logs.js /path/usage-logs-xxx.xlsx
+
+# 选项
+node import-logs.js file.xlsx --user 指定用户名   # 强制归属某个用户
+node import-logs.js file.xlsx --db /path/api.db   # 指定目标库
+node import-logs.js file.xlsx --tag my-import     # 来源标记
+```
+
+**特性**：
+- 保留**原始时间戳**（时间线连续）、**类型**（消费/充值/系统/管理）
+- **幂等**：按 `(用户, 时间, 模型, 输入, 输出, 类型)` 去重，可重复执行
+- 自动创建缺失的用户/令牌（自动建的用户**不可登录**，需管理员重置密码）
+- 导入后**重算**用户 `used_quota` / `request_count`
+- 导入记录标记 `channel_name='（历史导入）'` + `source=<tag>`，可追溯
+
+> 导入前建议先备份：`cp api.db /tmp/api.db.bak-$(date +%Y%m%d-%H%M%S)`
+
+---
+
 ## 🔌 渠道池（channels.json）
 
 每个渠道一条记录，`priority` 越大越优先，同一优先级内按 `weight` 随机分流；**失败自动故障转移到下一个渠道**。
@@ -183,7 +209,7 @@ api/
 │   ├── billing.js        # 计费引擎（价格表/token 估算/quota 计算）
 │   ├── ratelimit.js      # 令牌级滑动窗口限流
 │   ├── health.js         # 渠道健康检查 + 自动熔断 + 主动探活
-│   └── xlsx.js           # 零依赖 Excel 生成器（手写 zip+XML，导出用）
+│   ├── xlsx.js           # 零依赖 Excel 生成/读取器（手写 zip+XML）
 ├── public/               # 控制台前端（原生 HTML/CSS/JS）
 │   ├── index.html
 │   ├── app.js
@@ -192,6 +218,7 @@ api/
 ├── channels.example.json # 渠道配置模板
 ├── pricing.json          # 价格表
 ├── gen-channels.py       # 渠道配置生成脚本
+├── import-logs.js        # 【历史数据导入】把 SLCH/New-API usage-logs .xlsx 灌入本平台
 ├── start.sh              # 启动脚本
 └── api.db                # SQLite（gitignored）
 ```

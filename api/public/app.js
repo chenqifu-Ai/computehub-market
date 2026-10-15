@@ -506,21 +506,23 @@ async function loadUsers() {
       <td>${fmtMe(u.request_count)}</td>
       <td>${u.inviter_id ? '有' : '—'}${u.invite_reward ? ' / ' + fmtUsd(u.invite_reward) : ''}</td>
       <td class="actions">
-        <button class="btn-ghost sm" onclick="editUser(${u.id},'${esc(u.username)}',${u.status},${u.role})">管理</button>
+        <button class="btn-ghost sm" onclick="editUser(${u.id},'${esc(u.username)}',${u.status},${u.role},'${esc(u.remark || '')}')">管理</button>
       </td>
     </tr>`).join('');
   loadRedemptions();
 }
 $('btnReloadUsers').onclick = loadUsers;
-function editUser(id, name, status, role) {
+function editUser(id, name, status, role, remark) {
   openModal(`
     <h3>管理用户「${esc(name)}」(ID ${id})</h3>
     <label>充值（美元，正数加、负数扣）</label><input id="euAdd" type="number" value="1" step="0.5">
+    <label>充值后的总余额（美元，留空则不改）</label><input id="euQuota" type="number" step="0.5" placeholder="绝对余额，可选">
     <label>状态</label>
     <select id="euStatus"><option value="1" ${status === 1 ? 'selected' : ''}>正常</option><option value="2" ${status === 2 ? 'selected' : ''}>禁用</option></select>
     <label>角色</label>
     <select id="euRole"><option value="1" ${role < 100 ? 'selected' : ''}>普通用户</option><option value="100" ${role >= 100 ? 'selected' : ''}>管理员</option></select>
-    <label>备注</label><input id="euRemark" placeholder="可选">
+    <label>重置密码（留空不改，≥ 6 位）</label><input id="euPass" type="text" placeholder="例如 ZhongWu@2026!">
+    <label>备注</label><input id="euRemark" value="${esc(remark || '')}" placeholder="可选">
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closeModal()">取消</button>
       <button class="btn-primary" onclick="saveUser(${id})">保存</button>
@@ -533,6 +535,13 @@ async function saveUser(id) {
     remark: $('euRemark').value.trim(),
   };
   if (add) b.add_quota = Math.round(add * 500000);
+  const q = $('euQuota').value.trim();
+  if (q !== '') b.quota = Math.round(parseFloat(q) * 500000);
+  const pw = $('euPass').value.trim();
+  if (pw) {
+    if (pw.length < 6) return toast('密码至少 6 位', 'err');
+    b.password = pw;
+  }
   const j = await api('/api/admin/user/update', { method: 'POST', body: JSON.stringify(b) });
   if (!j.success) return toast(j.message, 'err');
   closeModal(); toast('✅ 已保存'); loadUsers();

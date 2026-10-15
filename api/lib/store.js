@@ -136,6 +136,13 @@ function migrate(db) {
   const cols = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
   if (!cols.includes('inviter_id')) db.exec('ALTER TABLE users ADD COLUMN inviter_id INTEGER NOT NULL DEFAULT 0');
   if (!cols.includes('invite_reward')) db.exec('ALTER TABLE users ADD COLUMN invite_reward INTEGER NOT NULL DEFAULT 0');
+
+  // logs 增量迁移：记录类型（consume/recharge/reward/system/admin）
+  const lcols = db.prepare('PRAGMA table_info(logs)').all().map(c => c.name);
+  if (!lcols.includes('log_type'))
+    db.exec("ALTER TABLE logs ADD COLUMN log_type TEXT NOT NULL DEFAULT 'consume'");
+  if (!lcols.includes('source'))
+    db.exec("ALTER TABLE logs ADD COLUMN source TEXT NOT NULL DEFAULT ''");
 }
 
 function userByAff(db, aff) {
@@ -419,13 +426,14 @@ function pricingCatalog(db) {
 function insertLog(db, l) {
   db.prepare(`
     INSERT INTO logs (user_id,username,token_id,token_name,model_name,channel_id,channel_name,
-      prompt_tokens,completion_tokens,total_tokens,quota,use_time,is_stream,ip,request_id,status,error,created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      prompt_tokens,completion_tokens,total_tokens,quota,use_time,is_stream,ip,request_id,status,error,created_at,log_type,source)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `).run(
     l.user_id, l.username || '', l.token_id || 0, l.token_name || '', l.model_name || '',
     l.channel_id || 0, l.channel_name || '', l.prompt_tokens || 0, l.completion_tokens || 0,
     l.total_tokens || 0, l.quota || 0, l.use_time || 0, l.is_stream ? 1 : 0,
-    l.ip || '', l.request_id || '', l.status || 'success', l.error || '', Date.now(),
+    l.ip || '', l.request_id || '', l.status || 'success', l.error || '',
+    l.created_at || Date.now(), l.log_type || 'consume', l.source || '',
   );
 }
 function listLogs(db, { userId, p = 1, size = 20 }) {
@@ -483,7 +491,8 @@ function adminUpdateUser(db, id, b) {
   if (b.group_name !== undefined) set('group_name', String(b.group_name));
   if (b.remark !== undefined) set('remark', String(b.remark));
   if (f.length) { v.push(id); db.prepare(`UPDATE users SET ${f.join(',')} WHERE id=?`).run(...v); }
-  return publicUser(getUserById(db, id));
+  if (b.password) setPasswordReal(db, id, String(b.password));
+  return publicUser(db, getUserById(db, id));
 }
 function systemStats(db) {
   const u = db.prepare('SELECT COUNT(*) c, COALESCE(SUM(quota),0) q, COALESCE(SUM(used_quota),0) uq FROM users').get();
@@ -587,6 +596,26 @@ function checkinStatus(db, user) {
   return { checked_today: today > 0 };
 }
 
+// 导出/导入辅助
+function logExists(db, { user_id, created_at, model_name, prompt_tokens, completion_tokens, log_type }) {
+  return !!db.prepare(`
+    SELECT id FROM logs WHERE user_id=? AND created_at=? AND model_name=? AND
+      prompt_tokens=? AND completion_tokens=? AND log_type=?
+  `).get(user_id, created_at, model_name, prompt_tokens, completion_tokens, log_type);
+}
+function recomputeUserStats(db, userId) {
+  const r = db.prepare(`
+    SELECT COALESCE(SUM(CASE WHEN quota>0 THEN quota ELSE 0 END),0) AS used,
+           SUM(CASE WHEN log_type='consume' THEN 1 ELSE 0 END) AS reqs
+    FROM logs WHERE user_id=?
+  `).get(userId);
+  db.prepare('UPDATE users SET used_quota=?, request_count=? WHERE id=?').run(r.used, r.reqs || 0, userId);
+  return r;
+}
+function countLogs(db, userId) {
+  return db.prepare('SELECT COUNT(*) c FROM logs WHERE user_id=?').get(userId).c;
+}
+
 module.exports = {
   open, migrate, seedChannels,
   hashPassword, verifyPassword,
@@ -598,6 +627,7 @@ module.exports = {
   addChannel, updateChannel, deleteChannel, touchChannel,
   publicModelCatalog, pricingCatalog, maskKey,
   insertLog, listLogs, logStatsByModel, exportLogs, exportSummary,
+  logExists, recomputeUserStats, countLogs,
   listUsers, adminUpdateUser, systemStats, userByAff,
   createRedemptions, getRedemption, redeemCode, listRedemptions, setRedemptionStatus, deleteRedemption,
   DEFAULT_SETTINGS, getSettings, getSetting, setSettings,

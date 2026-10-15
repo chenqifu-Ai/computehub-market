@@ -204,4 +204,125 @@ ${relSheets}
   ]);
 }
 
-module.exports = { build, esc, crc32 };
+// ============================================================
+// 读取 .xlsx（解析 ZIP + sheet XML）
+// ============================================================
+function inflate(buf, method) {
+  if (method === 0) return buf;                 // stored
+  if (method === 8) return zlib.inflateRawSync(buf);
+  throw new Error('不支持的压缩方式: ' + method);
+}
+
+/** 解析 ZIP → Map<name, Buffer> */
+function unzip(buf) {
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 22 - 65535); i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('不是有效的 ZIP/xlsx 文件');
+  const count = buf.readUInt16LE(eocd + 10);
+  let off = buf.readUInt32LE(eocd + 16);
+  const files = new Map();
+  for (let n = 0; n < count; n++) {
+    if (buf.readUInt32LE(off) !== 0x02014b50) throw new Error('ZIP 中央目录损坏');
+    const method = buf.readUInt16LE(off + 10);
+    const compSize = buf.readUInt32LE(off + 20);
+    const nameLen = buf.readUInt16LE(off + 28);
+    const extraLen = buf.readUInt16LE(off + 30);
+    const cmtLen = buf.readUInt16LE(off + 32);
+    const localOff = buf.readUInt32LE(off + 42);
+    const name = buf.toString('utf8', off + 46, off + 46 + nameLen);
+    const lNameLen = buf.readUInt16LE(localOff + 26);
+    const lExtraLen = buf.readUInt16LE(localOff + 28);
+    const dataStart = localOff + 30 + lNameLen + lExtraLen;
+    const data = buf.slice(dataStart, dataStart + compSize);
+    files.set(name, inflate(data, method));
+    off += 46 + nameLen + extraLen + cmtLen;
+  }
+  return files;
+}
+
+function colToIdx(ref) {
+  let n = 0;
+  for (const c of ref) {
+    const u = c.toUpperCase();
+    if (u >= 'A' && u <= 'Z') n = n * 26 + (u.charCodeAt(0) - 64);
+    else break;
+  }
+  return n - 1;
+}
+
+function parseRow(rowXml, shared) {
+  const cells = [];
+  const re = /<c\b([^>]*)\/?>([\s\S]*?)(?:<\/c>|(?=<c\b)|$)/g;
+  let m;
+  while ((m = re.exec(rowXml)) !== null) {
+    const attrs = m[1] || '';
+    const inner = m[2] || '';
+    const refM = /r="([A-Z]+)\d+"/.exec(attrs);
+    const idx = refM ? colToIdx(refM[1]) : cells.length;
+    const t = (/t="([^"]+)"/.exec(attrs) || [])[1] || '';
+    let val = '';
+    if (t === 's') {
+      const v = /<v>(\d+)<\/v>/.exec(inner);
+      val = v ? (shared[parseInt(v[1], 10)] ?? '') : '';
+    } else if (t === 'inlineStr') {
+      const isM = /<is>[\s\S]*?<t[^>]*>([\s\S]*?)<\/t>/.exec(inner);
+      val = isM ? unesc(isM[1]) : '';
+    } else {
+      const v = /<v>([\s\S]*?)<\/v>/.exec(inner);
+      val = v ? unesc(v[1]) : '';
+    }
+    cells[idx] = val;
+  }
+  for (let i = 0; i < cells.length; i++) if (cells[i] === undefined) cells[i] = '';
+  return cells;
+}
+
+function unesc(s) {
+  return String(s)
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+/** 读取工作簿 → { sheets: [{ name, rows: string[][] }] } */
+function read(buf) {
+  const files = unzip(buf);
+
+  const shared = [];
+  const ssBuf = files.get('xl/sharedStrings.xml');
+  if (ssBuf) {
+    const xml = ssBuf.toString('utf8');
+    const re = /<si>([\s\S]*?)<\/si>/g;
+    let m;
+    while ((m = re.exec(xml)) !== null) {
+      let text = '';
+      const tre = /<t[^>]*>([\s\S]*?)<\/t>/g;
+      let tm;
+      while ((tm = tre.exec(m[1])) !== null) text += unesc(tm[1]);
+      shared.push(text);
+    }
+  }
+
+  const wbXml = files.get('xl/workbook.xml')?.toString('utf8') || '';
+  const names = [];
+  const nre = /<sheet\b[^>]*name="([^"]*)"/g;
+  let nm;
+  while ((nm = nre.exec(wbXml)) !== null) names.push(unesc(nm[1]));
+
+  const sheets = [];
+  let i = 1;
+  while (files.has(`xl/worksheets/sheet${i}.xml`)) {
+    const xml = files.get(`xl/worksheets/sheet${i}.xml`).toString('utf8');
+    const rows = [];
+    const rre = /<row\b[^>]*>([\s\S]*?)<\/row>/g;
+    let rm;
+    while ((rm = rre.exec(xml)) !== null) rows.push(parseRow(rm[1], shared));
+    sheets.push({ name: names[i - 1] || `Sheet${i}`, rows });
+    i++;
+  }
+  return { sheets };
+}
+
+module.exports = { build, read, unzip, esc, crc32 };
