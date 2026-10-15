@@ -1,0 +1,16 @@
+{
+  "name": "computehub-market",
+  "version": "0.1.0",
+  "description": "ComputeHub 算力商城 - 分布式算力交易平台前端（带注册登录）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "license": "UNLICENSED",
+  "private": true,
+  "dependencies": {}
+}

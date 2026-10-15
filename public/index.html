@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>算力商城 · ComputeHub</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<!-- ============ 登录/注册视图 ============ -->
+<div id="authView" class="auth-wrap hidden">
+  <div class="auth-card">
+    <div class="auth-logo">⚡</div>
+    <h1>算力商城</h1>
+    <p class="auth-sub">ComputeHub 分布式算力交易平台</p>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="login">登录</button>
+      <button class="tab" data-tab="register">注册</button>
+    </div>
+
+    <form id="authForm" class="auth-form">
+      <label>用户名</label>
+      <input type="text" id="authUser" placeholder="请输入用户名" autocomplete="username" maxlength="32">
+      <label>密码</label>
+      <input type="password" id="authPass" placeholder="请输入密码（至少6位）" autocomplete="current-password" maxlength="64">
+      <div id="authMsg" class="auth-msg"></div>
+      <button type="submit" id="authSubmit" class="btn-primary">登录</button>
+    </form>
+  </div>
+</div>
+
+<!-- ============ 主界面 ============ -->
+<div id="mainView" class="hidden">
+  <div class="topbar">
+    <div class="topbar-left">
+      <span class="topbar-logo">⚡</span>
+      <span class="topbar-title">算力商城</span>
+    </div>
+    <div class="topbar-right">
+      <span id="welcomeUser" class="welcome"></span>
+      <button id="btnLogout" class="btn-ghost">退出</button>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <div class="stat-bar" id="statBar">
+      <div class="stat"><b id="stNodes">-</b><span>在线节点</span></div>
+      <div class="stat"><b id="stTasks">-</b><span>活跃任务</span></div>
+      <div class="stat"><b id="stTokens">-</b><span>累计 token</span></div>
+    </div>
+
+    <div class="grid">
+      <!-- 左列：算力节点 + 下单 -->
+      <div>
+        <div class="panel">
+          <h2>📦 算力节点 <span class="badge" id="nodeCount">-</span></h2>
+          <div class="nodes" id="nodeList">
+            <div class="empty">加载中…</div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>🛠️ 提交任务</h2>
+          <label>任务类型</label>
+          <select id="cmdType">
+            <option value="cpu">CPU 计算</option>
+            <option value="gpu">GPU 计算</option>
+            <option value="llm">LLM 推理</option>
+            <option value="io">数据搬移</option>
+          </select>
+
+          <label>命令</label>
+          <textarea id="cmd" placeholder="例如：python3 train.py --epochs 10"></textarea>
+
+          <div class="row">
+            <div><label>CPU 核数</label><input type="number" id="cpuCores" value="1" min="1"></div>
+            <div><label>内存 GB</label><input type="number" id="memGB" value="2" min="0" step="0.5"></div>
+            <div><label>预估时长(秒)</label><input type="number" id="estDur" value="60" min="1"></div>
+          </div>
+
+          <div class="row" id="gpuRow" style="display:none">
+            <div><label>GPU 卡数</label><input type="number" id="gpuCount" value="1" min="0"></div>
+            <div><label>显存 GB</label><input type="number" id="gpuVram" value="8" min="0" step="0.5"></div>
+          </div>
+
+          <label>优先级（1-10）</label>
+          <input type="number" id="priority" value="5" min="1" max="10">
+
+          <button id="btnEstimate" class="btn-primary" style="margin-top:14px">💰 预估报价</button>
+          <div id="quoteBox" class="quote hidden">
+            <div class="q-title">预估 token 报价</div>
+            <div class="q-tokens" id="qTokens">-</div>
+            <div class="q-range" id="qRange">-</div>
+            <button id="btnOrder" class="btn-primary" style="margin-top:12px">🚀 确认下单</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 右列：订单 -->
+      <div>
+        <div class="panel">
+          <h2>📋 我的订单 <span class="badge" id="orderCount">-</span></h2>
+          <div class="orders" id="orderList">
+            <div class="empty">暂无订单</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="/app.js"></script>
+</body>
+</html>
