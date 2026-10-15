@@ -12,7 +12,7 @@
 <div id="authView" class="auth-wrap hidden">
   <div class="auth-card">
     <div class="auth-logo">⚡</div>
-    <h1>算力商城 API</h1>
+    <h1 id="authTitle">算力商城 API</h1>
     <p class="auth-sub">AI 模型聚合网关 · 一站式调用</p>
 
     <div class="tabs">
@@ -25,22 +25,31 @@
       <input type="text" id="authUser" placeholder="请输入用户名" autocomplete="username" maxlength="32">
       <label>密码</label>
       <input type="password" id="authPass" placeholder="至少 6 位" autocomplete="current-password" maxlength="64">
+      <div id="affWrap" class="hidden">
+        <label>邀请码（选填）</label>
+        <input type="text" id="authAff" placeholder="填写可获额外奖励">
+      </div>
       <div id="authMsg" class="auth-msg"></div>
       <button type="submit" id="authSubmit" class="btn-primary">登录</button>
     </form>
+    <p class="auth-notice" id="authNotice"></p>
   </div>
 </div>
 
 <!-- ============ 控制台 ============ -->
 <div id="appView" class="hidden">
   <aside class="side">
-    <div class="side-logo"><span>⚡</span> 算力商城</div>
+    <div class="side-logo"><span>⚡</span> <b id="sideSite">算力商城</b></div>
     <nav class="side-nav">
       <a data-page="dashboard" class="active">📊 仪表盘</a>
       <a data-page="tokens">🔑 令牌管理</a>
       <a data-page="models">🧩 模型目录</a>
       <a data-page="logs">📜 使用日志</a>
-      <a data-page="channels">🔌 渠道管理</a>
+      <a data-page="topup">💰 充值兑换</a>
+      <a data-page="invite">🎁 邀请返利</a>
+      <a data-page="channels" class="admin-only">🔌 渠道管理</a>
+      <a data-page="users" class="admin-only">👥 用户管理</a>
+      <a data-page="settings" class="admin-only">⚙️ 系统设置</a>
       <a data-page="docs">📖 接入文档</a>
     </nav>
     <div class="side-foot">
@@ -53,9 +62,12 @@
     <header class="top">
       <h2 id="pageTitle">仪表盘</h2>
       <div class="top-right">
+        <button id="btnCheckin" class="btn-ghost sm">📅 签到</button>
         <span class="pill" id="balancePill">余额 —</span>
       </div>
     </header>
+
+    <div id="announce" class="announce hidden"></div>
 
     <!-- 仪表盘 -->
     <section class="page" id="page-dashboard">
@@ -71,6 +83,14 @@
           <div><b id="tReq">—</b><span>请求数</span></div>
           <div><b id="tTok">—</b><span>Tokens</span></div>
           <div><b id="tCost">—</b><span>消费</span></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>系统状态</h3>
+        <div class="mini-row">
+          <div><b id="sysCh">—</b><span>渠道 / 健康</span></div>
+          <div><b id="sysModels">—</b><span>可用模型</span></div>
+          <div><b id="sysRl">—</b><span>限流</span></div>
         </div>
       </div>
       <div class="panel">
@@ -113,29 +133,136 @@
     <!-- 日志 -->
     <section class="page hidden" id="page-logs">
       <div class="panel">
-        <div class="panel-head"><h3>使用日志</h3><span class="muted" id="logTotal"></span></div>
+        <div class="panel-head">
+          <h3>使用日志</h3>
+          <div>
+            <span class="muted" id="logTotal"></span>
+            <button class="btn-ghost sm" id="btnExportLogs">导出 CSV</button>
+          </div>
+        </div>
         <table class="tbl">
-          <thead><tr><th>时间</th><th>模型</th><th>令牌</th><th>渠道</th><th>输入</th><th>输出</th><th>耗时</th><th>消费</th></tr></thead>
-          <tbody id="logBody"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
+          <thead><tr><th>时间</th><th>模型</th><th>令牌</th><th>渠道</th><th>输入</th><th>输出</th><th>耗时</th><th>消费</th><th>状态</th></tr></thead>
+          <tbody id="logBody"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
         </table>
         <div class="pager"><button class="btn-ghost sm" id="logPrev">上一页</button><span id="logPage" class="muted"></span><button class="btn-ghost sm" id="logNext">下一页</button></div>
+      </div>
+    </section>
+
+    <!-- 充值兑换 -->
+    <section class="page hidden" id="page-topup">
+      <div class="grid2">
+        <div class="panel">
+          <h3>💳 兑换码充值</h3>
+          <p class="muted">输入兑换码即可为账户充值。</p>
+          <label>兑换码</label>
+          <input id="topupCode" placeholder="例如 A1B2C3D4E5F6" style="text-transform:uppercase">
+          <button class="btn-primary" id="btnTopup" style="margin-top:14px">立即兑换</button>
+        </div>
+        <div class="panel">
+          <h3>📅 每日签到</h3>
+          <p class="muted">每日签到可领取额度奖励。</p>
+          <div class="big-num" id="checkinQuota">—</div>
+          <button class="btn-primary" id="btnCheckin2">签到领额度</button>
+          <div class="muted" id="checkinState" style="margin-top:10px"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>当前余额</h3>
+        <div class="mini-row">
+          <div><b id="tpBalance">—</b><span>剩余</span></div>
+          <div><b id="tpUsed">—</b><span>累计消费</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 邀请返利 -->
+    <section class="page hidden" id="page-invite">
+      <div class="panel">
+        <h3>🎁 我的邀请</h3>
+        <p class="muted">分享你的邀请链接，好友注册后，TA 每次消费你都能获得返利。</p>
+        <div class="invite-box">
+          <div class="invite-code" id="inviteCode">—</div>
+          <button class="btn-ghost sm" id="btnCopyInvite">复制链接</button>
+        </div>
+        <div class="mini-row" style="margin-top:16px">
+          <div><b id="invCount">—</b><span>已邀请人数</span></div>
+          <div><b id="invReward">—</b><span>累计返利</span></div>
+          <div><b id="invRate">—</b><span>返利比例</span></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>邀请记录</h3>
+        <table class="tbl">
+          <thead><tr><th>用户</th><th>注册时间</th></tr></thead>
+          <tbody id="inviteBody"><tr><td colspan="2" class="empty">还没有邀请记录</td></tr></tbody>
+        </table>
       </div>
     </section>
 
     <!-- 渠道 -->
     <section class="page hidden" id="page-channels">
       <div class="panel">
-        <div class="panel-head"><h3>上游渠道（仅管理员可见）</h3><button class="btn-ghost sm" id="btnProbe">探测上游模型</button></div>
-        <div class="probe-box hidden" id="probeBox">
+        <div class="panel-head">
+          <h3>上游渠道</h3>
+          <button class="btn-primary sm" id="btnNewChannel">+ 新建渠道</button>
+        </div>
+        <table class="tbl">
+          <thead><tr><th>ID</th><th>名称</th><th>上游地址</th><th>Key</th><th>模型数</th><th>优先级</th><th>状态</th><th>健康</th><th>操作</th></tr></thead>
+          <tbody id="channelBody"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h3>探测上游模型</h3></div>
+        <div class="probe-box">
           <input id="probeUrl" placeholder="https://api.example.com/v1">
           <input id="probeKey" placeholder="sk-...（可留空）">
           <button class="btn-primary sm" id="btnProbeGo">探测</button>
-          <div id="probeResult" class="muted"></div>
+        </div>
+        <div id="probeResult" class="muted"></div>
+      </div>
+    </section>
+
+    <!-- 用户管理 -->
+    <section class="page hidden" id="page-users">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>用户管理 <span class="badge" id="userCount">-</span></h3>
+          <button class="btn-ghost sm" id="btnReloadUsers">刷新</button>
         </div>
         <table class="tbl">
-          <thead><tr><th>ID</th><th>名称</th><th>上游地址</th><th>Key</th><th>模型数</th><th>优先级</th><th>状态</th></tr></thead>
-          <tbody id="channelBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+          <thead><tr><th>ID</th><th>用户名</th><th>角色</th><th>状态</th><th>余额</th><th>已用</th><th>请求</th><th>邀请</th><th>操作</th></tr></thead>
+          <tbody id="userBody"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
         </table>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h3>兑换码管理 <span class="badge" id="redeemCount">-</span></h3>
+          <button class="btn-primary sm" id="btnGenRedeem">+ 生成兑换码</button>
+        </div>
+        <table class="tbl">
+          <thead><tr><th>ID</th><th>兑换码</th><th>额度</th><th>备注</th><th>状态</th><th>使用者</th><th>操作</th></tr></thead>
+          <tbody id="redeemBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 设置 -->
+    <section class="page hidden" id="page-settings">
+      <div class="panel">
+        <h3>⚙️ 系统设置</h3>
+        <div class="form-grid">
+          <div><label>站点名称</label><input id="sSiteName"></div>
+          <div><label>注册赠送（quota，500000=$1）</label><input id="sSignup" type="number"></div>
+          <div><label>签到赠送（quota）</label><input id="sCheckin" type="number"></div>
+          <div><label>每令牌每分钟限流（0=不限）</label><input id="sRate" type="number"></div>
+          <div><label>邀请返利比例（0.1=10%）</label><input id="sInvite" type="number" step="0.01"></div>
+          <div><label>公告（留空不显示）</label><input id="sAnnounce"></div>
+        </div>
+        <button class="btn-primary" id="btnSaveSettings" style="margin-top:16px;max-width:220px">保存设置</button>
+      </div>
+      <div class="panel">
+        <h3>📊 全站统计</h3>
+        <div class="mini-row" id="sysStats"></div>
       </div>
     </section>
 
@@ -144,9 +271,9 @@
       <div class="panel">
         <h3>接入方式（OpenAI 兼容）</h3>
         <p class="muted">把 base_url 指向本平台，用你的 <code>sk-</code> 令牌即可，无需改代码。</p>
-        <pre class="code">curl <span id="docBase">http://127.0.0.1:PORT</span>/v1/chat/completions \
+        <pre class="code">curl <span class="docBase">http://127.0.0.1:58881</span>/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-你的令牌" \
+  -H "Authorization: Bearer ***你的令牌" \
   -d '{
     "model": "deepseek-v4-flash",
     "messages": [{"role":"user","content":"你好"}],
@@ -155,8 +282,8 @@
         <h3>Python (openai SDK)</h3>
         <pre class="code">from openai import OpenAI
 client = OpenAI(
-    base_url="<span class="docBaseInline">http://127.0.0.1:PORT</span>/v1",
-    api_key="sk-你的令牌",
+    base_url="<span class="docBase">http://127.0.0.1:58881</span>/v1",
+    api_key="***",
 )
 r = client.chat.completions.create(
     model="deepseek-v4-flash",
@@ -169,6 +296,14 @@ print(r.choices[0].message.content)</pre>
           <li><code>POST /v1/chat/completions</code> — 对话补全（支持 stream）</li>
           <li><code>POST /v1/completions</code> — 文本补全</li>
           <li><code>POST /v1/embeddings</code> — 向量</li>
+        </ul>
+        <h3>错误码</h3>
+        <ul class="doc-list">
+          <li><code>401</code> 令牌无效 / 过期</li>
+          <li><code>402</code> 余额或令牌额度不足</li>
+          <li><code>403</code> 令牌禁用 / 模型无权 / IP 不白名单</li>
+          <li><code>429</code> 触发限流（响应头带 <code>Retry-After</code>）</li>
+          <li><code>502/503</code> 上游全部不可用（自动故障转移后仍失败）</li>
         </ul>
       </div>
     </section>

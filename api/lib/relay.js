@@ -11,14 +11,28 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const ratelimit = require('./ratelimit');
+const health = require('./health');
 
 let CTX = null; // { db, store, billing, QUOTA_PER_USD, clientIp, json }
 
 function status() {
   if (!CTX) return { ready: false };
   const chs = CTX.store.listChannelsRaw(CTX.db);
-  return { ready: true, channels: chs.length, active: chs.filter(c => c.status === 1).length };
+  return {
+    ready: true,
+    site: CTX.store.getSetting(CTX.db, 'site_name'),
+    channels: chs.length,
+    active: chs.filter(c => c.status === 1).length,
+    healthy: chs.filter(c => c.status === 1 && health.available(c.id)).length,
+    models: CTX.store.publicModelCatalog(CTX.db).count,
+    health: health.snapshot(),
+    ratelimit: ratelimit.stats(),
+  };
 }
+
+/** 让 status 在首次 /v1 请求前也能用（由 server 启动时注入） */
+function init(ctx) { CTX = ctx; }
 
 // ---------- 鉴权 ----------
 function authToken(ctx, req) {
@@ -46,6 +60,15 @@ function authToken(ctx, req) {
   if (!t.unlimited_quota && t.remain_quota <= 0) return { err: '令牌额度已用尽', code: 402 };
   // 用户余额
   if (user.quota <= 0) return { err: '账户余额不足，请充值', code: 402 };
+
+  // 限流（按令牌；管理员豁免）
+  if (user.role < 100) {
+    const limit = ctx.store.getSetting(ctx.db, 'rate_limit_per_min');
+    const rl = ratelimit.check('t' + t.id, limit);
+    if (!rl.ok) {
+      return { err: `请求过于频繁（限 ${rl.limit}/分钟，请 ${rl.retryAfter}s 后重试）`, code: 429, retryAfter: rl.retryAfter };
+    }
+  }
 
   return { token: t, user };
 }
@@ -137,7 +160,7 @@ async function handle(ctx, req, res, pathname, query) {
 
   // 鉴权
   const a = authToken(ctx, req);
-  if (a.err) return ctx.json(res, a.code, { error: { message: a.err, type: 'invalid_request_error' } });
+  if (a.err) return ctx.json(res, a.code, { error: { message: a.err, type: 'invalid_request_error' } }, a.retryAfter);
 
   // 模型白名单
   if (!modelAllowed(a.token, model)) {
@@ -156,10 +179,10 @@ async function handle(ctx, req, res, pathname, query) {
     is_stream: isStream, ip, request_id: requestId,
   };
 
-  // 渠道路由：按优先级依次尝试，失败自动换下一个（故障转移）
-  const ranked = rankChannels(ctx, model);
+  // 渠道路由：按优先级依次尝试，失败自动换下一个（故障转移 + 熔断跳过）
+  const ranked = rankChannels(ctx, model).filter(c => health.available(c.id));
   if (!ranked.length) {
-    return ctx.json(res, 503, { error: { message: `没有可用渠道支持模型 ${model}`, type: 'api_error' } });
+    return ctx.json(res, 503, { error: { message: `没有可用渠道支持模型 ${model}（可能全部熔断）`, type: 'api_error' } });
   }
 
   let lastErr = null;
@@ -169,6 +192,7 @@ async function handle(ctx, req, res, pathname, query) {
     const upstreamUrl = ch.base_url.replace(/\/+$/, '') + pathname.replace('/v1', '');
     const outBody = { ...body, model: upstreamModel };
     const logCtx = { ...logBase, channel_id: ch.id, channel_name: ch.name, retry: i };
+    const chT0 = Date.now();
 
     try {
       const up = await fetch(upstreamUrl, {
@@ -185,15 +209,18 @@ async function handle(ctx, req, res, pathname, query) {
       if (!up.ok) {
         const txt = await up.text().catch(() => '');
         lastErr = `上游 ${ch.name} 返回 ${up.status}: ${txt.slice(0, 200)}`;
+        health.onFailure(ch.id, lastErr);
         ctx.store.insertLog(ctx.db, { ...logCtx, use_time: (Date.now() - started) / 1000, status: 'error', error: lastErr });
         console.warn(`[relay] 渠道失败，尝试下一个: ${lastErr}`);
         continue;   // 故障转移
       }
 
+      health.onSuccess(ch.id, Date.now() - chT0);
       if (isStream) return await relayStream({ ctx, up, res, body, logCtx, model, started });
       return await relayOnce({ ctx, up, res, body, logCtx, model, started });
     } catch (e) {
       lastErr = `上游 ${ch.name} 请求失败: ${e.message}`;
+      health.onFailure(ch.id, lastErr);
       ctx.store.insertLog(ctx.db, { ...logCtx, use_time: (Date.now() - started) / 1000, status: 'error', error: lastErr });
       console.warn(`[relay] ${lastErr}`);
       continue;
@@ -303,6 +330,27 @@ function settle(ctx, { logCtx, model, prompt, completion, quota, started, stream
     ctx.store.addTokenUsage(ctx.db, logCtx.token_id, quota);
     ctx.store.touchToken(ctx.db, logCtx.token_id);
     ctx.store.addChannelUsage(ctx.db, logCtx.channel_id, quota);
+
+    // 邀请返利：将消费额度的一部分回馈给邀请人
+    try {
+      const rate = parseFloat(ctx.store.getSetting(ctx.db, 'invite_reward_rate') || '0');
+      if (rate > 0 && quota > 0) {
+        const u = ctx.store.getUserById(ctx.db, logCtx.user_id);
+        if (u && u.inviter_id) {
+          const reward = Math.floor(quota * rate);
+          if (reward > 0) {
+            ctx.store.addUserQuota(ctx.db, u.inviter_id, reward);
+            ctx.store.addInviteReward(ctx.db, u.inviter_id, reward);
+            ctx.store.insertLog(ctx.db, {
+              user_id: u.inviter_id, username: 'invite-reward', token_id: 0, token_name: '返利',
+              model_name: model, channel_id: 0, channel_name: '', quota: -reward,
+              status: 'success', request_id: 'invite:' + logCtx.request_id,
+            });
+          }
+        }
+      }
+    } catch (e) { console.error('[settle/invite]', e.message); }
+
     console.log(`[relay] ${logCtx.username} ${model} ch=${logCtx.channel_name} p=${prompt} c=${completion} quota=${quota} ${useSec.toFixed(1)}s${stream ? ' stream' : ''}`);
   } catch (e) { console.error('[settle]', e.message); }
 }
@@ -316,4 +364,4 @@ function readRaw(req, limit = 32 * 1024 * 1024) {
   });
 }
 
-module.exports = { handle, status };
+module.exports = { handle, status, init };

@@ -16,6 +16,7 @@ const { DatabaseSync } = require('node:sqlite');
 const store = require('./lib/store');
 const relay = require('./lib/relay');
 const billing = require('./lib/billing');
+const health = require('./lib/health');
 
 // ============ 配置 ============
 const PORT = parseInt(process.env.PORT || '58880', 10);
@@ -31,16 +32,20 @@ const db = store.open(DB_PATH);
 store.migrate(db);
 store.seedChannels(db, path.join(__dirname, 'channels.json'));
 console.log(`[db] 数据库就绪: ${DB_PATH}`);
+health.startProber({ db, store });
 
 // ============ HTTP 工具 ============
 function json(res, code, obj, extraHeaders) {
   const body = JSON.stringify(obj);
-  res.writeHead(code, {
+  const headers = {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     'Access-Control-Allow-Origin': '*',
-    ...(extraHeaders || {}),
-  });
+  };
+  // extraHeaders 可以是对象，也可以是数字（秒级 Retry-After）
+  if (typeof extraHeaders === 'number') headers['Retry-After'] = String(Math.max(1, extraHeaders));
+  else Object.assign(headers, extraHeaders || {});
+  res.writeHead(code, headers);
   res.end(body);
 }
 function readBody(req, limit = 20 * 1024 * 1024) {
@@ -121,6 +126,39 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { success: true, data: store.userDashboard(db, u) });
     }
 
+    // ---------- 兑换 / 签到 / 邀请 ----------
+    if (pathname === '/api/user/topup' && req.method === 'POST') {
+      const u = requireUser(req, res); if (!u) return;
+      const b = await readJson(req) || {};
+      const code = String(b.code || '').trim();
+      if (!code) return json(res, 400, { success: false, message: '请输入兑换码' });
+      const r = store.redeemCode(db, u, code);
+      if (!r.ok) return json(res, 400, { success: false, message: r.message });
+      console.log(`[topup] ${u.username} 兑换 ${r.quota} quota`);
+      return json(res, 200, { success: true, message: '兑换成功', data: store.publicUser(db, r.user) });
+    }
+    if (pathname === '/api/user/checkin') {
+      const u = requireUser(req, res); if (!u) return;
+      if (req.method === 'GET') return json(res, 200, { success: true, data: store.checkinStatus(db, u) });
+      const quota = parseInt(store.getSetting(db, 'checkin_quota') || '0', 10);
+      const r = store.doCheckin(db, u, quota);
+      if (!r.ok) return json(res, 400, { success: false, message: r.message });
+      return json(res, 200, { success: true, message: `签到成功，获得 ${quota} quota`, data: store.publicUser(db, r.user) });
+    }
+    if (pathname === '/api/user/invite') {
+      const u = requireUser(req, res); if (!u) return;
+      return json(res, 200, {
+        success: true,
+        data: {
+          aff_code: u.aff_code,
+          stats: store.inviteStats(db, u),
+          invitees: store.listInvitees(db, u),
+          reward_rate: parseFloat(store.getSetting(db, 'invite_reward_rate') || '0'),
+          site_name: store.getSetting(db, 'site_name'),
+        },
+      });
+    }
+
     // ---------- 令牌 ----------
     if (pathname === '/api/token/' || pathname === '/api/token') {
       const u = requireUser(req, res); if (!u) return;
@@ -162,13 +200,111 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/api/channel/' || pathname === '/api/channel') {
       const u = requireUser(req, res); if (!u) return;
       if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
-      return json(res, 200, { success: true, data: store.listChannels(db, false) });
+      if (req.method === 'GET') {
+        const list = store.listChannelsRaw(db).map(c => ({
+          ...c,
+          api_key: store.maskKey(c.api_key),
+          models: c.models || '',
+          health: health.snapshot()[c.id] || null,
+        }));
+        return json(res, 200, { success: true, data: list });
+      }
+      if (req.method === 'POST') {
+        const b = await readJson(req) || {};
+        return json(res, 200, { success: true, data: store.addChannel(db, b) });
+      }
+    }
+    if (pathname === '/api/channel/update' && req.method === 'POST') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      const b = await readJson(req) || {};
+      const c = store.updateChannel(db, parseInt(b.id || 0, 10), b);
+      return json(res, 200, { success: true, data: c });
+    }
+    if (pathname === '/api/channel/delete' && req.method === 'POST') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      const b = await readJson(req) || {};
+      store.deleteChannel(db, parseInt(b.id || 0, 10));
+      return json(res, 200, { success: true, message: '已删除' });
+    }
+    if (pathname === '/api/channel/test' && req.method === 'POST') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      const b = await readJson(req) || {};
+      const c = store.getChannel(db, parseInt(b.id || 0, 10));
+      if (!c) return json(res, 404, { success: false, message: '渠道不存在' });
+      const r = await health.probeChannel(c);
+      store.touchChannel(db, c.id);
+      return json(res, 200, { success: r.ok, data: r, message: r.ok ? `✅ ${r.models} 个模型 / ${r.latency}ms` : '❌ ' + r.error });
     }
     if (pathname === '/api/channel/models' && req.method === 'POST') {
       const u = requireUser(req, res); if (!u) return;
       const b = await readJson(req);
       if (!b || !b.base_url) return json(res, 400, { success: false, message: '缺少 base_url' });
       return await handleChannelModels(res, b);
+    }
+
+    // ---------- 管理：用户 / 兑换码 / 设置 ----------
+    if (pathname === '/api/admin/user/list') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      return json(res, 200, { success: true, data: store.listUsers(db) });
+    }
+    if (pathname === '/api/admin/user/update' && req.method === 'POST') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      const b = await readJson(req) || {};
+      const r = store.adminUpdateUser(db, parseInt(b.id || 0, 10), b);
+      return json(res, 200, { success: true, data: r });
+    }
+    if (pathname === '/api/admin/redemption/') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      if (req.method === 'GET') {
+        const p = parseInt(query.get('p') || '1', 10), size = Math.min(parseInt(query.get('size') || '50', 10), 200);
+        return json(res, 200, { success: true, data: store.listRedemptions(db, { p, size }) });
+      }
+      if (req.method === 'POST') {
+        const b = await readJson(req) || {};
+        const created = await store.createRedemptions(db, {
+          count: Math.min(parseInt(b.count || 1, 10), 500),
+          quota: parseInt(b.quota || 0, 10),
+          name: String(b.name || ''),
+          createdBy: u.id,
+        });
+        console.log(`[admin] ${u.username} 生成 ${created.length} 个兑换码`);
+        return json(res, 200, { success: true, data: { count: created.length, codes: created } });
+      }
+    }
+    if (pathname === '/api/admin/redemption/update' && req.method === 'POST') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      const b = await readJson(req) || {};
+      store.setRedemptionStatus(db, parseInt(b.id || 0, 10), b.status);
+      return json(res, 200, { success: true, message: '已更新' });
+    }
+    if (pathname === '/api/admin/redemption/delete' && req.method === 'POST') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      const b = await readJson(req) || {};
+      store.deleteRedemption(db, parseInt(b.id || 0, 10));
+      return json(res, 200, { success: true, message: '已删除' });
+    }
+    if (pathname === '/api/settings') {
+      if (req.method === 'GET') {
+        const s = { ...store.getSettings(db) };
+        return json(res, 200, { success: true, data: s });
+      }
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      const b = await readJson(req) || {};
+      return json(res, 200, { success: true, data: store.setSettings(db, b) });
+    }
+    if (pathname === '/api/admin/stats') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      return json(res, 200, { success: true, data: { ...store.systemStats(db), health: health.snapshot(), site: store.getSettings(db) } });
     }
 
     if (pathname === '/api/admin/user/list') {
@@ -189,7 +325,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { success: true, data: store.systemStats(db) });
     }
 
-    if (pathname === '/api/health') return json(res, 200, { success: true, ts: Date.now() });
+    if (pathname === '/api/health') return json(res, 200, { success: true, ts: Date.now(), site: store.getSetting(db, 'site_name') });
     if (pathname === '/api/status') return json(res, 200, { success: true, data: relay.status() });
 
     // ---------- 静态 ----------
@@ -204,6 +340,7 @@ const server = http.createServer(async (req, res) => {
 function relayCtx() {
   return { db, store, billing, QUOTA_PER_USD, clientIp, json };
 }
+relay.init(relayCtx());   // 启动即注入，使 /api/status 在首次 /v1 请求前就可用
 
 // ============ Handlers ============
 async function handleRegister(req, res) {
@@ -218,12 +355,21 @@ async function handleRegister(req, res) {
 
   // 首个注册用户自动成为管理员
   const isFirst = db.prepare('SELECT COUNT(*) c FROM users').get().c === 0;
+  const signupQuota = parseInt(store.getSetting(db, 'signup_quota') || '0', 10);
   const u = await store.createUser(db, username, password, {
-    quota: isFirst ? 5 * QUOTA_PER_USD : 0,   // 管理员初始赠 $5
+    quota: isFirst ? 5 * QUOTA_PER_USD : signupQuota,
     role: isFirst ? 100 : 1,
   });
-  console.log(`[auth] 注册: ${username}${isFirst ? ' (管理员)' : ''}`);
-  return json(res, 200, { success: true, message: '注册成功', data: store.publicUser(db, u) });
+
+  // 邀请绑定（通过邀请码）
+  const aff = String(b.aff_code || b.inviter || '').trim();
+  if (aff && !isFirst) {
+    const inviter = store.userByAff(db, aff);
+    if (inviter && inviter.id !== u.id) store.setInviter(db, u.id, inviter.id);
+  }
+
+  console.log(`[auth] 注册: ${username}${isFirst ? ' (管理员)' : ''}${aff ? ' 邀请码=' + aff : ''}`);
+  return json(res, 200, { success: true, message: '注册成功', data: store.publicUser(db, store.getUserById(db, u.id)) });
 }
 
 async function handleLogin(req, res) {

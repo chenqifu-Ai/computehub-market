@@ -104,7 +104,42 @@ function migrate(db) {
     created_at        INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_logs_user ON logs(user_id, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS redemptions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    code          TEXT UNIQUE NOT NULL,
+    name          TEXT NOT NULL DEFAULT '',
+    quota         INTEGER NOT NULL DEFAULT 0,     -- 可兑换额度
+    status        INTEGER NOT NULL DEFAULT 1,     -- 1 未用 / 2 已用 / 3 禁用
+    created_by    INTEGER NOT NULL DEFAULT 0,
+    used_by       INTEGER NOT NULL DEFAULT 0,
+    used_by_name  TEXT NOT NULL DEFAULT '',
+    created_time  INTEGER NOT NULL,
+    redeemed_time INTEGER NOT NULL DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+  );
+
+  CREATE TABLE IF NOT EXISTS checkins (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    quota      INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_checkins_user ON checkins(user_id, created_at DESC);
   `);
+
+  // 增量迁移（已存在的库补齐字段）
+  const cols = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
+  if (!cols.includes('inviter_id')) db.exec('ALTER TABLE users ADD COLUMN inviter_id INTEGER NOT NULL DEFAULT 0');
+  if (!cols.includes('invite_reward')) db.exec('ALTER TABLE users ADD COLUMN invite_reward INTEGER NOT NULL DEFAULT 0');
+}
+
+function userByAff(db, aff) {
+  return db.prepare('SELECT * FROM users WHERE aff_code=?').get(aff) || null;
 }
 
 // ---------- 密码 ----------
@@ -159,6 +194,8 @@ function publicUser(db, u) {
     role: u.role,
     status: u.status,
     aff_code: u.aff_code,
+    inviter_id: u.inviter_id || 0,
+    invite_reward: u.invite_reward || 0,
     remark: u.remark,
     created_at: u.created_at,
   };
@@ -185,14 +222,16 @@ function addUserQuota(db, id, amount) {
 function userDashboard(db, u) {
   const row = db.prepare(`
     SELECT COUNT(*) AS reqs,
-           COALESCE(SUM(quota),0) AS quota,
+           COALESCE(SUM(CASE WHEN quota > 0 THEN quota ELSE 0 END),0) AS quota,
            COALESCE(SUM(total_tokens),0) AS tokens
-    FROM logs WHERE user_id = ?
+    FROM logs WHERE user_id = ? AND request_id NOT LIKE 'invite:%'
   `).get(u.id);
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const t = db.prepare(`
-    SELECT COUNT(*) AS reqs, COALESCE(SUM(quota),0) AS quota, COALESCE(SUM(total_tokens),0) AS tokens
-    FROM logs WHERE user_id = ? AND created_at >= ?
+    SELECT COUNT(*) AS reqs,
+           COALESCE(SUM(CASE WHEN quota > 0 THEN quota ELSE 0 END),0) AS quota,
+           COALESCE(SUM(total_tokens),0) AS tokens
+    FROM logs WHERE user_id = ? AND created_at >= ? AND request_id NOT LIKE 'invite:%'
   `).get(u.id, today.getTime());
   return {
     quota: u.quota, used_quota: u.used_quota, request_count: u.request_count,
@@ -294,15 +333,48 @@ function seedChannels(db, jsonPath) {
   }
   console.log(`[db] 已导入 ${cfgs.length} 个上游渠道`);
 }
+function maskKey(k) {
+  if (!k) return '(无)';
+  if (k.length <= 12) return k.slice(0, 3) + '…';
+  return k.slice(0, 6) + '…' + k.slice(-4);
+}
 function listChannels(db, withKey = true) {
   const rows = db.prepare('SELECT * FROM channels ORDER BY priority DESC, id ASC').all();
-  return rows.map(c => withKey ? c : { ...c, api_key: c.api_key ? c.api_key.slice(0, 6) + '…' + c.api_key.slice(-4) : '' });
+  return rows.map(c => withKey ? c : { ...c, api_key: maskKey(c.api_key) });
 }
 function listChannelsRaw(db) { return db.prepare('SELECT * FROM channels ORDER BY priority DESC, id ASC').all(); }
 function getChannel(db, id) { return db.prepare('SELECT * FROM channels WHERE id=?').get(id) || null; }
 function addChannelUsage(db, id, quota) {
   db.prepare('UPDATE channels SET used_quota = used_quota + ? WHERE id=?').run(quota, id);
 }
+function addChannel(db, b) {
+  const info = db.prepare(`
+    INSERT INTO channels (name,type,base_url,api_key,models,model_mapping,weight,priority,status,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    String(b.name || '未命名渠道'), parseInt(b.type || 1, 10), String(b.base_url || ''),
+    String(b.api_key || ''), Array.isArray(b.models) ? b.models.join(',') : String(b.models || ''),
+    b.model_mapping ? (typeof b.model_mapping === 'string' ? b.model_mapping : JSON.stringify(b.model_mapping)) : '',
+    parseInt(b.weight || 1, 10), parseInt(b.priority || 0, 10), b.status === 0 ? 0 : 1, Date.now(),
+  );
+  return getChannel(db, Number(info.lastInsertRowid));
+}
+function updateChannel(db, id, b) {
+  const f = [], v = [];
+  const set = (c, val) => { f.push(c + '=?'); v.push(val); };
+  if (b.name !== undefined) set('name', String(b.name));
+  if (b.base_url !== undefined) set('base_url', String(b.base_url));
+  if (b.api_key !== undefined && String(b.api_key).trim() !== '') set('api_key', String(b.api_key));
+  if (b.models !== undefined) set('models', Array.isArray(b.models) ? b.models.join(',') : String(b.models));
+  if (b.model_mapping !== undefined) set('model_mapping', typeof b.model_mapping === 'string' ? b.model_mapping : JSON.stringify(b.model_mapping));
+  if (b.weight !== undefined) set('weight', parseInt(b.weight, 10));
+  if (b.priority !== undefined) set('priority', parseInt(b.priority, 10));
+  if (b.status !== undefined) set('status', parseInt(b.status, 10));
+  if (f.length) { v.push(id); db.prepare(`UPDATE channels SET ${f.join(',')} WHERE id=?`).run(...v); }
+  return getChannel(db, id);
+}
+function deleteChannel(db, id) { db.prepare('DELETE FROM channels WHERE id=?').run(id); }
+function touchChannel(db, id) { db.prepare('UPDATE channels SET tested_at=? WHERE id=?').run(Date.now(), id); }
 
 // 找出能服务某模型的渠道（按优先级/权重）
 function channelsForModel(db, model) {
@@ -365,15 +437,17 @@ function listLogs(db, { userId, p = 1, size = 20 }) {
 function logStatsByModel(db, userId) {
   return db.prepare(`
     SELECT model_name, COUNT(*) AS count, SUM(prompt_tokens) AS prompt_tokens,
-           SUM(completion_tokens) AS completion_tokens, SUM(quota) AS quota,
+           SUM(completion_tokens) AS completion_tokens,
+           SUM(CASE WHEN quota > 0 THEN quota ELSE 0 END) AS quota,
            AVG(use_time) AS avg_time
-    FROM logs WHERE user_id=? GROUP BY model_name ORDER BY count DESC
+    FROM logs WHERE user_id=? AND request_id NOT LIKE 'invite:%'
+    GROUP BY model_name ORDER BY count DESC
   `).all(userId);
 }
 
 // ---------- 管理 ----------
 function listUsers(db) {
-  return db.prepare('SELECT * FROM users ORDER BY id ASC').all().map(publicUser);
+  return db.prepare('SELECT * FROM users ORDER BY id ASC').all().map(u => publicUser(db, u));
 }
 function adminUpdateUser(db, id, b) {
   const f = [], v = [];
@@ -394,6 +468,101 @@ function systemStats(db) {
   return { users: u.c, user_quota: u.q, user_used_quota: u.uq, requests: l.c, log_quota: l.q, tokens: l.t, channels: c.c };
 }
 
+// ---------- 兑换码 ----------
+async function createRedemptions(db, { count = 1, quota = 0, name = '', createdBy = 0 }) {
+  const out = [];
+  const stmt = db.prepare('INSERT INTO redemptions (code,name,quota,created_by,created_time) VALUES (?,?,?,?,?)');
+  for (let i = 0; i < count; i++) {
+    const code = crypto.randomBytes(8).toString('base64url').replace(/[-_]/g, 'x').slice(0, 12).toUpperCase();
+    try {
+      const info = stmt.run(code, name, quota, createdBy, Date.now());
+      out.push(db.prepare('SELECT * FROM redemptions WHERE id=?').get(Number(info.lastInsertRowid)));
+    } catch { i--; }   // 撞码重试
+  }
+  return out;
+}
+function getRedemption(db, code) {
+  return db.prepare('SELECT * FROM redemptions WHERE code=?').get(String(code).toUpperCase().trim()) || null;
+}
+function redeemCode(db, user, code) {
+  const r = getRedemption(db, code);
+  if (!r) return { ok: false, message: '兑换码不存在' };
+  if (r.status === 2) return { ok: false, message: '兑换码已被使用' };
+  if (r.status === 3) return { ok: false, message: '兑换码已禁用' };
+  db.prepare('UPDATE redemptions SET status=2, used_by=?, used_by_name=?, redeemed_time=? WHERE id=? AND status=1')
+    .run(user.id, user.username, Date.now(), r.id);
+  addUserQuota(db, user.id, r.quota);
+  return { ok: true, quota: r.quota, user: getUserById(db, user.id) };
+}
+function listRedemptions(db, { p = 1, size = 50 } = {}) {
+  const total = db.prepare('SELECT COUNT(*) c FROM redemptions').get().c;
+  const items = db.prepare('SELECT * FROM redemptions ORDER BY id DESC LIMIT ? OFFSET ?')
+    .all(size, (p - 1) * size);
+  return { items, total, page: p, page_size: size };
+}
+function setRedemptionStatus(db, id, status) {
+  db.prepare('UPDATE redemptions SET status=? WHERE id=?').run(parseInt(status, 10), id);
+}
+function deleteRedemption(db, id) { db.prepare('DELETE FROM redemptions WHERE id=?').run(id); }
+
+// ---------- 设置 ----------
+const DEFAULT_SETTINGS = {
+  site_name: '算力商城 API',
+  signup_quota: '0',            // 注册赠送额度
+  checkin_quota: '0',           // 每日签到额度
+  rate_limit_per_min: '120',    // 每令牌每分钟请求上限（0=不限）
+  invite_reward_rate: '0.1',    // 邀请返利率（被邀请人消费的 x 倍）
+  announcement: '',
+};
+function getSettings(db) {
+  const rows = db.prepare('SELECT key,value FROM settings').all();
+  const out = { ...DEFAULT_SETTINGS };
+  for (const r of rows) out[r.key] = r.value;
+  return out;
+}
+function getSetting(db, key) { return getSettings(db)[key]; }
+function setSettings(db, obj) {
+  const stmt = db.prepare('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
+  for (const [k, v] of Object.entries(obj || {})) {
+    if (k in DEFAULT_SETTINGS) stmt.run(k, String(v));
+  }
+  return getSettings(db);
+}
+
+// ---------- 邀请 ----------
+function getInviter(db, user) {
+  if (!user || !user.inviter_id) return null;
+  return getUserById(db, user.inviter_id);
+}
+function listInvitees(db, user) {
+  return db.prepare('SELECT id,username,created_at FROM users WHERE inviter_id=? ORDER BY id DESC').all(user.id);
+}
+function setInviter(db, userId, inviterId) {
+  db.prepare('UPDATE users SET inviter_id=? WHERE id=?').run(inviterId, userId);
+}
+function inviteStats(db, user) {
+  const invited = db.prepare('SELECT COUNT(*) c FROM users WHERE inviter_id=?').get(user.id).c;
+  return { invited, reward_quota: user.invite_reward || 0 };
+}
+function addInviteReward(db, userId, quota) {
+  db.prepare('UPDATE users SET invite_reward = invite_reward + ? WHERE id=?').run(quota, userId);
+}
+
+// ---------- 签到 ----------
+function doCheckin(db, user, quota) {
+  const start = new Date(); start.setHours(0, 0, 0, 0);
+  const today = db.prepare('SELECT COUNT(*) c FROM checkins WHERE user_id=? AND created_at>=?').get(user.id, start.getTime()).c;
+  if (today > 0) return { ok: false, message: '今日已签到' };
+  db.prepare('INSERT INTO checkins (user_id,quota,created_at) VALUES (?,?,?)').run(user.id, quota, Date.now());
+  addUserQuota(db, user.id, quota);
+  return { ok: true, quota, user: getUserById(db, user.id) };
+}
+function checkinStatus(db, user) {
+  const start = new Date(); start.setHours(0, 0, 0, 0);
+  const today = db.prepare('SELECT COUNT(*) c FROM checkins WHERE user_id=? AND created_at>=?').get(user.id, start.getTime()).c;
+  return { checked_today: today > 0 };
+}
+
 module.exports = {
   open, migrate, seedChannels,
   hashPassword, verifyPassword,
@@ -402,8 +571,13 @@ module.exports = {
   createSession, getSession, deleteSession,
   createToken, getToken, getTokenByPlain, listTokens, updateToken, deleteToken, touchToken, addTokenUsage,
   listChannels, listChannelsRaw, getChannel, channelsForModel, addChannelUsage,
-  publicModelCatalog, pricingCatalog,
+  addChannel, updateChannel, deleteChannel, touchChannel,
+  publicModelCatalog, pricingCatalog, maskKey,
   insertLog, listLogs, logStatsByModel,
-  listUsers, adminUpdateUser, systemStats,
+  listUsers, adminUpdateUser, systemStats, userByAff,
+  createRedemptions, getRedemption, redeemCode, listRedemptions, setRedemptionStatus, deleteRedemption,
+  DEFAULT_SETTINGS, getSettings, getSetting, setSettings,
+  getInviter, listInvitees, setInviter, inviteStats, addInviteReward,
+  doCheckin, checkinStatus,
   hashKey, newTokenKey,
 };
