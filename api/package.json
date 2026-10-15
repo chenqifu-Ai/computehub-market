@@ -1,0 +1,14 @@
+{
+  "name": "computehub-api",
+  "version": "0.1.0",
+  "description": "算力商城 · AI 模型聚合网关（New-API 式中转站，零 npm 依赖）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "gen-channels": "python3 gen-channels.py"
+  },
+  "engines": { "node": ">=22.0.0" },
+  "license": "UNLICENSED",
+  "private": true,
+  "dependencies": {}
+}

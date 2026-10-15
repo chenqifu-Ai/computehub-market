@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>算力商城 · API 平台</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- ============ 登录 / 注册 ============ -->
+<div id="authView" class="auth-wrap hidden">
+  <div class="auth-card">
+    <div class="auth-logo">⚡</div>
+    <h1>算力商城 API</h1>
+    <p class="auth-sub">AI 模型聚合网关 · 一站式调用</p>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="login">登录</button>
+      <button class="tab" data-tab="register">注册</button>
+    </div>
+
+    <form id="authForm" class="auth-form">
+      <label>用户名</label>
+      <input type="text" id="authUser" placeholder="请输入用户名" autocomplete="username" maxlength="32">
+      <label>密码</label>
+      <input type="password" id="authPass" placeholder="至少 6 位" autocomplete="current-password" maxlength="64">
+      <div id="authMsg" class="auth-msg"></div>
+      <button type="submit" id="authSubmit" class="btn-primary">登录</button>
+    </form>
+  </div>
+</div>
+
+<!-- ============ 控制台 ============ -->
+<div id="appView" class="hidden">
+  <aside class="side">
+    <div class="side-logo"><span>⚡</span> 算力商城</div>
+    <nav class="side-nav">
+      <a data-page="dashboard" class="active">📊 仪表盘</a>
+      <a data-page="tokens">🔑 令牌管理</a>
+      <a data-page="models">🧩 模型目录</a>
+      <a data-page="logs">📜 使用日志</a>
+      <a data-page="channels">🔌 渠道管理</a>
+      <a data-page="docs">📖 接入文档</a>
+    </nav>
+    <div class="side-foot">
+      <div id="sideUser" class="side-user"></div>
+      <button id="btnLogout" class="btn-ghost sm">退出</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="top">
+      <h2 id="pageTitle">仪表盘</h2>
+      <div class="top-right">
+        <span class="pill" id="balancePill">余额 —</span>
+      </div>
+    </header>
+
+    <!-- 仪表盘 -->
+    <section class="page" id="page-dashboard">
+      <div class="stat-row">
+        <div class="stat-card"><b id="dBalance">—</b><span>剩余余额</span></div>
+        <div class="stat-card"><b id="dUsed">—</b><span>累计消费</span></div>
+        <div class="stat-card"><b id="dReqs">—</b><span>累计请求</span></div>
+        <div class="stat-card"><b id="dToday">—</b><span>今日请求</span></div>
+      </div>
+      <div class="panel">
+        <h3>今日用量</h3>
+        <div class="mini-row">
+          <div><b id="tReq">—</b><span>请求数</span></div>
+          <div><b id="tTok">—</b><span>Tokens</span></div>
+          <div><b id="tCost">—</b><span>消费</span></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>按模型统计（Top 10）</h3>
+        <table class="tbl">
+          <thead><tr><th>模型</th><th>请求</th><th>输入 tok</th><th>输出 tok</th><th>消费</th></tr></thead>
+          <tbody id="dModelStats"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 令牌 -->
+    <section class="page hidden" id="page-tokens">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>我的令牌</h3>
+          <button class="btn-primary sm" id="btnNewToken">+ 新建令牌</button>
+        </div>
+        <table class="tbl">
+          <thead><tr><th>名称</th><th>状态</th><th>额度</th><th>已用</th><th>模型限制</th><th>Key</th><th>最近使用</th><th>操作</th></tr></thead>
+          <tbody id="tokenBody"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 模型目录 -->
+    <section class="page hidden" id="page-models">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>可用模型 <span class="badge" id="modelCount">-</span></h3>
+          <input type="text" id="modelSearch" class="search" placeholder="搜索模型…">
+        </div>
+        <table class="tbl">
+          <thead><tr><th>模型名</th><th>渠道数</th><th>输入 $/1M</th><th>输出 $/1M</th></tr></thead>
+          <tbody id="modelBody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 日志 -->
+    <section class="page hidden" id="page-logs">
+      <div class="panel">
+        <div class="panel-head"><h3>使用日志</h3><span class="muted" id="logTotal"></span></div>
+        <table class="tbl">
+          <thead><tr><th>时间</th><th>模型</th><th>令牌</th><th>渠道</th><th>输入</th><th>输出</th><th>耗时</th><th>消费</th></tr></thead>
+          <tbody id="logBody"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
+        </table>
+        <div class="pager"><button class="btn-ghost sm" id="logPrev">上一页</button><span id="logPage" class="muted"></span><button class="btn-ghost sm" id="logNext">下一页</button></div>
+      </div>
+    </section>
+
+    <!-- 渠道 -->
+    <section class="page hidden" id="page-channels">
+      <div class="panel">
+        <div class="panel-head"><h3>上游渠道（仅管理员可见）</h3><button class="btn-ghost sm" id="btnProbe">探测上游模型</button></div>
+        <div class="probe-box hidden" id="probeBox">
+          <input id="probeUrl" placeholder="https://api.example.com/v1">
+          <input id="probeKey" placeholder="sk-...（可留空）">
+          <button class="btn-primary sm" id="btnProbeGo">探测</button>
+          <div id="probeResult" class="muted"></div>
+        </div>
+        <table class="tbl">
+          <thead><tr><th>ID</th><th>名称</th><th>上游地址</th><th>Key</th><th>模型数</th><th>优先级</th><th>状态</th></tr></thead>
+          <tbody id="channelBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 文档 -->
+    <section class="page hidden" id="page-docs">
+      <div class="panel">
+        <h3>接入方式（OpenAI 兼容）</h3>
+        <p class="muted">把 base_url 指向本平台，用你的 <code>sk-</code> 令牌即可，无需改代码。</p>
+        <pre class="code">curl <span id="docBase">http://127.0.0.1:PORT</span>/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-你的令牌" \
+  -d '{
+    "model": "deepseek-v4-flash",
+    "messages": [{"role":"user","content":"你好"}],
+    "stream": false
+  }'</pre>
+        <h3>Python (openai SDK)</h3>
+        <pre class="code">from openai import OpenAI
+client = OpenAI(
+    base_url="<span class="docBaseInline">http://127.0.0.1:PORT</span>/v1",
+    api_key="sk-你的令牌",
+)
+r = client.chat.completions.create(
+    model="deepseek-v4-flash",
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(r.choices[0].message.content)</pre>
+        <h3>可用端点</h3>
+        <ul class="doc-list">
+          <li><code>GET /v1/models</code> — 列出令牌可见模型</li>
+          <li><code>POST /v1/chat/completions</code> — 对话补全（支持 stream）</li>
+          <li><code>POST /v1/completions</code> — 文本补全</li>
+          <li><code>POST /v1/embeddings</code> — 向量</li>
+        </ul>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<div id="modal" class="modal hidden"><div class="modal-box" id="modalBox"></div></div>
+<script src="/app.js"></script>
+</body>
+</html>

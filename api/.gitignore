@@ -1,0 +1,19 @@
+# 数据库
+*.db
+*.db-wal
+*.db-shm
+api.db*
+
+# 含真实密钥的渠道配置（用 gen-channels.py 生成，不入库）
+channels.json
+
+# 日志
+*.log
+logs/
+
+# Node
+node_modules/
+
+# 系统
+.DS_Store
+Thumbs.db
