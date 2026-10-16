@@ -135,5 +135,30 @@
     "priority": 9,
     "weight": 1,
     "status": 1
+  },
+  {
+    "name": "啊翀",
+    "type": 1,
+    "base_url": "http://transit.wingspire-ai.com:9021",
+    "api_key": "sk-be43…",
+    "models": [
+      "claude-fable-5-1",
+      "claude-fable-5",
+      "claude-opus-4-5-20251101",
+      "claude-opus-4-6",
+      "claude-opus-4-7",
+      "claude-opus-4-8",
+      "claude-opus-5-5",
+      "claude-opus-5",
+      "claude-sonnet-5-5",
+      "claude-sonnet-5",
+      "claude-sonnet-4-6",
+      "claude-sonnet-4-5-20250929",
+      "claude-haiku-4-5-20251001",
+      "claude-haiku-5-5"
+    ],
+    "priority": 50,
+    "weight": 1,
+    "status": 1
   }
 ]

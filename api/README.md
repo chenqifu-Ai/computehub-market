@@ -105,7 +105,7 @@ print(r.choices[0].message.content)
 | GET  | `/api/models` | 公开模型目录 |
 | GET  | `/api/pricing` | 模型价格表 |
 | GET  | `/api/channel/` | 渠道列表（仅管理员） |
-| POST | `/api/channel/models` | 探测上游可用模型 |
+| POST | `/api/channel/models` | 探测上游可用模型：`{base_url, api_key}` 纯探测不落库；`{id, persist?}` 用渠道已存 key 探测并**覆盖写入该渠道 models**（仅管理员） |
 | GET  | `/api/admin/stats` | 全站统计（仅管理员） |
 
 ---
@@ -195,6 +195,21 @@ sudo systemctl restart computehub-api
 
 > ⚠️ `channels.json` 含真实密钥，已加入 `.gitignore`，**不入库**。
 > 入库的是 `channels.example.json`（占位符）。
+
+### 🖥️ 渠道管理（控制台 UI）
+
+渠道页支持：
+
+| 操作 | 说明 |
+|------|------|
+| **新建渠道** | 弹窗填写；「模型列表」**可为空**（建完再同步），但为空时该渠道的模型不会出现在对外目录 |
+| **🔍 探测上游并填充** | 弹窗内按钮：拉取上游 `/models` 并**回填到模型列表输入框**（不自动保存） |
+| **编辑** | 弹窗编辑名称/地址/模型/优先级/权重/映射；**API Key 留空 = 不修改**（列表展示的是脱敏串） |
+| **同步模型** | 列表按钮：用渠道已存 key 探测上游 `/models`，**直接覆盖落库**该渠道 models（有变化立即生效，无需重启） |
+| 测试 / 启用禁用 / 删除 | 探活单个渠道（`/models` 探活 + 写 `tested_at`）/ 人工开关 / 删除 |
+
+> 💡 **新建渠道后看不到模型？** 说明「模型列表」留空了 —— 点该行「同步模型」一键补齐即可。
+> ⚠️ 「模型列表」留空的渠道在 `channelsForModel()` 里会被当成“通吃”所有模型，而在对外目录 `publicModelCatalog()` 里却**不可见**，两边逻辑不一致，建议始终填满。
 
 ---
 

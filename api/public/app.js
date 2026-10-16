@@ -560,6 +560,8 @@ async function loadChannels() {
       <td><span class="tag ${c.status === 1 ? 'on' : 'off'}">${c.status === 1 ? '启用' : '禁用'}</span></td>
       <td>${healthy}${h.last_err ? `<div class="muted" style="font-size:11px" title="${esc(h.last_err)}">${esc((h.last_err || '').slice(0, 40))}</div>` : ''}</td>
       <td class="actions">
+        <button class="btn-ghost sm" onclick="editChannel(${c.id})">编辑</button>
+        <button class="btn-ghost sm" onclick="syncChannelModels(${c.id},'${esc(c.name)}')">同步模型</button>
         <button class="btn-ghost sm" onclick="testChannel(${c.id},'${esc(c.name)}')">测试</button>
         <button class="btn-ghost sm" onclick="toggleChannel(${c.id},${c.status})">${c.status === 1 ? '禁用' : '启用'}</button>
         <button class="btn-ghost sm btn-danger" onclick="delChannel(${c.id},'${esc(c.name)}')">删除</button>
@@ -584,33 +586,83 @@ async function delChannel(id, name) {
   if (!j.success) return toast(j.message, 'err');
   toast('已删除'); loadChannels();
 }
-$('btnNewChannel').onclick = () => {
+// ---------- 渠道 新建/编辑（共用弹窗）+ 探测回填 + 同步 ----------
+let CH_EDIT_ID = 0;   // 0 = 新建
+$('btnNewChannel').onclick = () => openChannelModal(null);
+function openChannelModal(c) {
+  CH_EDIT_ID = c ? c.id : 0;
+  const v = c || { name: '', base_url: '', api_key: '', models: '', priority: 50, weight: 1, model_mapping: '' };
+  let mapStr = '';
+  if (v.model_mapping) {
+    try { mapStr = typeof v.model_mapping === 'string' ? v.model_mapping : JSON.stringify(v.model_mapping); } catch { mapStr = ''; }
+  }
   openModal(`
-    <h3>新建渠道</h3>
-    <label>名称</label><input id="chName" placeholder="例如 某某中转站">
-    <label>上游地址（OpenAI 兼容 /v1）</label><input id="chUrl" placeholder="https://api.example.com/v1">
-    <label>API Key</label><input id="chKey" placeholder="sk-...">
-    <label>模型列表（逗号分隔）</label><input id="chModels" placeholder="deepseek-v4-flash,gpt-oss:20b">
-    <label>优先级（越大越优先）</label><input id="chPrio" type="number" value="50">
-    <label>权重（同优先级分流）</label><input id="chWeight" type="number" value="1">
-    <label>模型映射（可选，JSON 如 {"对外名":"上游名"}）</label><input id="chMap" placeholder="">
+    <h3>${c ? '编辑渠道 · #' + c.id : '新建渠道'}</h3>
+    <label>名称</label><input id="chName" value="${esc(v.name)}" placeholder="例如 某某中转站">
+    <label>上游地址（OpenAI 兼容 /v1）</label><input id="chUrl" value="${esc(v.base_url)}" placeholder="https://api.example.com/v1">
+    <label>API Key${c ? '（留空 = 不修改）' : ''}</label><input id="chKey" placeholder="${c ? '留空保持不变' : 'sk-...'}">
+    <label>模型列表（逗号分隔）</label>
+    <textarea id="chModels" rows="4" style="width:100%;font-family:ui-monospace,monospace" placeholder="deepseek-v4-flash,gpt-oss:20b">${esc(v.models || '')}</textarea>
+    <div style="margin:-6px 0 10px">
+      <button class="btn-ghost sm" onclick="probeIntoModal()">🔍 探测上游并填充</button>
+      <span id="chProbeMsg" class="muted" style="font-size:12px;margin-left:8px"></span>
+    </div>
+    <label>优先级（越大越优先）</label><input id="chPrio" type="number" value="${esc(v.priority)}">
+    <label>权重（同优先级分流）</label><input id="chWeight" type="number" value="${esc(v.weight)}">
+    <label>模型映射（可选，JSON 如 {"对外名":"上游名"}）</label><input id="chMap" value="${esc(mapStr)}" placeholder="">
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closeModal()">取消</button>
-      <button class="btn-primary" onclick="createChannel()">创建</button>
+      <button class="btn-primary" onclick="saveChannel()">${c ? '保存' : '创建'}</button>
     </div>`);
-};
-async function createChannel() {
+}
+// 弹窗内探测：把上游模型回填到「模型列表」输入框
+async function probeIntoModal() {
+  const msg = $('chProbeMsg');
+  const base_url = $('chUrl').value.trim();
+  const key = $('chKey').value.trim();
+  if (!base_url) return toast('请先填写上游地址', 'err');
+  msg.textContent = '探测中…';
+  // 编辑态且未重填 key → 用渠道已存的 key 探测（persist:false 仅拉取，不落库）
+  const body = (CH_EDIT_ID && !key) ? { id: CH_EDIT_ID, persist: false } : { base_url, api_key: key };
+  const j = await api('/api/channel/models', { method: 'POST', body: JSON.stringify(body) });
+  if (!j.success) { msg.textContent = '❌ ' + j.message; return toast('探测失败', 'err'); }
+  $('chModels').value = (j.data.models || []).join(',');
+  msg.textContent = `✅ 拉回 ${j.data.count} 个模型，已填充`;
+  toast(`✅ 已填充 ${j.data.count} 个模型`);
+}
+async function saveChannel() {
   const maps = $('chMap').value.trim();
   const b = {
-    name: $('chName').value.trim(), base_url: $('chUrl').value.trim(), api_key: $('chKey').value.trim(),
+    name: $('chName').value.trim(), base_url: $('chUrl').value.trim(),
     models: $('chModels').value.split(',').map(s => s.trim()).filter(Boolean),
     priority: parseInt($('chPrio').value, 10) || 0, weight: parseInt($('chWeight').value, 10) || 1,
   };
+  const key = $('chKey').value.trim();
+  if (key) b.api_key = key;               // 留空 = 不修改（更新接口只在非空时写 key）
   if (maps) { try { b.model_mapping = JSON.parse(maps); } catch { return toast('模型映射不是合法 JSON', 'err'); } }
   if (!b.base_url) return toast('请填写上游地址', 'err');
-  const j = await api('/api/channel/', { method: 'POST', body: JSON.stringify(b) });
+  if (!b.models.length) return toast('模型列表为空：可点「🔍 探测上游并填充」或手动填写', 'err');
+  let j;
+  if (CH_EDIT_ID) { b.id = CH_EDIT_ID; j = await api('/api/channel/update', { method: 'POST', body: JSON.stringify(b) }); }
+  else            { j = await api('/api/channel/', { method: 'POST', body: JSON.stringify(b) }); }
   if (!j.success) return toast(j.message, 'err');
-  closeModal(); toast('✅ 渠道已创建'); loadChannels();
+  closeModal(); toast(CH_EDIT_ID ? '✅ 渠道已更新' : '✅ 渠道已创建'); loadChannels();
+}
+async function editChannel(id) {
+  const j = await api('/api/channel/');
+  if (!j.success) return toast(j.message, 'err');
+  const c = (j.data || []).find(x => x.id === id);
+  if (!c) return toast('渠道不存在', 'err');
+  openChannelModal(c);   // api_key 是脱敏串，弹窗里留空即不修改
+}
+// 列表一键「同步模型」：探测上游 → 直接落库
+async function syncChannelModels(id, name) {
+  if (!confirm(`同步「${name}」的模型列表？\n将探测上游 /models 并覆盖该渠道的模型清单。`)) return;
+  toast('探测中…');
+  const j = await api('/api/channel/models', { method: 'POST', body: JSON.stringify({ id }) });
+  if (!j.success) return toast(j.message || '探测失败', 'err');
+  toast(`✅ ${name} 模型已同步 ${j.data.count} 个`);
+  loadChannels();
 }
 $('btnProbeGo').onclick = async () => {
   const base_url = $('probeUrl').value.trim();
@@ -1323,7 +1375,8 @@ function fallbackCopy(t, done) {
 // 暴露给 inline onclick
 Object.assign(window, {
   showKey, delToken, editToken, saveToken, createToken,
-  testChannel, toggleChannel, delChannel, createChannel,
+  testChannel, toggleChannel, delChannel, createChannel: saveChannel,
+  editChannel, syncChannelModels, probeIntoModal, saveChannel,
   editUser, saveUser, genRedeem, toggleRedeem, delRedeem,
   closeModal, copyText,
 });

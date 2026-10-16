@@ -477,10 +477,27 @@ const server = http.createServer(async (req, res) => {
       store.touchChannel(db, c.id);
       return json(res, 200, { success: r.ok, data: r, message: r.ok ? `✅ ${r.models} 个模型 / ${r.latency}ms` : '❌ ' + r.error });
     }
+    // 探测上游模型：
+    //   {base_url, api_key}  → 纯探测，不落库（新建/编辑弹窗里回填用）
+    //   {id, persist?}       → 用渠道已存 key 探测，并把结果覆盖写入该渠道 models
     if (pathname === '/api/channel/models' && req.method === 'POST') {
       const u = requireUser(req, res); if (!u) return;
-      const b = await readJson(req);
-      if (!b || !b.base_url) return json(res, 400, { success: false, message: '缺少 base_url' });
+      const b = await readJson(req) || {};
+      if (b.id) {
+        if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+        const c = store.getChannel(db, parseInt(b.id, 10));
+        if (!c) return json(res, 404, { success: false, message: '渠道不存在' });
+        const r = await probeUpstreamModels(c.base_url, c.api_key);
+        if (!r.ok) return json(res, 502, { success: false, message: '探测失败: ' + r.error });
+        if (b.persist !== false) {
+          const ms = [...new Set(r.models.map(x => String(x).trim()).filter(Boolean))].sort();
+          store.updateChannel(db, c.id, { models: ms });
+          store.touchChannel(db, c.id);
+          r.models = ms; r.count = ms.length;
+        }
+        return json(res, 200, { success: true, data: r, message: `已同步 ${r.count} 个模型` });
+      }
+      if (!b.base_url) return json(res, 400, { success: false, message: '缺少 base_url' });
       return await handleChannelModels(res, b);
     }
 
@@ -1104,21 +1121,28 @@ function sendXlsx(res, buf, fname, logMsg) {
   console.log(logMsg);
 }
 
-async function handleChannelModels(res, b) {
-  const base = String(b.base_url).replace(/\/+$/, '');
-  const key = String(b.api_key || '');
+// 探测上游 /models，返回 { ok, models, count, error }
+async function probeUpstreamModels(baseUrl, apiKey) {
+  const base = String(baseUrl || '').replace(/\/+$/, '');
+  const key = String(apiKey || '');
   const url = base + '/models';
   try {
     const r = await fetch(url, {
       headers: key ? { Authorization: 'Bearer ' + key } : {},
       signal: AbortSignal.timeout(20000),
     });
+    if (!r.ok) return { ok: false, error: `HTTP ${r.status}`, models: [], count: 0 };
     const j = await r.json();
     const ids = (j.data || j.models || []).map(m => m.id || m.name).filter(Boolean);
-    return json(res, 200, { success: true, data: { count: ids.length, models: ids } });
+    return { ok: true, models: ids, count: ids.length };
   } catch (e) {
-    return json(res, 502, { success: false, message: '探测失败: ' + e.message });
+    return { ok: false, error: e.message, models: [], count: 0 };
   }
+}
+async function handleChannelModels(res, b) {
+  const r = await probeUpstreamModels(b.base_url, b.api_key);
+  if (!r.ok) return json(res, 502, { success: false, message: '探测失败: ' + r.error });
+  return json(res, 200, { success: true, data: { count: r.count, models: r.models } });
 }
 
 // ============ 静态文件 ============
