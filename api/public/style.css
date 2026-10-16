@@ -123,6 +123,12 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
 .tree-node .tlevel{font-size:11px;background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:1px 7px;color:var(--accent)}
 .tree-node .tmeta{color:var(--muted);font-size:12px}
 .tree-children{margin-left:16px;border-left:1px dashed var(--border);padding-left:10px}
+.tree-children.collapsed{display:none}
+.tree-toggle{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;line-height:1;
+  border:1px solid var(--border);border-radius:5px;background:var(--panel2);color:var(--accent);cursor:pointer;
+  font-size:14px;font-weight:700;user-select:none;flex:0 0 auto}
+.tree-toggle:hover{border-color:var(--accent);background:rgba(79,140,255,.12)}
+.tree-toggle.empty{border:none;background:none;color:var(--muted);cursor:default;font-weight:400}
 .tree-badge{font-size:11px;padding:1px 6px;border-radius:5px;background:var(--panel2);border:1px solid var(--border)}
 .team-actions{display:flex;gap:6px}
 

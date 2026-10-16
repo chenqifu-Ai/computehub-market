@@ -225,6 +225,11 @@ function goto(page) {
     topup: loadTopup, invite: loadInvite, profile: loadProfile, channels: loadChannels,
     users: loadUsers, team: loadTeam, ledger: loadLedger, agenttree: loadAgentTree, settings: loadSettings, docs: () => {},
   }[page];
+  if (page === 'team') {
+    // 默认树状视图
+    $('teamTreeBox').classList.remove('hidden'); $('teamTable').classList.add('hidden');
+    $('btnTmTree').classList.add('active'); $('btnTmList').classList.remove('active');
+  }
   if (fn) fn();
 }
 
@@ -447,13 +452,45 @@ async function downloadAuthed(url, tip) {
 $('btnExportXlsx').onclick = () => downloadXlsx(false);
 if ($('btnExportAll')) $('btnExportAll').onclick = () => downloadXlsx(true);
 
-// 结算清单下载（管理员:all / 指定用户; 普通用户:自己）
+// 结算清单下载：先弹「时间段选择」弹窗（不再直接导全部）
 function downloadSettle(user) {
-  downloadAuthed(`/api/settle/export?user=${encodeURIComponent(user)}`,
-    user === 'all' ? '正在导出全部用户结算清单…' : '正在导出结算清单…');
+  openModal(`
+    <h3>📊 导出结算清单</h3>
+    <p class="muted">范围：<b>${user === 'all' ? '全部用户' : user === 'me' ? '我自己' : ('用户 #' + user)}</b></p>
+    <label>快捷时间段</label>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      <button class="btn-ghost sm" onclick="$('stDays').value=1">今天</button>
+      <button class="btn-ghost sm" onclick="$('stDays').value=7">近7天</button>
+      <button class="btn-ghost sm" onclick="$('stDays').value=30">近30天</button>
+      <button class="btn-ghost sm" onclick="$('stDays').value=0">全部</button>
+    </div>
+    <label>或：起始日期</label>
+    <input id="stFrom" type="date">
+    <label>结束日期</label>
+    <input id="stTo" type="date">
+    <p class="muted" style="margin-top:8px">填了起止日期则以日期为准；否则用快捷天数。留空 + 全部 = 导出全部历史。</p>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn-primary" onclick="doSettleExport('${user}')">导出</button>
+    </div>`);
+}
+function doSettleExport(user) {
+  let qs = '/api/settle/export?user=' + encodeURIComponent(user);
+  const from = ($('stFrom') && $('stFrom').value) || '';
+  const to = ($('stTo') && $('stTo').value) || '';
+  if (from || to) {
+    if (from) qs += '&from=' + encodeURIComponent(new Date(from + 'T00:00:00').getTime());
+    if (to) qs += '&until=' + encodeURIComponent(new Date(to + 'T23:59:59').getTime());
+  } else {
+    const days = parseInt(($('stDays') && $('stDays').value) || '0', 10);
+    if (days > 0) qs += '&days=' + days;
+  }
+  closeModal();
+  downloadAuthed(qs, '正在导出结算清单…');
 }
 if ($('btnSettleAll')) $('btnSettleAll').onclick = () => downloadSettle('all');
 if ($('btnSettleSelf')) $('btnSettleSelf').onclick = () => downloadSettle('me');
+if ($('btnSettleMyTeam')) $('btnSettleMyTeam').onclick = () => downloadSettle('me');
 
 // ---------- 充值 / 签到 ----------
 async function loadTopup() {
@@ -709,9 +746,15 @@ function showUserTree() {
 async function loadUserTree() {
   const j = await api('/api/admin/agent/tree');
   if (!j.success) { $('userTreeBox').innerHTML = `<div class="empty">${esc(j.message)}</div>`; return; }
-  const render = (n) => `
-    <div class="tree-node">
+  const render = (n) => {
+    const kids = n.children || [];
+    const hasKids = kids.length > 0;
+    return `
+    <div class="tree-node" data-nid="${n.id}">
       <div class="tree-line">
+        ${hasKids
+          ? `<span class="tree-toggle" onclick="toggleTreeNode(this)">+</span>`
+          : '<span class="tree-toggle empty">·</span>'}
         <span class="tname">${esc(n.username)}</span>
         <span class="tlevel">${n.agent_level ? '代理L' + n.agent_level + (n.agent_name ? ' · ' + esc(n.agent_name) : '') : '普通用户'}</span>
         <span class="tmeta">ID ${n.id}</span>
@@ -719,9 +762,11 @@ async function loadUserTree() {
         <button class="btn-ghost sm" onclick="editUpline(${n.id},'${esc(n.username)}')">改上级</button>
         <button class="btn-ghost sm" onclick="editUser(${n.id},'${esc(n.username)}',${n.status || 1},${n.role || 1},'${esc(n.remark || '')}')">管理</button>
       </div>
-      ${(n.children || []).length ? `<div class="tree-children">${n.children.map(render).join('')}</div>` : ''}
+      ${hasKids ? `<div class="tree-children">${kids.map(render).join('')}</div>` : ''}
     </div>`;
+  };
   $('userTreeBox').innerHTML = j.data.length ? j.data.map(render).join('') : '<div class="empty">暂无用户</div>';
+  initTreeCollapse('userTreeBox');
 }
 
 // 改上级：可指定任意用户为上级（admin 可重挂任何人）
@@ -999,7 +1044,53 @@ if ($('btnReloadLedger')) $('btnReloadLedger').onclick = loadLedger;
 if ($('ledgerFilter')) $('ledgerFilter').oninput = () => { clearTimeout(window.__lgT); window.__lgT = setTimeout(loadLedger, 300); };
 if ($('ledgerKind')) $('ledgerKind').onchange = loadLedger;
 
+// ---------- 层级树折叠 ----------
+// 渲染后初始化：默认展开一层（根节点展开，深层收起）
+function initTreeCollapse(boxId) {
+  const box = document.getElementById(boxId);
+  if (!box) return;
+  const nodes = box.querySelectorAll('.tree-node');
+  nodes.forEach((node, idx) => {
+    const toggle = node.querySelector(':scope > .tree-line > .tree-toggle');
+    const kids = node.querySelector(':scope > .tree-children');
+    if (!toggle || !kids) return;
+    // 默认：根节点（无父 .tree-children）展开；有父的收起
+    const inChild = node.parentElement && node.parentElement.classList.contains('tree-children');
+    if (inChild) {
+      kids.classList.add('collapsed');
+      toggle.textContent = '+';
+    } else {
+      toggle.textContent = '−';
+    }
+  });
+}
+function toggleTreeNode(el) {
+  const node = el.closest('.tree-node');
+  if (!node) return;
+  const kids = node.querySelector(':scope > .tree-children');
+  if (!kids) return;
+  const collapsed = kids.classList.toggle('collapsed');
+  el.textContent = collapsed ? '+' : '−';
+}
+// 全局展开/收起
+function expandAllTree(boxId, expand) {
+  const box = document.getElementById(boxId);
+  if (!box) return;
+  box.querySelectorAll('.tree-children').forEach(k => k.classList.toggle('collapsed', !expand));
+  box.querySelectorAll('.tree-toggle').forEach(t => { if (!t.classList.contains('empty')) t.textContent = expand ? '−' : '+'; });
+}
+
 // ---------- 代理团队 ----------
+// 代理团队页视图切换
+if ($('btnTmTree')) $('btnTmTree').onclick = () => {
+  $('teamTreeBox').classList.remove('hidden'); $('teamTable').classList.add('hidden');
+  $('btnTmTree').classList.add('active'); $('btnTmList').classList.remove('active');
+};
+if ($('btnTmList')) $('btnTmList').onclick = () => {
+  $('teamTreeBox').classList.add('hidden'); $('teamTable').classList.remove('hidden');
+  $('btnTmList').classList.add('active'); $('btnTmTree').classList.remove('active');
+};
+
 async function loadTeam() {
   const j = await api('/api/agent/team');
   if (!j.success) { $('teamBody').innerHTML = `<tr><td colspan="9" class="empty">${esc(j.message)}</td></tr>`; return; }
@@ -1013,6 +1104,28 @@ async function loadTeam() {
   const up = (d.upline || []).map(p => `${esc(p.username)}${p.agent_level ? ' (L' + p.agent_level + ')' : ''}`);
   $('tmUpline').textContent = up.length ? ('我的上级：' + up.join(' → ')) : '我的上级：平台直营（无上级）';
   $('tmBadge').textContent = d.downline.length + ' 人';
+  // 树状视图（以我为首）
+  const st = d.subtree;
+  if (st && $('teamTreeBox')) {
+    const rnode = (n) => {
+      const kids = n.children || [];
+      const hasKids = kids.length > 0;
+      return `
+      <div class="tree-node" data-nid="${n.id}">
+        <div class="tree-line">
+          ${hasKids ? `<span class="tree-toggle" onclick="toggleTreeNode(this)">+</span>` : '<span class="tree-toggle empty">·</span>'}
+          <span class="tname">${esc(n.username)}${n.id === d.me.id ? ' (我)' : ''}</span>
+          <span class="tlevel">${n.agent_level ? 'L' + n.agent_level + (n.agent_name ? ' · ' + esc(n.agent_name) : '') : '普通用户'}</span>
+          <span class="tmeta">ID ${n.id}</span>
+          <span class="tmeta">余额 ${fmtUsd(n.quota || 0)} | 已用 ${fmtUsd(n.used_quota || 0)}</span>
+          ${n.id !== d.me.id ? `<button class="btn-ghost sm" onclick="openTransfer(${n.id},'${esc(n.username)}')">💰划转</button>` : ''}
+        </div>
+        ${hasKids ? `<div class="tree-children">${kids.map(rnode).join('')}</div>` : ''}
+      </div>`;
+    };
+    $('teamTreeBox').innerHTML = st ? rnode(st) : '<div class="empty">暂无团队</div>';
+    initTreeCollapse('teamTreeBox');
+  }
   if (!d.downline.length) { $('teamBody').innerHTML = '<tr><td colspan="9" class="empty">暂无下级成员</td></tr>'; return; }
   $('teamBody').innerHTML = d.downline.map(m => `
     <tr>
@@ -1091,9 +1204,15 @@ async function loadAgentTree() {
     $('cfgR2').textContent = (parseFloat(st.data.agent_reward_l2 || 0) * 100).toFixed(0) + '%';
     $('cfgR3').textContent = (parseFloat(st.data.agent_reward_l3 || 0) * 100).toFixed(0) + '%';
   }
-  const render = (n, lvl) => `
-    <div class="tree-node">
+  const render = (n, lvl) => {
+    const kids = n.children || [];
+    const hasKids = kids.length > 0;
+    return `
+    <div class="tree-node" data-nid="${n.id}">
       <div class="tree-line">
+        ${hasKids
+          ? `<span class="tree-toggle" onclick="toggleTreeNode(this)">+</span>`
+          : '<span class="tree-toggle empty">·</span>'}
         <span class="tname">${esc(n.username)}</span>
         <span class="tlevel">${n.agent_level ? '代理L' + n.agent_level + (n.agent_name ? ' · ' + esc(n.agent_name) : '') : '普通用户'}</span>
         <span class="tmeta">ID ${n.id}</span>
@@ -1101,14 +1220,47 @@ async function loadAgentTree() {
         <button class="btn-ghost sm" onclick="downloadSettle(${n.id})">结算</button>
         <button class="btn-ghost sm" onclick="editAgent(${n.id},'${esc(n.username)}',${n.agent_level || 0},'${esc(n.agent_name || '')}')">设置</button>
       </div>
-      ${(n.children || []).length ? `<div class="tree-children">${n.children.map(c => render(c, lvl + 1)).join('')}</div>` : ''}
+      ${hasKids ? `<div class="tree-children">${kids.map(c => render(c, lvl + 1)).join('')}</div>` : ''}
     </div>`;
+  };
   $('treeBox').innerHTML = j.data.length ? j.data.map(r => render(r, 0)).join('') : '<div class="empty">暂无用户</div>';
+  initTreeCollapse('treeBox');
 }
 $('btnReloadTree').onclick = loadAgentTree;
 if ($('btnSettleAgents')) $('btnSettleAgents').onclick = () => {
-  downloadAuthed('/api/admin/agent/settle', '正在导出全部代理结算清单…');
+  openModal(`
+    <h3>📊 导出全部代理结算</h3>
+    <p class="muted">每个代理的团队结算总表 + 明细 sheet。</p>
+    <label>快捷时间段</label>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      <button class="btn-ghost sm" onclick="$('agDays').value=1">今天</button>
+      <button class="btn-ghost sm" onclick="$('agDays').value=7">近7天</button>
+      <button class="btn-ghost sm" onclick="$('agDays').value=30">近30天</button>
+      <button class="btn-ghost sm" onclick="$('agDays').value=0">全部</button>
+    </div>
+    <label>或：起始日期</label>
+    <input id="agFrom" type="date">
+    <label>结束日期</label>
+    <input id="agTo" type="date">
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn-primary" onclick="doAgentSettleExport()">导出</button>
+    </div>`);
 };
+function doAgentSettleExport() {
+  let qs = '/api/admin/agent/settle';
+  const from = ($('agFrom') && $('agFrom').value) || '';
+  const to = ($('agTo') && $('agTo').value) || '';
+  if (from || to) {
+    if (from) qs += '?from=' + encodeURIComponent(new Date(from + 'T00:00:00').getTime());
+    if (to) qs += (qs.includes('?') ? '&' : '?') + 'until=' + encodeURIComponent(new Date(to + 'T23:59:59').getTime());
+  } else {
+    const days = parseInt(($('agDays') && $('agDays').value) || '0', 10);
+    if (days > 0) qs += '?days=' + days;
+  }
+  closeModal();
+  downloadAuthed(qs, '正在导出全部代理结算清单…');
+}
 
 function editAgent(id, name, level, aname) {
   openModal(`

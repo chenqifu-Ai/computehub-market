@@ -562,11 +562,13 @@ function listLogs(db, { userId, p = 1, size = 20 }) {
 }
 
 // 导出用：明细 + 汇总（userId=null 表示全站）
-function exportLogs(db, { userId, since = 0 } = {}) {
-  if (userId) {
-    return db.prepare('SELECT * FROM logs WHERE user_id=? AND created_at>=? ORDER BY created_at DESC').all(userId, since);
-  }
-  return db.prepare('SELECT * FROM logs WHERE created_at>=? ORDER BY created_at DESC').all(since);
+function exportLogs(db, { userId, since = 0, until = 0 } = {}) {
+  const cond = [], v = [];
+  if (userId) { cond.push('user_id=?'); v.push(userId); }
+  if (since) { cond.push('created_at>=?'); v.push(since); }
+  if (until) { cond.push('created_at<=?'); v.push(until); }
+  const where = cond.length ? ('WHERE ' + cond.join(' AND ')) : '';
+  return db.prepare(`SELECT * FROM logs ${where} ORDER BY created_at DESC`).all(...v);
 }
 function exportSummary(db, { userId, since = 0 } = {}) {
   const cond = []; const v = [];
@@ -817,6 +819,25 @@ function ledgerStats(db, userId = 0) {
   return { in: inSum, out: outSum, net: inSum + outSum };
 }
 
+/** 以某用户为根的子（嵌套树）：返回 { ...me, children:[...] } */
+function subtreeOf(db, userId, maxDepth = 5) {
+  const me = getUserById(db, userId);
+  if (!me) return null;
+  const build = (u, depth) => {
+    const node = {
+      id: u.id, username: u.username, agent_level: u.agent_level, agent_name: u.agent_name,
+      quota: u.quota, used_quota: u.used_quota, request_count: u.request_count, status: u.status,
+      depth, children: [],
+    };
+    if (depth < maxDepth) {
+      const kids = db.prepare('SELECT * FROM users WHERE inviter_id=? ORDER BY id').all(u.id);
+      node.children = kids.map(k => build(k, depth + 1));
+    }
+    return node;
+  };
+  return build(me, 0);
+}
+
 // ---------- 签到 ----------
 function doCheckin(db, user, quota) {
   const start = new Date(); start.setHours(0, 0, 0, 0);
@@ -868,7 +889,7 @@ module.exports = {
   createRedemptions, getRedemption, redeemCode, listRedemptions, setRedemptionStatus, deleteRedemption,
   DEFAULT_SETTINGS, getSettings, getSetting, setSettings,
   getInviter, listInvitees, setInviter, inviteStats, addInviteReward,
-  getUpline, listDownline, teamStats, setInviterSafe, setAgentInfo, addAgentReward,
+  getUpline, listDownline, teamStats, setInviterSafe, setAgentInfo, addAgentReward, subtreeOf,
   addAgentAudit, listAgentAudit, addLedger, listLedger, ledgerStats,
   doCheckin, checkinStatus,
   hashKey, newTokenKey,

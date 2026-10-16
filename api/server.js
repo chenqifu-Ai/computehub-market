@@ -251,9 +251,10 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         success: true,
         data: {
-          me: { id: u.id, username: u.username, agent_level: u.agent_level, agent_name: u.agent_name },
+          me: { id: u.id, username: u.username, agent_level: u.agent_level, agent_name: u.agent_name, quota: u.quota, used_quota: u.used_quota, request_count: u.request_count, status: u.status },
           stats: store.teamStats(db, u.id),
           downline: store.listDownline(db, u.id, { maxDepth: 5 }),
+          subtree: store.subtreeOf(db, u.id, 5),   // 以我为首的嵌套树
           upline: store.getUpline(db, u.id, 3).map(p => ({ id: p.id, username: p.username, agent_level: p.agent_level, agent_name: p.agent_name })),
         },
       });
@@ -344,7 +345,10 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/api/admin/agent/settle' && req.method === 'GET') {
       const u = requireUser(req, res); if (!u) return;
       if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
-      return exportAgentSettleXlsx(res);
+      const days = Math.min(parseInt(query.get('days') || '0', 10), 3650);
+      const since = parseInt(query.get('from') || '0', 10) || (days > 0 ? Date.now() - days * 86400000 : 0);
+      const until = parseInt(query.get('until') || '0', 10) || 0;
+      return exportAgentSettleXlsx(res, { since, until });
     }
 
     // 归属变更审计日志
@@ -416,7 +420,13 @@ const server = http.createServer(async (req, res) => {
       }
       const days = Math.min(parseInt(query.get('days') || '0', 10), 3650);
       const since = days > 0 ? Date.now() - days * 86400000 : 0;
-      return exportSettleXlsx(res, { target, since });
+      const fromQ = parseInt(query.get('from') || '0', 10);
+      const untilQ = parseInt(query.get('until') || '0', 10);
+      const range = {
+        since: fromQ || since,
+        until: untilQ || 0,
+      };
+      return exportSettleXlsx(res, { target, since: range.since, until: range.until });
     }
 
     // ---------- 模型 / 渠道（对外目录：不含密钥） ----------
@@ -880,16 +890,31 @@ function exportUsageXlsx(res, { userId, since, all }) {
 }
 
 /** 结算清单导出：target = 'all' 或 用户ID 字符串 */
-function exportSettleXlsx(res, { target, since }) {
+function exportSettleXlsx(res, { target, since, until = 0 }) {
   const xlsx = require('./lib/xlsx');
   const TYPE = { consume: '消费', recharge: '充值', reward: '返利', system: '系统', admin: '管理' };
   const usdS = q => '$' + ((q || 0) / QUOTA_PER_USD).toFixed(6);
-  const aggSql = (uid) => `SELECT COUNT(*) c,
+  // 范围条件（供 agg / 汇总用）
+  const rng = (uid) => {
+    const cond = ['user_id=?'], v = [uid];
+    if (since) { cond.push('created_at>=?'); v.push(since); }
+    if (until) { cond.push('created_at<=?'); v.push(until); }
+    return { where: cond.join(' AND '), v };
+  };
+  const aggSql = (uid) => {
+    const { where, v } = rng(uid);
+    return { sql: `SELECT COUNT(*) c,
       SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) ok,
       SUM(CASE WHEN status!='success' THEN 1 ELSE 0 END) err,
       COALESCE(SUM(prompt_tokens),0) tin, COALESCE(SUM(completion_tokens),0) tout,
       COALESCE(SUM(total_tokens),0) tok, COALESCE(SUM(quota),0) q
-    FROM logs WHERE user_id=?`;
+    FROM logs WHERE ${where}`, v };
+  };
+  const aggOf = (uid) => { const a = aggSql(uid); return db.prepare(a.sql).get(...a.v); };
+  const rcOf = (uid) => {
+    const { where, v } = rng(uid);
+    return db.prepare(`SELECT COALESCE(SUM(quota),0) q FROM logs WHERE ${where} AND log_type='recharge'`).get(...v).q;
+  };
 
   const users = target === 'all'
     ? store.listUsers(db)
@@ -901,9 +926,9 @@ function exportSettleXlsx(res, { target, since }) {
   let G={c:0,ok:0,err:0,tin:0,tout:0,tok:0,q:0,rc:0};
 
   for (const u of users) {
-    const logs = store.exportLogs(db, { userId: u.id, since });
-    const agg = db.prepare(aggSql(u.id)).get(u.id);
-    const rc = db.prepare(`SELECT COALESCE(SUM(quota),0) q FROM logs WHERE user_id=? AND log_type='recharge'`).get(u.id).q;
+    const logs = store.exportLogs(db, { userId: u.id, since, until });
+    const agg = aggOf(u.id);
+    const rc = rcOf(u.id);
     const first = logs.length ? logs[logs.length-1].created_at : u.created_at;  // exportLogs 为 DESC
     const last  = logs.length ? logs[0].created_at : u.created_at;
     G.c+=agg.c; G.ok+=agg.ok||0; G.err+=agg.err||0; G.tin+=agg.tin; G.tout+=agg.tout; G.tok+=agg.tok; G.q+=agg.q; G.rc+=rc;
@@ -921,9 +946,9 @@ function exportSettleXlsx(res, { target, since }) {
 
   if (target !== 'all') {
     const u = users[0];
-    const logs = store.exportLogs(db, { userId: u.id, since });
-    const agg = db.prepare(aggSql(u.id)).get(u.id);
-    const rc = db.prepare(`SELECT COALESCE(SUM(quota),0) q FROM logs WHERE user_id=? AND log_type='recharge'`).get(u.id).q;
+    const logs = store.exportLogs(db, { userId: u.id, since, until });
+    const agg = aggOf(u.id);
+    const rc = rcOf(u.id);
     const first = logs.length ? logs[logs.length-1].created_at : u.created_at;  // exportLogs 为 DESC
     const last  = logs.length ? logs[0].created_at : u.created_at;
 
@@ -946,15 +971,16 @@ function exportSettleXlsx(res, { target, since }) {
       Math.round(l.use_time||0), l.is_stream?'是':'否', l.status==='success'?'成功':'失败',
       (l.error||'').slice(0,80), l.ip||'',
     ]);
+    const r1 = rng(u.id);
     const byModel = db.prepare(`SELECT model_name, COUNT(*) c, COALESCE(SUM(prompt_tokens),0) tin,
        COALESCE(SUM(completion_tokens),0) tout, COALESCE(SUM(total_tokens),0) tok, COALESCE(SUM(quota),0) q
-       FROM logs WHERE user_id=? GROUP BY model_name ORDER BY q DESC`).all(u.id);
+       FROM logs WHERE ${r1.where} GROUP BY model_name ORDER BY q DESC`).all(...r1.v);
     const mSheet = [['模型','请求次数','输入token','输出token','总token','消费(USD)']];
     let mR=0,mI=0,mO=0,mT=0,mQ=0;
     for (const r of byModel) { mSheet.push([r.model_name,r.c,r.tin,r.tout,r.tok,usdS(r.q)]); mR+=r.c;mI+=r.tin;mO+=r.tout;mT+=r.tok;mQ+=r.q; }
     mSheet.push(['合计',mR,mI,mO,mT,usdS(mQ)]);
     const byCh = db.prepare(`SELECT channel_name, COUNT(*) c, COALESCE(SUM(total_tokens),0) tok, COALESCE(SUM(quota),0) q
-       FROM logs WHERE user_id=? GROUP BY channel_name ORDER BY q DESC`).all(u.id);
+       FROM logs WHERE ${r1.where} GROUP BY channel_name ORDER BY q DESC`).all(...r1.v);
     const cSheet = [['渠道','请求次数','总token','消费(USD)']];
     let cR=0,cT=0,cQ=0;
     for (const r of byCh) { cSheet.push([r.channel_name||'-',r.c,r.tok,usdS(r.q)]); cR+=r.c;cT+=r.tok;cQ+=r.q; }
@@ -974,13 +1000,13 @@ function exportSettleXlsx(res, { target, since }) {
   const sheets = [{ name: '全部用户结算', rows: master, colWidths: [8,16,8,6,19,19,9,7,7,12,12,12,15,15,15], freezeHeader: true }];
   const used = new Set(['全部用户结算']);
   for (const u of users.slice(0, 40)) {
-    const logs = store.exportLogs(db, { userId: u.id, since });
+    const logs = store.exportLogs(db, { userId: u.id, since, until });
     if (!logs.length) continue;
     let nm = u.username.replace(/[\\\/\?\*\[\]:]/g, '_').slice(0, 26);
     let base = nm, i = 2;
     while (used.has(nm)) nm = base + '_' + (i++);
     used.add(nm);
-    const agg = db.prepare(aggSql(u.id)).get(u.id);
+    const agg = aggOf(u.id);
     const rows = [['结算:' + u.username + ' (ID ' + u.id + ')',''],
       ['累计消费(USD)', usdS(agg.q)], ['总token', String(agg.tok)], ['请求数', String(agg.c)],
       ['',''], ['时间','模型','渠道','输入token','输出token','总token','消费(USD)','状态']];
@@ -997,9 +1023,16 @@ function exportSettleXlsx(res, { target, since }) {
 }
 
 /** 代理结算导出：每个代理一行（团队人数/团队消费/各级返佣）+ 每代理一个明细 sheet */
-function exportAgentSettleXlsx(res) {
+function exportAgentSettleXlsx(res, { since = 0, until = 0 } = {}) {
   const xlsx = require('./lib/xlsx');
   const usdS = q => '$' + ((q || 0) / QUOTA_PER_USD).toFixed(6);
+  const rngFor = (ids) => {
+    const ph = ids.map(() => '?').join(',');
+    const cond = [`user_id IN (${ph})`, "request_id NOT LIKE 'invite:%'"], v = [...ids];
+    if (since) { cond.push('created_at>=?'); v.push(since); }
+    if (until) { cond.push('created_at<=?'); v.push(until); }
+    return { where: cond.join(' AND '), v };
+  };
   const agents = db.prepare('SELECT * FROM users WHERE agent_level > 0 ORDER BY agent_level, id').all();
 
   const head = ['用户ID','用户名','代理名','等级','直属下级','团队总人数','团队消费(USD)','自身消费(USD)','一级返佣(USD)','二级返佣(USD)','三级返佣(USD)','返佣合计(USD)','当前余额(USD)'];
@@ -1013,10 +1046,11 @@ function exportAgentSettleXlsx(res) {
     const teamIds = [a.id, ...store.listDownline(db, a.id, { maxDepth: 5 }).map(d => d.id)];
     let teamConsume = 0;
     for (const id of teamIds) {
-      const r = db.prepare("SELECT COALESCE(SUM(quota),0) q FROM logs WHERE user_id=? AND request_id NOT LIKE 'invite:%'").get(id);
-      teamConsume += r.q;
+      const r = rngFor([id]);
+      teamConsume += db.prepare(`SELECT COALESCE(SUM(quota),0) q FROM logs WHERE ${r.where}`).get(...r.v).q;
     }
-    const own = db.prepare("SELECT COALESCE(SUM(quota),0) q FROM logs WHERE user_id=? AND request_id NOT LIKE 'invite:%'").get(a.id).q;
+    const ro = rngFor([a.id]);
+    const own = db.prepare(`SELECT COALESCE(SUM(quota),0) q FROM logs WHERE ${ro.where}`).get(...ro.v).q;
     master.push([
       String(a.id), a.username, a.agent_name || '', 'L' + a.agent_level,
       ts.direct, ts.total, usdS(teamConsume), usdS(own),
@@ -1029,9 +1063,11 @@ function exportAgentSettleXlsx(res) {
       ['团队人数', String(ts.total)], ['团队消费(USD)', usdS(teamConsume)],
       ['返佣 L1/L2/L3', usdS(ts.reward_l1) + ' / ' + usdS(ts.reward_l2) + ' / ' + usdS(ts.reward_l3)],
       ['',''], ['时间','成员','模型','渠道','输入token','输出token','总token','消费(USD)','状态']];
+    const rr = rngFor(teamIds);
     const logs = db.prepare(`SELECT l.*, u.username AS uname FROM logs l JOIN users u ON u.id=l.user_id
       WHERE l.user_id IN (${teamIds.map(() => '?').join(',')}) AND l.request_id NOT LIKE 'invite:%'
-      ORDER BY l.created_at DESC LIMIT 5000`).all(...teamIds);
+      ${since ? 'AND l.created_at>=?' : ''} ${until ? 'AND l.created_at<=?' : ''}
+      ORDER BY l.created_at DESC LIMIT 5000`).all(...teamIds, ...(since ? [since] : []), ...(until ? [until] : []));
     for (const l of logs) rows.push([
       fmtTs(l.created_at), l.uname, l.model_name || '-', l.channel_name || '-',
       l.prompt_tokens, l.completion_tokens, l.total_tokens, usdS(l.quota),

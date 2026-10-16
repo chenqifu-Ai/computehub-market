@@ -239,7 +239,12 @@
     <!-- 代理团队 -->
     <section class="page hidden" id="page-team">
       <div class="panel">
-        <h3>🌳 我的代理团队</h3>
+        <div class="panel-head">
+          <h3>🌳 我的代理团队</h3>
+          <div class="head-actions">
+            <button class="btn-ghost sm" id="btnSettleMyTeam">📊 我的结算清单</button>
+          </div>
+        </div>
         <p class="muted">你的下级消费时，你按级别获得返佣：<b>一级 <span id="tmR1">—</span> · 二级 <span id="tmR2">—</span> · 三级 <span id="tmR3">—</span></b>。</p>
         <div class="mini-row">
           <div><b id="tmDirect">—</b><span>直属下级</span></div>
@@ -252,8 +257,17 @@
         <p class="muted" id="tmUpline" style="margin-top:14px"></p>
       </div>
       <div class="panel">
-        <h3>下级成员 <span class="badge" id="tmBadge">-</span></h3>
-        <table class="tbl">
+        <div class="panel-head">
+          <h3>下级成员 <span class="badge" id="tmBadge">-</span></h3>
+          <div class="head-actions">
+            <button class="btn-ghost sm" id="btnTmTree">🌳 树状</button>
+            <button class="btn-ghost sm" id="btnTmList">📋 列表</button>
+            <button class="btn-ghost sm" onclick="expandAllTree('teamTreeBox',true)">展开全部</button>
+            <button class="btn-ghost sm" onclick="expandAllTree('teamTreeBox',false)">收起全部</button>
+          </div>
+        </div>
+        <div id="teamTreeBox" class="tree-box"></div>
+        <table class="tbl" id="teamTable">
           <thead><tr><th>ID</th><th>用户名</th><th>层级</th><th>代理等级</th><th>余额</th><th>已用</th><th>请求</th><th>状态</th><th>操作</th></tr></thead>
           <tbody id="teamBody"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
         </table>
@@ -267,6 +281,8 @@
           <h3>🏢 全平台代理层级树</h3>
           <div class="head-actions">
             <button class="btn-ghost sm" id="btnSettleAgents">📊 导出全部代理结算</button>
+            <button class="btn-ghost sm" onclick="expandAllTree('treeBox',true)">展开全部</button>
+            <button class="btn-ghost sm" onclick="expandAllTree('treeBox',false)">收起全部</button>
             <button class="btn-ghost sm" id="btnReloadTree">刷新</button>
           </div>
         </div>
@@ -315,6 +331,8 @@
           <div class="head-actions">
             <button class="btn-ghost sm" id="btnViewTree">🌳 层级树</button>
             <button class="btn-ghost sm" id="btnViewList">📋 列表</button>
+            <button class="btn-ghost sm" onclick="expandAllTree('userTreeBox',true)">展开全部</button>
+            <button class="btn-ghost sm" onclick="expandAllTree('userTreeBox',false)">收起全部</button>
             <button class="btn-ghost sm" id="btnBulkCreate">➕ 批量建用户</button>
             <button class="btn-ghost sm" id="btnSettleAll">📊 一键导出全部结算(Excel)</button>
             <button class="btn-ghost sm" id="btnExportAll">导出全站用量 Excel</button>
