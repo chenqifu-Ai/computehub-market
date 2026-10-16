@@ -36,7 +36,14 @@ function migrate(db) {
     aff_code      TEXT NOT NULL DEFAULT '',
     remark        TEXT NOT NULL DEFAULT '',
     last_login_ip TEXT NOT NULL DEFAULT '',
-    created_at    INTEGER NOT NULL
+    created_at    INTEGER NOT NULL,
+    inviter_id    INTEGER NOT NULL DEFAULT 0,
+    invite_reward INTEGER NOT NULL DEFAULT 0,
+    agent_level   INTEGER NOT NULL DEFAULT 0,   -- 0=平台直营/1=一级代理/2=二级代理...
+    agent_name    TEXT NOT NULL DEFAULT '',     -- 代理显示名
+    reward_l1     INTEGER NOT NULL DEFAULT 0,   -- 累计一级返佣
+    reward_l2     INTEGER NOT NULL DEFAULT 0,
+    reward_l3     INTEGER NOT NULL DEFAULT 0
   );
 
   CREATE TABLE IF NOT EXISTS sessions (
@@ -130,12 +137,61 @@ function migrate(db) {
     created_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_checkins_user ON checkins(user_id, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS agent_audit (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_user_id INTEGER NOT NULL,            -- 被调整归属的用户
+    target_name    TEXT NOT NULL DEFAULT '',
+    old_inviter_id INTEGER NOT NULL DEFAULT 0,  -- 变更前上级
+    old_inviter    TEXT NOT NULL DEFAULT '',
+    new_inviter_id INTEGER NOT NULL DEFAULT 0,  -- 变更后上级
+    new_inviter    TEXT NOT NULL DEFAULT '',
+    action         TEXT NOT NULL DEFAULT 'reassign', -- reassign/set_level/set_agent
+    level_before   INTEGER NOT NULL DEFAULT 0,
+    level_after    INTEGER NOT NULL DEFAULT 0,
+    agent_name     TEXT NOT NULL DEFAULT '',
+    op_user_id     INTEGER NOT NULL DEFAULT 0,  -- 操作人
+    op_username    TEXT NOT NULL DEFAULT '',
+    op_role        TEXT NOT NULL DEFAULT '',    -- 管理员/代理
+    ip             TEXT NOT NULL DEFAULT '',
+    created_at     INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_audit_target ON agent_audit(target_user_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_audit_time ON agent_audit(created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS wallet_ledger (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER NOT NULL,            -- 资金变动归属用户
+    username      TEXT NOT NULL DEFAULT '',
+    delta         INTEGER NOT NULL DEFAULT 0,  -- 变动额度（+ 入账 / - 出账），quota 单位
+    balance_after INTEGER NOT NULL DEFAULT 0,  -- 变动后余额
+    kind          TEXT NOT NULL DEFAULT '',    -- recharge/transfer_out/transfer_in/redeem/checkin/reward/consume/refund/admin_set/adjust
+    detail        TEXT NOT NULL DEFAULT '',    -- 说明
+    ref_user_id   INTEGER NOT NULL DEFAULT 0,  -- 关联对象（如划转对手）
+    ref_username  TEXT NOT NULL DEFAULT '',
+    op_user_id    INTEGER NOT NULL DEFAULT 0,  -- 操作人
+    op_username   TEXT NOT NULL DEFAULT '',
+    op_role       TEXT NOT NULL DEFAULT '',
+    ip            TEXT NOT NULL DEFAULT '',
+    request_id    TEXT NOT NULL DEFAULT '',
+    remark        TEXT NOT NULL DEFAULT '',
+    created_at    INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_ledger_user ON wallet_ledger(user_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_ledger_time ON wallet_ledger(created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_ledger_kind ON wallet_ledger(kind);
   `);
 
   // 增量迁移（已存在的库补齐字段）
   const cols = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
   if (!cols.includes('inviter_id')) db.exec('ALTER TABLE users ADD COLUMN inviter_id INTEGER NOT NULL DEFAULT 0');
   if (!cols.includes('invite_reward')) db.exec('ALTER TABLE users ADD COLUMN invite_reward INTEGER NOT NULL DEFAULT 0');
+  // 多层级代理：等级(0=平台/1=一级代理...) + 各代已获返佣明细
+  if (!cols.includes('agent_level')) db.exec('ALTER TABLE users ADD COLUMN agent_level INTEGER NOT NULL DEFAULT 0');
+  if (!cols.includes('agent_name')) db.exec("ALTER TABLE users ADD COLUMN agent_name TEXT NOT NULL DEFAULT ''");
+  if (!cols.includes('reward_l1')) db.exec('ALTER TABLE users ADD COLUMN reward_l1 INTEGER NOT NULL DEFAULT 0');
+  if (!cols.includes('reward_l2')) db.exec('ALTER TABLE users ADD COLUMN reward_l2 INTEGER NOT NULL DEFAULT 0');
+  if (!cols.includes('reward_l3')) db.exec('ALTER TABLE users ADD COLUMN reward_l3 INTEGER NOT NULL DEFAULT 0');
 
   // logs 增量迁移：记录类型（consume/recharge/reward/system/admin）
   const lcols = db.prepare('PRAGMA table_info(logs)').all().map(c => c.name);
@@ -143,6 +199,13 @@ function migrate(db) {
     db.exec("ALTER TABLE logs ADD COLUMN log_type TEXT NOT NULL DEFAULT 'consume'");
   if (!lcols.includes('source'))
     db.exec("ALTER TABLE logs ADD COLUMN source TEXT NOT NULL DEFAULT ''");
+
+  // sessions 增量迁移：身份切换来源（便于免密返回自己）
+  const scols = db.prepare('PRAGMA table_info(sessions)').all().map(c => c.name);
+  if (!scols.includes('origin_id'))
+    db.exec('ALTER TABLE sessions ADD COLUMN origin_id INTEGER NOT NULL DEFAULT 0');
+  if (!scols.includes('switch_depth'))
+    db.exec('ALTER TABLE sessions ADD COLUMN switch_depth INTEGER NOT NULL DEFAULT 0');
 }
 
 function userByAff(db, aff) {
@@ -178,14 +241,17 @@ async function createUser(db, username, password, opts = {}) {
   const hash = await hashPassword(password, salt);
   const aff = crypto.randomBytes(4).toString('hex').slice(0, 6);
   const info = db.prepare(`
-    INSERT INTO users (username, display_name, pass_hash, salt, quota, group_name, role, aff_code, created_at)
-    VALUES (?,?,?,?,?,?,?,?,?)
+    INSERT INTO users (username, display_name, pass_hash, salt, quota, group_name, role, aff_code, created_at, inviter_id, agent_level, agent_name)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
   `).run(
     username, opts.display_name || username, hash, salt,
     parseInt(opts.quota || 0, 10),
     opts.group_name || 'default',
     parseInt(opts.role || 1, 10),
     aff, Date.now(),
+    parseInt(opts.inviter_id || 0, 10),
+    parseInt(opts.agent_level || 0, 10),
+    opts.agent_name || '',
   );
   return getUserById(db, Number(info.lastInsertRowid));
 }
@@ -215,6 +281,38 @@ async function setPasswordReal(db, id, plain) {
 function setDisplayName(db, id, name) {
   db.prepare('UPDATE users SET display_name=? WHERE id=?').run(name, id);
 }
+/** 改自己的用户名（需唯一） */
+function setUsername(db, id, newName) {
+  const n = String(newName || '').trim();
+  if (!/^[a-zA-Z0-9_\u4e00-\u9fa5]{2,32}$/.test(n)) return { ok: false, message: '用户名需 2-32 位（中文/字母/数字/下划线）' };
+  const exist = db.prepare('SELECT id FROM users WHERE username=?').get(n);
+  if (exist && exist.id !== id) return { ok: false, message: '用户名已被占用' };
+  db.prepare('UPDATE users SET username=? WHERE id=?').run(n, id);
+  return { ok: true };
+}
+/** 批量建用户：按前缀/数量生成，返回创建明细 */
+async function bulkCreateUsers(db, { prefix = 'user', count = 1, password = '123456', quota = 0, startIndex, digits = 4, inviter_id = 0, agent_name = '', agent_level = 0 }) {
+  const out = [];
+  let idx = (startIndex !== undefined && startIndex !== null && startIndex !== '') ? parseInt(startIndex, 10) : 1;
+  const pf = String(prefix || 'user').trim() || 'user';
+  const n = Math.min(Math.max(parseInt(count, 10) || 1, 1), 200);
+  const inviterId = parseInt(inviter_id, 10) || 0;
+  const lvl = parseInt(agent_level, 10) || 0;   // 默认不自动设为代理（等级是独立营销标签）
+  for (let i = 0; i < n; i++) {
+    let uname, guard = 0;
+    do {
+      uname = pf + String(idx).padStart(parseInt(digits, 10) || 4, '0');
+      idx++;
+      guard++;
+    } while (getUserByName(db, uname) && guard < 100000);   // 跳过已存在
+    const u = await createUser(db, uname, String(password || '123456'), {
+      quota: parseInt(quota, 10) || 0,
+      inviter_id: inviterId, agent_level: lvl, agent_name: String(agent_name || ''),
+    });
+    out.push({ id: u.id, username: u.username, password: String(password || '123456') });
+  }
+  return out;
+}
 function touchLogin(db, id, ip) {
   db.prepare('UPDATE users SET last_login_ip=? WHERE id=?').run(ip || '', id);
 }
@@ -225,6 +323,26 @@ function addUserUsage(db, id, quota, tokens = 1) {
 function addUserQuota(db, id, amount) {
   db.prepare('UPDATE users SET quota = quota + ? WHERE id = ?').run(amount, id);
   return getUserById(db, id);
+}
+/** 额度转移（代理从自己额度划给下级），原子化：先扣源再增目标，源不足则回滚 */
+function transferQuota(db, fromId, toId, amount) {
+  const amt = parseInt(amount, 10) || 0;
+  if (amt <= 0) return { ok: false, message: '划转额度必须大于 0' };
+  if (fromId === toId) return { ok: false, message: '不能划转给自己' };
+  const from = getUserById(db, fromId); const to = getUserById(db, toId);
+  if (!from || !to) return { ok: false, message: '用户不存在' };
+  if (from.quota < amt) return { ok: false, message: '余额不足（当前 $' + (from.quota / 500000).toFixed(4) + '）' };
+  db.exec('BEGIN');
+  try {
+    const r = db.prepare('UPDATE users SET quota = quota - ? WHERE id=? AND quota >= ?').run(amt, fromId, amt);
+    if (!r.changes) { db.exec('ROLLBACK'); return { ok: false, message: '余额不足' }; }
+    db.prepare('UPDATE users SET quota = quota + ? WHERE id=?').run(amt, toId);
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch {}
+    return { ok: false, message: '划转失败: ' + e.message };
+  }
+  return { ok: true, from: getUserById(db, fromId), to: getUserById(db, toId) };
 }
 function userDashboard(db, u) {
   const row = db.prepare(`
@@ -248,10 +366,10 @@ function userDashboard(db, u) {
 }
 
 // ---------- 会话 ----------
-function createSession(db, userId, ttlMs) {
+function createSession(db, userId, ttlMs, opts = {}) {
   const t = crypto.randomBytes(32).toString('hex');
-  db.prepare('INSERT INTO sessions (token,user_id,created_at,expires_at) VALUES (?,?,?,?)')
-    .run(t, userId, Date.now(), Date.now() + ttlMs);
+  db.prepare('INSERT INTO sessions (token,user_id,created_at,expires_at,origin_id,switch_depth) VALUES (?,?,?,?,?,?)')
+    .run(t, userId, Date.now(), Date.now() + ttlMs, opts.origin_id || 0, opts.switch_depth || 0);
   return t;
 }
 function getSession(db, token) {
@@ -485,7 +603,7 @@ function adminUpdateUser(db, id, b) {
   const f = [], v = [];
   const set = (c, val) => { f.push(c + '=?'); v.push(val); };
   if (b.quota !== undefined) set('quota', parseInt(b.quota, 10));
-  if (b.add_quota !== undefined) { v.push(id); db.prepare('UPDATE users SET quota = MAX(0, quota + ?) WHERE id=?').run(parseInt(b.add_quota, 10)); }
+  if (b.add_quota !== undefined) { db.prepare('UPDATE users SET quota = MAX(0, quota + ?) WHERE id=?').run(parseInt(b.add_quota, 10), id); }
   if (b.status !== undefined) set('status', parseInt(b.status, 10));
   if (b.role !== undefined) set('role', parseInt(b.role, 10));
   if (b.group_name !== undefined) set('group_name', String(b.group_name));
@@ -544,7 +662,10 @@ const DEFAULT_SETTINGS = {
   signup_quota: '0',            // 注册赠送额度
   checkin_quota: '0',           // 每日签到额度
   rate_limit_per_min: '120',    // 每令牌每分钟请求上限（0=不限）
-  invite_reward_rate: '0.1',    // 邀请返利率（被邀请人消费的 x 倍）
+  invite_reward_rate: '0.1',    // 一级返佣率（下线消费 × 此率）
+  agent_reward_l2: '0.05',      // 二级返佣率（上上级）
+  agent_reward_l3: '0.02',      // 三级返佣率
+  agent_manage_downline: '1',   // 代理可否管理自己下级（1=可）
   announcement: '',
 };
 function getSettings(db) {
@@ -557,7 +678,7 @@ function getSetting(db, key) { return getSettings(db)[key]; }
 function setSettings(db, obj) {
   const stmt = db.prepare('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
   for (const [k, v] of Object.entries(obj || {})) {
-    if (k in DEFAULT_SETTINGS) stmt.run(k, String(v));
+    if (k in DEFAULT_SETTINGS && v !== undefined && v !== null) stmt.run(k, String(v));
   }
   return getSettings(db);
 }
@@ -579,6 +700,121 @@ function inviteStats(db, user) {
 }
 function addInviteReward(db, userId, quota) {
   db.prepare('UPDATE users SET invite_reward = invite_reward + ? WHERE id=?').run(quota, userId);
+}
+
+// ---------- 多层级代理 ----------
+/** 沿 inviter_id 链向上取上级（最多 depth 层） */
+function getUpline(db, userId, depth = 3) {
+  const chain = [];
+  let cur = getUserById(db, userId);
+  for (let i = 0; i < depth && cur && cur.inviter_id; i++) {
+    const p = getUserById(db, cur.inviter_id);
+    if (!p) break;
+    chain.push(p);
+    cur = p;
+  }
+  return chain;   // [一级上级, 二级上级, 三级上级]
+}
+/** 下级树（递归，带深度 + 消费/返佣汇总） */
+function listDownline(db, userId, { maxDepth = 5, since = 0 } = {}) {
+  const out = [];
+  const walk = (pid, depth) => {
+    if (depth > maxDepth) return;
+    const kids = db.prepare('SELECT id,username,display_name,agent_level,agent_name,quota,used_quota,request_count,status,created_at FROM users WHERE inviter_id=? ORDER BY id').all(pid);
+    for (const k of kids) {
+      const agg = db.prepare(`SELECT COUNT(*) c, COALESCE(SUM(quota),0) q FROM logs WHERE user_id=? AND request_id NOT LIKE 'invite:%'${since ? ' AND created_at>=?' : ''}`)
+        .get(...(since ? [k.id, since] : [k.id]));
+      out.push({ ...k, depth, direct_req: agg.c, direct_consume: agg.q });
+      walk(k.id, depth + 1);
+    }
+  };
+  walk(userId, 1);
+  return out;
+}
+/** 某用户的整棵团队统计（各级人数 + 各级消费 + 本户累计返佣） */
+function teamStats(db, userId) {
+  const down = listDownline(db, userId, { maxDepth: 5 });
+  const byDepth = {};
+  for (const d of down) {
+    byDepth[d.depth] = byDepth[d.depth] || { users: 0, consume: 0 };
+    byDepth[d.depth].users++;
+    byDepth[d.depth].consume += d.direct_consume || 0;
+  }
+  const u = getUserById(db, userId);
+  return {
+    direct: down.filter(d => d.depth === 1).length,
+    total: down.length,
+    byDepth,
+    reward_l1: u.reward_l1 || 0, reward_l2: u.reward_l2 || 0, reward_l3: u.reward_l3 || 0,
+    reward_total: (u.invite_reward || 0),
+  };
+}
+/** 设置用户上级（防环：不能挂到自己的下级） */
+function setInviterSafe(db, userId, inviterId) {
+  if (userId === inviterId) return { ok: false, message: '不能成为自己的上级' };
+  if (inviterId) {
+    // 若 inviterId 在 userId 的下级链中 → 会成环
+    const down = listDownline(db, userId, { maxDepth: 20 }).map(d => d.id);
+    if (down.includes(inviterId)) return { ok: false, message: '不能挂到自己的下级（会形成环）' };
+  }
+  db.prepare('UPDATE users SET inviter_id=? WHERE id=?').run(inviterId || 0, userId);
+  return { ok: true };
+}
+/** 设置代理等级/名称 */
+function setAgentInfo(db, userId, { agent_level, agent_name }) {
+  const f = [], v = [];
+  if (agent_level !== undefined) { f.push('agent_level=?'); v.push(parseInt(agent_level, 10) || 0); }
+  if (agent_name !== undefined) { f.push('agent_name=?'); v.push(String(agent_name)); }
+  if (f.length) { v.push(userId); db.prepare(`UPDATE users SET ${f.join(',')} WHERE id=?`).run(...v); }
+  return getUserById(db, userId);
+}
+
+/** 记录某级返佣（level=1/2/3） */
+function addAgentReward(db, userId, level, quota) {
+  const col = level === 1 ? 'reward_l1' : level === 2 ? 'reward_l2' : 'reward_l3';
+  db.prepare(`UPDATE users SET invite_reward = invite_reward + ?, ${col} = ${col} + ? WHERE id=?`).run(quota, quota, userId);
+}
+
+// ---------- 归属变更审计 ----------
+function addAgentAudit(db, rec) {
+  db.prepare(`INSERT INTO agent_audit
+    (target_user_id,target_name,old_inviter_id,old_inviter,new_inviter_id,new_inviter,action,level_before,level_after,agent_name,op_user_id,op_username,op_role,ip,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    rec.target_user_id, rec.target_name || '', rec.old_inviter_id || 0, rec.old_inviter || '',
+    rec.new_inviter_id || 0, rec.new_inviter || '', rec.action || 'reassign',
+    rec.level_before || 0, rec.level_after || 0, rec.agent_name || '',
+    rec.op_user_id || 0, rec.op_username || '', rec.op_role || '', rec.ip || '', Date.now());
+}
+function listAgentAudit(db, { targetUserId = 0, limit = 200 } = {}) {
+  if (targetUserId) return db.prepare('SELECT * FROM agent_audit WHERE target_user_id=? ORDER BY id DESC LIMIT ?').all(targetUserId, limit);
+  return db.prepare('SELECT * FROM agent_audit ORDER BY id DESC LIMIT ?').all(limit);
+}
+
+/** 钱包流水记录（所有余额变动都调它） */
+function addLedger(db, r) {
+  const bal = getUserById(db, r.user_id);
+  db.prepare(`INSERT INTO wallet_ledger
+    (user_id,username,delta,balance_after,kind,detail,ref_user_id,ref_username,op_user_id,op_username,op_role,ip,request_id,remark,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    r.user_id, (bal && bal.username) || r.username || '', parseInt(r.delta, 10) || 0,
+    bal ? bal.quota : 0, r.kind || '', r.detail || '', r.ref_user_id || 0, r.ref_username || '',
+    r.op_user_id || 0, r.op_username || '', r.op_role || '', r.ip || '', r.request_id || '', r.remark || '',
+    r.created_at || Date.now());
+}
+function listLedger(db, { userId = 0, kind = '', limit = 200, since = 0 } = {}) {
+  const cond = [], v = [];
+  if (userId) { cond.push('user_id=?'); v.push(userId); }
+  if (kind) { cond.push('kind=?'); v.push(kind); }
+  if (since) { cond.push('created_at>=?'); v.push(since); }
+  const where = cond.length ? ('WHERE ' + cond.join(' AND ')) : '';
+  return db.prepare(`SELECT * FROM wallet_ledger ${where} ORDER BY id DESC LIMIT ?`).all(...v, limit);
+}
+function ledgerStats(db, userId = 0) {
+  const cond = userId ? 'WHERE user_id=?' : '';
+  const v = userId ? [userId] : [];
+  const inSum = db.prepare(`SELECT COALESCE(SUM(delta),0) s FROM wallet_ledger ${cond ? cond + ' AND' : 'WHERE'} delta>0`).get(...v).s;
+  const outSum = db.prepare(`SELECT COALESCE(SUM(delta),0) s FROM wallet_ledger ${cond ? cond + ' AND' : 'WHERE'} delta<0`).get(...v).s;
+  return { in: inSum, out: outSum, net: inSum + outSum };
 }
 
 // ---------- 签到 ----------
@@ -619,8 +855,8 @@ function countLogs(db, userId) {
 module.exports = {
   open, migrate, seedChannels,
   hashPassword, verifyPassword,
-  getUserByName, getUserById, isAdmin, createUser, publicUser, setDisplayName,
-  setPassword: setPasswordReal, touchLogin, addUserUsage, addUserQuota, userDashboard,
+  getUserByName, getUserById, isAdmin, createUser, publicUser, setDisplayName, setUsername, bulkCreateUsers,
+  setPassword: setPasswordReal, touchLogin, addUserUsage, addUserQuota, transferQuota, userDashboard,
   createSession, getSession, deleteSession,
   createToken, getToken, getTokenByPlain, listTokens, updateToken, deleteToken, touchToken, addTokenUsage,
   listChannels, listChannelsRaw, getChannel, channelsForModel, addChannelUsage,
@@ -632,6 +868,8 @@ module.exports = {
   createRedemptions, getRedemption, redeemCode, listRedemptions, setRedemptionStatus, deleteRedemption,
   DEFAULT_SETTINGS, getSettings, getSetting, setSettings,
   getInviter, listInvitees, setInviter, inviteStats, addInviteReward,
+  getUpline, listDownline, teamStats, setInviterSafe, setAgentInfo, addAgentReward,
+  addAgentAudit, listAgentAudit, addLedger, listLedger, ledgerStats,
   doCheckin, checkinStatus,
   hashKey, newTokenKey,
 };

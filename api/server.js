@@ -113,6 +113,47 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/api/user/register' && req.method === 'POST') return await handleRegister(req, res);
     if (pathname === '/api/user/login' && req.method === 'POST') return await handleLogin(req, res);
     if (pathname === '/api/user/logout') return handleLogout(req, res);
+    // 身份切换（左下角）：免密切到下级/自己；切到上级需上级密码；admin 可切任何人
+    if (pathname === '/api/user/impersonate' && req.method === 'POST') {
+      const u = requireUser(req, res); if (!u) return;
+      const b = await readJson(req) || {};
+      const targetRaw = String(b.target || 'me');
+      const sess = store.getSession(db, tokenFromReq(req));
+      const originId = sess && sess.origin_id ? sess.origin_id : u.id;  // 原始登录身份
+      const origin = store.getUserById(db, originId) || u;
+
+      if (targetRaw === 'me') {
+        const t = store.createSession(db, origin.id, SESSION_TTL_MS, { origin_id: origin.id, switch_depth: 0 });
+        return json(res, 200, { success: true, message: '已返回本人', data: { token: t, user: store.publicUser(db, origin) } });
+      }
+      const tid = parseInt(targetRaw, 10);
+      if (!tid) return json(res, 400, { success: false, message: '无效的目标用户' });
+      const target = store.getUserById(db, tid);
+      if (!target) return json(res, 404, { success: false, message: '目标用户不存在' });
+      if (target.status !== 1) return json(res, 403, { success: false, message: '目标账号已禁用' });
+
+      // 权限判定（基于原始登录身份 origin，而非当前已切换身份，避免套娃）
+      const down = store.listDownline(db, origin.id, { maxDepth: 20 }).map(d => d.id);
+      const up = store.getUpline(db, origin.id, 3).map(d => d.id);
+      const isAdminUser = store.isAdmin(origin);
+      let allowed = false, needPw = false;
+      if (isAdminUser) allowed = true;                    // 管理员免密切换任何人
+      else if (tid === origin.id) allowed = true;          // 自己
+      else if (down.includes(tid)) allowed = true;         // 下级（含 L1/L2/L3）免密
+      else if (up.includes(tid)) { allowed = true; needPw = true; }  // 上级需密码
+
+      if (!allowed) return json(res, 403, { success: false, message: '只能切换到自己的下级或上级' });
+
+      if (needPw) {
+        const pw = String(b.password || '');
+        if (!pw || !(await store.verifyPassword(pw, target.salt, target.pass_hash)))
+          return json(res, 401, { success: false, message: '切换到上级需要该上级的密码' });
+      }
+      const t = store.createSession(db, target.id, SESSION_TTL_MS, { origin_id: origin.id, switch_depth: (sess && sess.switch_depth || 0) + 1 });
+      console.log(`[impersonate] ${origin.username} -> ${target.username}${needPw ? ' (需密码)' : ''}`);
+      return json(res, 200, { success: true, message: '', data: { token: t, user: store.publicUser(db, target) } });
+    }
+
     if (pathname === '/api/user/self') {
       const u = requireUser(req, res); if (!u) return;
       return json(res, 200, { success: true, data: store.publicUser(db, u) });
@@ -134,6 +175,12 @@ const server = http.createServer(async (req, res) => {
       if (!code) return json(res, 400, { success: false, message: '请输入兑换码' });
       const r = store.redeemCode(db, u, code);
       if (!r.ok) return json(res, 400, { success: false, message: r.message });
+      store.addLedger(db, {
+        user_id: u.id, delta: r.quota, kind: 'redeem',
+        detail: `兑换码充值 +$${(r.quota / 500000).toFixed(4)}`,
+        op_user_id: u.id, op_username: u.username, op_role: '用户', ip: clientIp(req),
+        request_id: 'redeem:' + code + '-' + Date.now(), remark: code,
+      });
       console.log(`[topup] ${u.username} 兑换 ${r.quota} quota`);
       return json(res, 200, { success: true, message: '兑换成功', data: store.publicUser(db, r.user) });
     }
@@ -143,8 +190,42 @@ const server = http.createServer(async (req, res) => {
       const quota = parseInt(store.getSetting(db, 'checkin_quota') || '0', 10);
       const r = store.doCheckin(db, u, quota);
       if (!r.ok) return json(res, 400, { success: false, message: r.message });
+      store.addLedger(db, {
+        user_id: u.id, delta: quota, kind: 'checkin',
+        detail: `每日签到 +$${(quota / 500000).toFixed(4)}`,
+        op_user_id: u.id, op_username: u.username, op_role: '用户', ip: clientIp(req),
+        request_id: 'checkin:' + u.id + '-' + Date.now(),
+      });
       return json(res, 200, { success: true, message: `签到成功，获得 ${quota} quota`, data: store.publicUser(db, r.user) });
     }
+    // 可切换身份列表：自己 + 下级(免密) + 上级(需密)
+    if (pathname === '/api/user/switchable' && req.method === 'GET') {
+      const u = requireUser(req, res); if (!u) return;
+      const sess = store.getSession(db, tokenFromReq(req));
+      const originId = sess && sess.origin_id ? sess.origin_id : u.id;
+      const origin = store.getUserById(db, originId) || u;
+      const down = store.listDownline(db, origin.id, { maxDepth: 5 }).map(d => ({ id: d.id, username: d.username, depth: d.depth, agent_level: d.agent_level, agent_name: d.agent_name }));
+      const up = store.getUpline(db, origin.id, 3).map((p, i) => ({ id: p.id, username: p.username, depth: -(i + 1), agent_level: p.agent_level, agent_name: p.agent_name }));
+      const isAdminUser = store.isAdmin(origin);
+      // 管理员：列出平台全部用户（除自己），可直达任意人
+      let all = [];
+      if (isAdminUser) {
+        all = db.prepare('SELECT id,username,display_name,agent_level,agent_name,role,status FROM users WHERE id != ? ORDER BY id').all(origin.id)
+          .map(x => ({ id: x.id, username: x.username, agent_level: x.agent_level, agent_name: x.agent_name, role: x.role, status: x.status }));
+      }
+      return json(res, 200, {
+        success: true,
+        data: {
+          current: { id: u.id, username: u.username },
+          origin: { id: origin.id, username: origin.username },
+          is_admin: isAdminUser,
+          downline: down,
+          upline: up,
+          all,
+        },
+      });
+    }
+
     if (pathname === '/api/user/invite') {
       const u = requireUser(req, res); if (!u) return;
       return json(res, 200, {
@@ -154,9 +235,129 @@ const server = http.createServer(async (req, res) => {
           stats: store.inviteStats(db, u),
           invitees: store.listInvitees(db, u),
           reward_rate: parseFloat(store.getSetting(db, 'invite_reward_rate') || '0'),
+          reward_l2: parseFloat(store.getSetting(db, 'agent_reward_l2') || '0'),
+          reward_l3: parseFloat(store.getSetting(db, 'agent_reward_l3') || '0'),
+          team: store.teamStats(db, u.id),
+          upline: store.getUpline(db, u.id, 3).map(p => ({ id: p.id, username: p.username, agent_level: p.agent_level })),
           site_name: store.getSetting(db, 'site_name'),
         },
       });
+    }
+
+    // ---------- 多层级代理 ----------
+    // 我的团队（含整棵下级树 + 各级统计）
+    if (pathname === '/api/agent/team') {
+      const u = requireUser(req, res); if (!u) return;
+      return json(res, 200, {
+        success: true,
+        data: {
+          me: { id: u.id, username: u.username, agent_level: u.agent_level, agent_name: u.agent_name },
+          stats: store.teamStats(db, u.id),
+          downline: store.listDownline(db, u.id, { maxDepth: 5 }),
+          upline: store.getUpline(db, u.id, 3).map(p => ({ id: p.id, username: p.username, agent_level: p.agent_level, agent_name: p.agent_name })),
+        },
+      });
+    }
+    // 管理员：全平台代理树 / 设置某用户上级与等级
+    if (pathname === '/api/admin/agent/tree' && req.method === 'GET') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      // 根节点 = 无上级的用户
+      const roots = db.prepare('SELECT id,username,agent_level,agent_name,quota,used_quota,status,role,remark,inviter_id FROM users WHERE inviter_id=0 ORDER BY id').all();
+      const build = (n) => {
+        const kids = db.prepare('SELECT id,username,agent_level,agent_name,quota,used_quota,status,role,remark,inviter_id FROM users WHERE inviter_id=? ORDER BY id').all(n.id);
+        return { ...n, children: kids.map(build) };
+      };
+      return json(res, 200, { success: true, data: roots.map(build) });
+    }
+    if (pathname === '/api/admin/agent/set' && req.method === 'POST') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      const b = await readJson(req) || {};
+      const uid = parseInt(b.user_id || 0, 10);
+      if (!uid) return json(res, 400, { success: false, message: '缺少 user_id' });
+      const before = store.getUserById(db, uid);
+      if (!before) return json(res, 404, { success: false, message: '用户不存在' });
+      if (b.inviter_id !== undefined) {
+        const r = store.setInviterSafe(db, uid, parseInt(b.inviter_id || 0, 10));
+        if (!r.ok) return json(res, 400, { success: false, message: r.message });
+      }
+      if (b.agent_level !== undefined || b.agent_name !== undefined) {
+        store.setAgentInfo(db, uid, { agent_level: b.agent_level, agent_name: b.agent_name });
+      }
+      const after = store.getUserById(db, uid);
+      // 审计
+      if (before.inviter_id !== after.inviter_id || before.agent_level !== after.agent_level || before.agent_name !== after.agent_name) {
+        const oi = before.inviter_id ? store.getUserById(db, before.inviter_id) : null;
+        const ni = after.inviter_id ? store.getUserById(db, after.inviter_id) : null;
+        store.addAgentAudit(db, {
+          target_user_id: uid, target_name: after.username,
+          old_inviter_id: before.inviter_id, old_inviter: oi ? oi.username : '平台直营',
+          new_inviter_id: after.inviter_id, new_inviter: ni ? ni.username : '平台直营',
+          action: 'admin-set', level_before: before.agent_level, level_after: after.agent_level, agent_name: after.agent_name,
+          op_user_id: u.id, op_username: u.username, op_role: '管理员', ip: clientIp(req),
+        });
+      }
+      console.log(`[agent] ${u.username} 设置 uid=${uid} inviter=${b.inviter_id ?? '-'} level=${b.agent_level ?? '-'}`);
+      return json(res, 200, { success: true, data: store.publicUser(db, after) });
+    }
+
+    // 代理自助：改自己「下1级用户」的归属（admin 可改任何人）
+    // POST /api/agent/reassign { user_id, inviter_id }
+    if (pathname === '/api/agent/reassign' && req.method === 'POST') {
+      const u = requireUser(req, res); if (!u) return;
+      const b = await readJson(req) || {};
+      const uid = parseInt(b.user_id || 0, 10);
+      const newInviter = parseInt(b.inviter_id || 0, 10);
+      if (!uid) return json(res, 400, { success: false, message: '缺少 user_id' });
+      const target = store.getUserById(db, uid);
+      if (!target) return json(res, 404, { success: false, message: '用户不存在' });
+      const isAdminUser = store.isAdmin(u);
+      // 非管理员：只能动「自己的直属下级」（target.inviter_id === 自己）
+      if (!isAdminUser && target.inviter_id !== u.id) {
+        return json(res, 403, { success: false, message: '只能调整自己的直属下级' });
+      }
+      // 非管理员：新上级必须是自己或自己的下级（不能把下1级挂到自己上面/体系外）
+      if (!isAdminUser) {
+        const ownDown = store.listDownline(db, u.id, { maxDepth: 20 }).map(d => d.id);
+        if (newInviter !== u.id && !ownDown.includes(newInviter)) {
+          return json(res, 403, { success: false, message: '只能在自己团队内部调整（可挂到自己或自己的下级）' });
+        }
+      }
+      const r = store.setInviterSafe(db, uid, newInviter);
+      if (!r.ok) return json(res, 400, { success: false, message: r.message });
+      const oi = target.inviter_id ? store.getUserById(db, target.inviter_id) : null;
+      const ni = newInviter ? store.getUserById(db, newInviter) : null;
+      store.addAgentAudit(db, {
+        target_user_id: uid, target_name: target.username,
+        old_inviter_id: target.inviter_id, old_inviter: oi ? oi.username : '平台直营',
+        new_inviter_id: newInviter, new_inviter: ni ? ni.username : '平台直营',
+        action: 'agent-reassign', level_before: target.agent_level, level_after: target.agent_level, agent_name: target.agent_name,
+        op_user_id: u.id, op_username: u.username, op_role: store.isAdmin(u) ? '管理员' : '代理', ip: clientIp(req),
+      });
+      console.log(`[agent] ${u.username} 调整 uid=${uid} 归属 -> inviter=${newInviter}`);
+      return json(res, 200, { success: true, data: store.publicUser(db, store.getUserById(db, uid)) });
+    }
+
+    // 代理结算：导出每个代理的团队结算（自身 + 全下级消费 + 返佣）
+    // GET /api/admin/agent/settle  (管理员)
+    if (pathname === '/api/admin/agent/settle' && req.method === 'GET') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      return exportAgentSettleXlsx(res);
+    }
+
+    // 归属变更审计日志
+    // GET /api/agent/audit?user=<id>&limit=N  （管理员看全部；普通用户看自己相关）
+    if (pathname === '/api/agent/audit' && req.method === 'GET') {
+      const u = requireUser(req, res); if (!u) return;
+      const limit = Math.min(parseInt(query.get('limit') || '200', 10), 500);
+      if (store.isAdmin(u)) {
+        const target = parseInt(query.get('user') || '0', 10);
+        return json(res, 200, { success: true, data: store.listAgentAudit(db, { targetUserId: target, limit }) });
+      }
+      // 普通用户：只看自己（作为被调整对象）的记录
+      return json(res, 200, { success: true, data: store.listAgentAudit(db, { targetUserId: u.id, limit }) });
     }
 
     // ---------- 令牌 ----------
@@ -197,6 +398,25 @@ const server = http.createServer(async (req, res) => {
       const days = Math.min(parseInt(query.get('days') || '0', 10), 3650);
       const since = days > 0 ? Date.now() - days * 86400000 : 0;
       return exportUsageXlsx(res, { userId, since, all });
+    }
+
+    // 结算清单导出（xlsx，管理员：全部或指定用户；普通用户：自己）
+    // GET /api/settle/export?user=all|<id>|me  [&days=N]
+    if (pathname === '/api/settle/export') {
+      const u = requireUser(req, res); if (!u) return;
+      const isAdminUser = store.isAdmin(u);
+      let target = String(query.get('user') || (isAdminUser ? 'all' : 'me'));
+      if (!isAdminUser) target = 'me';               // 非管理员只能导自己
+      if (target === 'me') target = String(u.id);
+      if (target !== 'all') {
+        const uid = parseInt(target, 10);
+        if (!uid) return json(res, 400, { success: false, message: '参数 user 需为 all / me / 用户ID' });
+        if (uid !== u.id && !isAdminUser) return json(res, 403, { success: false, message: '无权导出其他用户' });
+        target = String(uid);
+      }
+      const days = Math.min(parseInt(query.get('days') || '0', 10), 3650);
+      const since = days > 0 ? Date.now() - days * 86400000 : 0;
+      return exportSettleXlsx(res, { target, since });
     }
 
     // ---------- 模型 / 渠道（对外目录：不含密钥） ----------
@@ -255,6 +475,86 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---------- 管理：用户 / 兑换码 / 设置 ----------
+    // 代理给下级划转额度（从自己余额）：POST /api/agent/transfer {user_id, amount}
+    if (pathname === '/api/agent/transfer' && req.method === 'POST') {
+      const u = requireUser(req, res); if (!u) return;
+      const b = await readJson(req) || {};
+      const tid = parseInt(b.user_id || 0, 10);
+      const amount = parseInt(b.amount || 0, 10);   // quota 单位
+      if (!tid) return json(res, 400, { success: false, message: '缺少 user_id' });
+      if (amount <= 0) return json(res, 400, { success: false, message: '划转额度必须大于 0' });
+      const target = store.getUserById(db, tid);
+      if (!target) return json(res, 404, { success: false, message: '目标用户不存在' });
+      // 非管理员：只能给自己的下级划转
+      const isAdminUser = store.isAdmin(u);
+      if (!isAdminUser) {
+        const down = store.listDownline(db, u.id, { maxDepth: 20 }).map(d => d.id);
+        if (!down.includes(tid)) return json(res, 403, { success: false, message: '只能给自己的下级划转额度' });
+      }
+      const r = store.transferQuota(db, u.id, tid, amount);
+      if (!r.ok) return json(res, 400, { success: false, message: r.message });
+      // 双边流水留痕
+      const rid = 'transfer:' + u.id + '-' + Date.now();
+      store.addLedger(db, {
+        user_id: u.id, delta: -amount, kind: 'transfer_out',
+        detail: `划转给 ${target.username} -$${(amount / 500000).toFixed(4)}`,
+        ref_user_id: tid, ref_username: target.username,
+        op_user_id: u.id, op_username: u.username, op_role: isAdminUser ? '管理员' : '代理', ip: clientIp(req), request_id: rid,
+      });
+      store.addLedger(db, {
+        user_id: tid, delta: amount, kind: 'transfer_in',
+        detail: `来自 ${u.username} 划转 +$${(amount / 500000).toFixed(4)}`,
+        ref_user_id: u.id, ref_username: u.username,
+        op_user_id: u.id, op_username: u.username, op_role: isAdminUser ? '管理员' : '代理', ip: clientIp(req), request_id: rid,
+      });
+      // 记流水（充值类型）
+      store.insertLog(db, {
+        user_id: tid, username: target.username, token_id: 0, token_name: '代理划转',
+        model_name: '', channel_id: 0, channel_name: '', quota: amount,
+        status: 'success', log_type: 'recharge', source: 'agent-transfer',
+        request_id: rid,
+      });
+      // 审计
+      store.addAgentAudit(db, {
+        target_user_id: tid, target_name: target.username,
+        old_inviter_id: target.inviter_id, old_inviter: '—',
+        new_inviter_id: target.inviter_id, new_inviter: '—',
+        action: 'transfer', agent_name: '$' + (amount / 500000).toFixed(4),
+        op_user_id: u.id, op_username: u.username, op_role: isAdminUser ? '管理员' : '代理', ip: clientIp(req),
+      });
+      console.log(`[agent] ${u.username} 给 ${target.username} 划转 quota=${amount}`);
+      return json(res, 200, { success: true, message: `已给 ${target.username} 划转 $${(amount / 500000).toFixed(4)}`, data: { from: store.publicUser(db, r.from), to: store.publicUser(db, r.to) } });
+    }
+
+    // 钱包流水（资金账单）：GET /api/ledger?user=<id>&kind=&limit=N
+    // 管理员看全部/可筛用户；普通用户只能看自己
+    if (pathname === '/api/ledger' && req.method === 'GET') {
+      const u = requireUser(req, res); if (!u) return;
+      const limit = Math.min(parseInt(query.get('limit') || '200', 10), 1000);
+      const kind = String(query.get('kind') || '');
+      const days = parseInt(query.get('days') || '0', 10);
+      const since = days > 0 ? Date.now() - days * 86400000 : 0;
+      if (store.isAdmin(u)) {
+        const target = parseInt(query.get('user') || '0', 10);
+        return json(res, 200, { success: true, data: store.listLedger(db, { userId: target, kind, limit, since }) });
+      }
+      return json(res, 200, { success: true, data: store.listLedger(db, { userId: u.id, kind, limit, since }) });
+    }
+
+    // 批量建用户（管理员）POST /api/admin/user/bulk
+    if (pathname === '/api/admin/user/bulk' && req.method === 'POST') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      const b = await readJson(req) || {};
+      const created = await store.bulkCreateUsers(db, {
+        prefix: b.prefix || 'user', count: b.count || 1,
+        password: b.password || '123456', quota: b.quota || 0,
+        startIndex: b.startIndex, digits: b.digits || 4,
+        inviter_id: b.inviter_id || 0, agent_name: b.agent_name || '',
+      });
+      console.log(`[admin] ${u.username} 批量建 ${created.length} 个用户 (前缀 ${b.prefix || 'user'}${b.inviter_id ? ', 挂到代理 ' + b.inviter_id : ''})`);
+      return json(res, 200, { success: true, message: `已创建 ${created.length} 个用户`, data: created });
+    }
     if (pathname === '/api/admin/user/list') {
       const u = requireUser(req, res); if (!u) return;
       if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
@@ -325,7 +625,30 @@ const server = http.createServer(async (req, res) => {
       const u = requireUser(req, res); if (!u) return;
       if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
       const b = await readJson(req) || {};
-      const r = store.adminUpdateUser(db, parseInt(b.id || 0, 10), b);
+      const uid = parseInt(b.id || 0, 10);
+      const before = store.getUserById(db, uid);
+      if (!before) return json(res, 404, { success: false, message: '用户不存在' });
+      const r = store.adminUpdateUser(db, uid, b);
+      const after = store.getUserById(db, uid);
+      if (after.quota !== before.quota) {
+        const delta = after.quota - before.quota;
+        store.addLedger(db, {
+          user_id: uid, delta, kind: delta >= 0 ? 'recharge' : 'adjust',
+          detail: delta >= 0 ? ('管理员充值 +$' + (delta / 500000).toFixed(4)) : ('管理员扣减 $' + (delta / 500000).toFixed(4)),
+          op_user_id: u.id, op_username: u.username, op_role: '管理员', ip: clientIp(req),
+          request_id: 'admin-user-update:' + uid + '-' + Date.now(),
+        });
+      }
+      if (before.role !== after.role || before.status !== after.status) {
+        store.addAgentAudit(db, {
+          target_user_id: uid, target_name: after.username,
+          old_inviter_id: before.inviter_id, old_inviter: '—', new_inviter_id: after.inviter_id, new_inviter: '—',
+          action: 'admin-account', level_before: before.agent_level, level_after: after.agent_level,
+          agent_name: `role ${before.role}->${after.role}, status ${before.status}->${after.status}`,
+          op_user_id: u.id, op_username: u.username, op_role: '管理员', ip: clientIp(req),
+        });
+      }
+      console.log(`[admin] ${u.username} 更新用户 ${uid}${after.quota !== before.quota ? ' quota ' + before.quota + '->' + after.quota : ''}`);
       return json(res, 200, { success: true, data: r });
     }
     if (pathname === '/api/admin/stats') {
@@ -421,6 +744,16 @@ async function handleUserUpdate(req, res, u) {
       return json(res, 403, { success: false, message: '当前密码不正确' });
     await store.setPassword(db, u.id, np);
     changed.push('密码');
+  }
+
+  // 改用户名（不能重名）
+  if (b.username !== undefined && String(b.username).trim() !== '') {
+    const newU = String(b.username).trim();
+    if (newU !== u.username) {
+      const r = store.setUsername(db, u.id, newU);
+      if (!r.ok) return json(res, 400, { success: false, message: r.message });
+      changed.push('用户名');
+    }
   }
 
   // 改昵称
@@ -544,6 +877,195 @@ function exportUsageXlsx(res, { userId, since, all }) {
   });
   res.end(buf);
   console.log(`[export] ${all ? 'ALL' : 'uid'} xlsx: ${rows.length} 条明细 / ${summary.length} 行汇总`);
+}
+
+/** 结算清单导出：target = 'all' 或 用户ID 字符串 */
+function exportSettleXlsx(res, { target, since }) {
+  const xlsx = require('./lib/xlsx');
+  const TYPE = { consume: '消费', recharge: '充值', reward: '返利', system: '系统', admin: '管理' };
+  const usdS = q => '$' + ((q || 0) / QUOTA_PER_USD).toFixed(6);
+  const aggSql = (uid) => `SELECT COUNT(*) c,
+      SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) ok,
+      SUM(CASE WHEN status!='success' THEN 1 ELSE 0 END) err,
+      COALESCE(SUM(prompt_tokens),0) tin, COALESCE(SUM(completion_tokens),0) tout,
+      COALESCE(SUM(total_tokens),0) tok, COALESCE(SUM(quota),0) q
+    FROM logs WHERE user_id=?`;
+
+  const users = target === 'all'
+    ? store.listUsers(db)
+    : [store.getUserById(db, parseInt(target, 10))].filter(Boolean);
+  if (!users.length) return json(res, 404, { success: false, message: '用户不存在' });
+
+  // 汇总总表
+  const master = [['用户ID','用户名','角色','状态','账期起','账期止','请求次数','成功','失败','输入token','输出token','总token','累计消费(USD)','累计充值(USD)','当前余额(USD)']];
+  let G={c:0,ok:0,err:0,tin:0,tout:0,tok:0,q:0,rc:0};
+
+  for (const u of users) {
+    const logs = store.exportLogs(db, { userId: u.id, since });
+    const agg = db.prepare(aggSql(u.id)).get(u.id);
+    const rc = db.prepare(`SELECT COALESCE(SUM(quota),0) q FROM logs WHERE user_id=? AND log_type='recharge'`).get(u.id).q;
+    const first = logs.length ? logs[logs.length-1].created_at : u.created_at;  // exportLogs 为 DESC
+    const last  = logs.length ? logs[0].created_at : u.created_at;
+    G.c+=agg.c; G.ok+=agg.ok||0; G.err+=agg.err||0; G.tin+=agg.tin; G.tout+=agg.tout; G.tok+=agg.tok; G.q+=agg.q; G.rc+=rc;
+    master.push([
+      String(u.id), u.username, u.role>=100?'管理员':'用户', u.status===1?'启用':'禁用',
+      fmtTs(first), fmtTs(last), agg.c, agg.ok||0, agg.err||0,
+      agg.tin, agg.tout, agg.tok, usdS(agg.q), usdS(rc), usdS(u.quota),
+    ]);
+  }
+  master.push(['合计','','','','','',G.c,G.ok,G.err,G.tin,G.tout,G.tok,usdS(G.q),usdS(G.rc),'']);
+
+  // 每人一份结算 sheet 的拼接方式：指定用户→多 sheet；全部→总表 + 每人一个 sheet（上限保护）
+  const d = new Date();
+  const stamp = `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+
+  if (target !== 'all') {
+    const u = users[0];
+    const logs = store.exportLogs(db, { userId: u.id, since });
+    const agg = db.prepare(aggSql(u.id)).get(u.id);
+    const rc = db.prepare(`SELECT COALESCE(SUM(quota),0) q FROM logs WHERE user_id=? AND log_type='recharge'`).get(u.id).q;
+    const first = logs.length ? logs[logs.length-1].created_at : u.created_at;  // exportLogs 为 DESC
+    const last  = logs.length ? logs[0].created_at : u.created_at;
+
+    const info = [
+      ['结算清单',''], ['用户名', u.username], ['用户ID', String(u.id)],
+      ['角色', u.role>=100?'管理员':'用户'], ['状态', u.status===1?'启用':'禁用'],
+      ['注册时间', fmtTs(u.created_at)],
+      ['账期', logs.length ? `${fmtTs(first)} ~ ${fmtTs(last)}` : '(无调用记录)'],
+      ['',''], ['结算项目','金额(USD)'],
+      ['累计充值', usdS(rc)], ['累计消费', usdS(agg.q)], ['当前余额', usdS(u.quota)],
+      ['',''], ['调用统计',''],
+      ['请求总数', String(agg.c)], ['成功', String(agg.ok||0)], ['失败', String(agg.err||0)],
+      ['输入token', String(agg.tin)], ['输出token', String(agg.tout)], ['总token', String(agg.tok)],
+      ['导出时间', fmtTs(Date.now())],
+    ];
+    const detail = [['时间','类型','模型','渠道','令牌','输入token','输出token','总token','消费(USD)','耗时(秒)','流式','状态','错误','来源IP']];
+    for (const l of logs) detail.push([
+      fmtTs(l.created_at), TYPE[l.log_type]||l.log_type||'消费', l.model_name||'-', l.channel_name||'-', l.token_name||'-',
+      l.prompt_tokens, l.completion_tokens, l.total_tokens, usdS(l.quota),
+      Math.round(l.use_time||0), l.is_stream?'是':'否', l.status==='success'?'成功':'失败',
+      (l.error||'').slice(0,80), l.ip||'',
+    ]);
+    const byModel = db.prepare(`SELECT model_name, COUNT(*) c, COALESCE(SUM(prompt_tokens),0) tin,
+       COALESCE(SUM(completion_tokens),0) tout, COALESCE(SUM(total_tokens),0) tok, COALESCE(SUM(quota),0) q
+       FROM logs WHERE user_id=? GROUP BY model_name ORDER BY q DESC`).all(u.id);
+    const mSheet = [['模型','请求次数','输入token','输出token','总token','消费(USD)']];
+    let mR=0,mI=0,mO=0,mT=0,mQ=0;
+    for (const r of byModel) { mSheet.push([r.model_name,r.c,r.tin,r.tout,r.tok,usdS(r.q)]); mR+=r.c;mI+=r.tin;mO+=r.tout;mT+=r.tok;mQ+=r.q; }
+    mSheet.push(['合计',mR,mI,mO,mT,usdS(mQ)]);
+    const byCh = db.prepare(`SELECT channel_name, COUNT(*) c, COALESCE(SUM(total_tokens),0) tok, COALESCE(SUM(quota),0) q
+       FROM logs WHERE user_id=? GROUP BY channel_name ORDER BY q DESC`).all(u.id);
+    const cSheet = [['渠道','请求次数','总token','消费(USD)']];
+    let cR=0,cT=0,cQ=0;
+    for (const r of byCh) { cSheet.push([r.channel_name||'-',r.c,r.tok,usdS(r.q)]); cR+=r.c;cT+=r.tok;cQ+=r.q; }
+    cSheet.push(['合计',cR,cT,usdS(cQ)]);
+
+    const buf = xlsx.build([
+      { name: '结算概要', rows: info, colWidths: [16, 44] },
+      { name: '调用明细', rows: detail, colWidths: [19,8,22,24,14,11,11,11,13,8,6,7,40,16], freezeHeader: true },
+      { name: '按模型汇总', rows: mSheet, colWidths: [24,10,13,13,13,14], freezeHeader: true },
+      { name: '按渠道汇总', rows: cSheet, colWidths: [26,10,13,14], freezeHeader: true },
+    ]);
+    const fname = `结算清单_${u.username}_${u.id}_${stamp}.xlsx`;
+    return sendXlsx(res, buf, fname, `[settle] uid=${u.id} ${logs.length} 条`);
+  }
+
+  // 全部用户：总表 + 每个用户一个明细 sheet（sheet 名去重/截断，上限 40 用户）
+  const sheets = [{ name: '全部用户结算', rows: master, colWidths: [8,16,8,6,19,19,9,7,7,12,12,12,15,15,15], freezeHeader: true }];
+  const used = new Set(['全部用户结算']);
+  for (const u of users.slice(0, 40)) {
+    const logs = store.exportLogs(db, { userId: u.id, since });
+    if (!logs.length) continue;
+    let nm = u.username.replace(/[\\\/\?\*\[\]:]/g, '_').slice(0, 26);
+    let base = nm, i = 2;
+    while (used.has(nm)) nm = base + '_' + (i++);
+    used.add(nm);
+    const agg = db.prepare(aggSql(u.id)).get(u.id);
+    const rows = [['结算:' + u.username + ' (ID ' + u.id + ')',''],
+      ['累计消费(USD)', usdS(agg.q)], ['总token', String(agg.tok)], ['请求数', String(agg.c)],
+      ['',''], ['时间','模型','渠道','输入token','输出token','总token','消费(USD)','状态']];
+    for (const l of logs) rows.push([
+      fmtTs(l.created_at), l.model_name||'-', l.channel_name||'-',
+      l.prompt_tokens, l.completion_tokens, l.total_tokens, usdS(l.quota),
+      l.status==='success'?'成功':'失败',
+    ]);
+    sheets.push({ name: nm, rows, colWidths: [19,24,24,11,11,11,13,7], freezeHeader: true });
+  }
+  const buf = xlsx.build(sheets);
+  const fname = `结算清单_全部用户_${stamp}.xlsx`;
+  return sendXlsx(res, buf, fname, `[settle] ALL ${users.length} 用户`);
+}
+
+/** 代理结算导出：每个代理一行（团队人数/团队消费/各级返佣）+ 每代理一个明细 sheet */
+function exportAgentSettleXlsx(res) {
+  const xlsx = require('./lib/xlsx');
+  const usdS = q => '$' + ((q || 0) / QUOTA_PER_USD).toFixed(6);
+  const agents = db.prepare('SELECT * FROM users WHERE agent_level > 0 ORDER BY agent_level, id').all();
+
+  const head = ['用户ID','用户名','代理名','等级','直属下级','团队总人数','团队消费(USD)','自身消费(USD)','一级返佣(USD)','二级返佣(USD)','三级返佣(USD)','返佣合计(USD)','当前余额(USD)'];
+  const master = [head];
+  let GT={users:0,consume:0,r1:0,r2:0,r3:0};
+
+  const detailSheets = [];
+  for (const a of agents) {
+    const ts = store.teamStats(db, a.id);
+    // 团队消费 = 自身 + 全下级消费
+    const teamIds = [a.id, ...store.listDownline(db, a.id, { maxDepth: 5 }).map(d => d.id)];
+    let teamConsume = 0;
+    for (const id of teamIds) {
+      const r = db.prepare("SELECT COALESCE(SUM(quota),0) q FROM logs WHERE user_id=? AND request_id NOT LIKE 'invite:%'").get(id);
+      teamConsume += r.q;
+    }
+    const own = db.prepare("SELECT COALESCE(SUM(quota),0) q FROM logs WHERE user_id=? AND request_id NOT LIKE 'invite:%'").get(a.id).q;
+    master.push([
+      String(a.id), a.username, a.agent_name || '', 'L' + a.agent_level,
+      ts.direct, ts.total, usdS(teamConsume), usdS(own),
+      usdS(ts.reward_l1), usdS(ts.reward_l2), usdS(ts.reward_l3), usdS(ts.reward_total), usdS(a.quota),
+    ]);
+    GT.users += ts.total; GT.consume += teamConsume; GT.r1 += ts.reward_l1; GT.r2 += ts.reward_l2; GT.r3 += ts.reward_l3;
+
+    // 该代理的明细 sheet（自身 + 下级消费明细）
+    const rows = [['代理:' + a.username + ' (L' + a.agent_level + ' ' + (a.agent_name || '') + ')',''],
+      ['团队人数', String(ts.total)], ['团队消费(USD)', usdS(teamConsume)],
+      ['返佣 L1/L2/L3', usdS(ts.reward_l1) + ' / ' + usdS(ts.reward_l2) + ' / ' + usdS(ts.reward_l3)],
+      ['',''], ['时间','成员','模型','渠道','输入token','输出token','总token','消费(USD)','状态']];
+    const logs = db.prepare(`SELECT l.*, u.username AS uname FROM logs l JOIN users u ON u.id=l.user_id
+      WHERE l.user_id IN (${teamIds.map(() => '?').join(',')}) AND l.request_id NOT LIKE 'invite:%'
+      ORDER BY l.created_at DESC LIMIT 5000`).all(...teamIds);
+    for (const l of logs) rows.push([
+      fmtTs(l.created_at), l.uname, l.model_name || '-', l.channel_name || '-',
+      l.prompt_tokens, l.completion_tokens, l.total_tokens, usdS(l.quota),
+      l.status === 'success' ? '成功' : '失败',
+    ]);
+    let nm = a.username.replace(/[\\\/\?\*\[\]:]/g, '_').slice(0, 26);
+    detailSheets.push({ name: nm, rows, colWidths: [19,16,22,22,11,11,11,13,7], freezeHeader: true });
+  }
+  master.push(['合计','','','', '', GT.users, usdS(GT.consume), '', usdS(GT.r1), usdS(GT.r2), usdS(GT.r3), usdS(GT.r1 + GT.r2 + GT.r3), '']);
+
+  // sheet 名去重
+  const used = new Set(['代理结算总表']);
+  for (const s of detailSheets) {
+    let b = s.name, i = 2;
+    while (used.has(s.name)) s.name = b + '_' + (i++);
+    used.add(s.name);
+  }
+  const sheets = [{ name: '代理结算总表', rows: master, colWidths: [8,16,14,6,9,10,14,14,14,14,14,14,14], freezeHeader: true }, ...detailSheets.slice(0, 30)];
+  const buf = xlsx.build(sheets);
+  const d = new Date();
+  const stamp = `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+  return sendXlsx(res, buf, `代理结算清单_${stamp}.xlsx`, `[settle] agents=${agents.length}`);
+}
+
+function sendXlsx(res, buf, fname, logMsg) {
+  res.writeHead(200, {
+    'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'Content-Disposition': `attachment; filename="${encodeURIComponent(fname)}"; filename*=UTF-8''${encodeURIComponent(fname)}`,
+    'Content-Length': buf.length,
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*',
+  });
+  res.end(buf);
+  console.log(logMsg);
 }
 
 async function handleChannelModels(res, b) {

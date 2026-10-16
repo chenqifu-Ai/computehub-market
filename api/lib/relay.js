@@ -331,25 +331,48 @@ function settle(ctx, { logCtx, model, prompt, completion, quota, started, stream
     ctx.store.touchToken(ctx.db, logCtx.token_id);
     ctx.store.addChannelUsage(ctx.db, logCtx.channel_id, quota);
 
-    // 邀请返利：将消费额度的一部分回馈给邀请人
+    // 消费扣费留痕
+    if (quota > 0 && ctx.store.addLedger) {
+      ctx.store.addLedger(ctx.db, {
+        user_id: logCtx.user_id, delta: -quota, kind: 'consume',
+        detail: `调用 ${model} -$${(quota / 500000).toFixed(6)}`,
+        ref_user_id: 0, ref_username: logCtx.channel_name || '',
+        op_user_id: logCtx.user_id, op_username: logCtx.username, op_role: '用户',
+        ip: logCtx.ip || '', request_id: logCtx.request_id,
+      });
+    }
+
+    // 多层级返佣：下线消费，沿上级链逐级分成（第1代/第2代/第3代）
     try {
-      const rate = parseFloat(ctx.store.getSetting(ctx.db, 'invite_reward_rate') || '0');
-      if (rate > 0 && quota > 0) {
-        const u = ctx.store.getUserById(ctx.db, logCtx.user_id);
-        if (u && u.inviter_id) {
+      const rate1 = parseFloat(ctx.store.getSetting(ctx.db, 'invite_reward_rate') || '0');
+      const rate2 = parseFloat(ctx.store.getSetting(ctx.db, 'agent_reward_l2') || '0');
+      const rate3 = parseFloat(ctx.store.getSetting(ctx.db, 'agent_reward_l3') || '0');
+      const rates = [rate1, rate2, rate3];
+      if (quota > 0 && (rate1 > 0 || rate2 > 0 || rate3 > 0)) {
+        const chain = ctx.store.getUpline(ctx.db, logCtx.user_id, 3);   // [L1, L2, L3]
+        for (let i = 0; i < chain.length; i++) {
+          const rate = rates[i] || 0;
+          if (rate <= 0) continue;
           const reward = Math.floor(quota * rate);
-          if (reward > 0) {
-            ctx.store.addUserQuota(ctx.db, u.inviter_id, reward);
-            ctx.store.addInviteReward(ctx.db, u.inviter_id, reward);
-            ctx.store.insertLog(ctx.db, {
-              user_id: u.inviter_id, username: 'invite-reward', token_id: 0, token_name: '返利',
-              model_name: model, channel_id: 0, channel_name: '', quota: -reward,
-              status: 'success', request_id: 'invite:' + logCtx.request_id,
+          if (reward <= 0) continue;
+          const parent = chain[i];
+          ctx.store.addAgentReward(ctx.db, parent.id, i + 1, reward);
+          if (ctx.store.addLedger) {
+            ctx.store.addLedger(ctx.db, {
+              user_id: parent.id, delta: reward, kind: 'reward',
+              detail: `下级 ${logCtx.username} 消费返佣 L${i + 1} +$${(reward / 500000).toFixed(6)}`,
+              ref_user_id: logCtx.user_id, ref_username: logCtx.username,
+              op_user_id: 0, op_username: 'system', op_role: '系统', request_id: 'invite:' + logCtx.request_id,
             });
           }
+          ctx.store.insertLog(ctx.db, {
+            user_id: parent.id, username: 'agent-reward-L' + (i + 1), token_id: 0, token_name: '返佣L' + (i + 1),
+            model_name: model, channel_id: 0, channel_name: '', quota: -reward,
+            status: 'success', request_id: 'invite:' + logCtx.request_id,
+          });
         }
       }
-    } catch (e) { console.error('[settle/invite]', e.message); }
+    } catch (e) { console.error('[settle/agent-reward]', e.message); }
 
     console.log(`[relay] ${logCtx.username} ${model} ch=${logCtx.channel_name} p=${prompt} c=${completion} quota=${quota} ${useSec.toFixed(1)}s${stream ? ' stream' : ''}`);
   } catch (e) { console.error('[settle]', e.message); }

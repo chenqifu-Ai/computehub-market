@@ -82,7 +82,7 @@ async function probeChannel(ch) {
   const t0 = Date.now();
   try {
     const r = await fetch(url, {
-      headers: ch.api_key ? { Authorization: '***' + ch.api_key } : {},
+      headers: ch.api_key ? { Authorization: `Bearer ${ch.api_key}` } : {},
       signal: AbortSignal.timeout(15000),
     });
     if (!r.ok) throw new Error('HTTP ' + r.status);

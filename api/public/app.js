@@ -95,6 +95,73 @@ $('btnLogout').onclick = async () => {
   SESSION = null; localStorage.removeItem(SKEY); location.reload();
 };
 
+// ---------- 身份切换 ----------
+$('btnSwitch').onclick = openSwitchDialog;
+async function openSwitchDialog() {
+  const j = await api('/api/user/switchable');
+  if (!j.success) return toast(j.message, 'err');
+  const d = j.data;
+  const isSelf = d.origin.id === d.current.id;
+  const opt = (u, tag) => `<option value="${u.id}">${esc(u.username)}${tag ? ' — ' + tag : ''}</option>`;
+  const downOpts = d.downline.map(u => opt(u, '下级 L' + u.depth + (u.agent_name ? ' · ' + u.agent_name : ''))).join('');
+  const upOpts = d.upline.map(u => opt(u, '上级（需密码）')).join('');
+  const allOpts = (d.all || []).map(u => opt(u, (u.role >= 100 ? '管理员' : '用户') + (u.agent_name ? ' · ' + u.agent_name : ''))).join('');
+  openModal(`
+    <h3>🔄 切换身份</h3>
+    <p class="muted">当前身份：<b>${esc(d.current.username)}</b>${isSelf ? '' : '（原始登录：' + esc(d.origin.username) + '）'}</p>
+    ${d.is_admin ? `
+    <label>🔑 管理员：切换到任意用户（无需密码）</label>
+    <input id="swAllFilter" placeholder="输入用户名/ID 过滤" oninput="filterSwitchAll()">
+    <select id="swAll" size="8" style="width:100%">
+      <option value="${d.origin.id}">↩ 返回本人（${esc(d.origin.username)}）</option>
+      ${allOpts}
+    </select>` : `
+    <label>切换到下级（无需密码）</label>
+    <select id="swDown" style="width:100%">
+      <option value="">— 选择下级 —</option>
+      <option value="${d.origin.id}">↩ 返回本人（${esc(d.origin.username)}）</option>
+      ${downOpts}
+    </select>
+    ${upOpts ? `
+    <label>切换到上级（需该上级密码）</label>
+    <select id="swUp" style="width:100%">
+      <option value="">— 选择上级 —</option>
+      ${upOpts}
+    </select>
+    <label>上级密码</label>
+    <input id="swPw" type="password" placeholder="输入所选上级的密码">` : ''}`}
+    ${!d.is_admin && !downOpts && !upOpts ? '<p class="muted" style="margin-top:10px">你目前没有可切换的下级或上级。</p>' : ''}
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn-primary" onclick="doSwitch()">切换</button>
+    </div>`);
+}
+function filterSwitchAll() {
+  const kw = ($('swAllFilter').value || '').trim().toLowerCase();
+  Array.from($('swAll').options).forEach(o => {
+    if (o.value === '') return;
+    o.style.display = (!kw || o.textContent.toLowerCase().includes(kw)) ? '' : 'none';
+  });
+}
+async function doSwitch() {
+  let target = '', password = '';
+  if ($('swAll')) { target = $('swAll').value; }
+  else {
+    const up = $('swUp') ? $('swUp').value : '';
+    const down = $('swDown') ? $('swDown').value : '';
+    if (up) { target = up; password = ($('swPw') || {}).value || ''; if (!password) return toast('切换到上级需要输入密码', 'err'); }
+    else if (down) { target = down; }
+  }
+  if (!target) return toast('请选择要切换到的用户', 'err');
+  const j = await api('/api/user/impersonate', { method: 'POST', body: JSON.stringify({ target, password }) });
+  if (!j.success) return toast(j.message, 'err');
+  SESSION = j.data.token;
+  localStorage.setItem(SKEY, SESSION);
+  toast('已切换到 ' + j.data.user.username);
+  closeModal();
+  setTimeout(() => location.reload(), 500);
+}
+
 // ---------- 进入控制台 ----------
 async function bootstrap() {
   const site = await api('/api/settings');
@@ -145,8 +212,8 @@ async function loadAnnounce() {
 // ---------- 导航 ----------
 const TITLES = {
   dashboard: '仪表盘', tokens: '令牌管理', models: '模型目录', logs: '使用日志',
-  topup: '充值兑换', invite: '邀请返利', profile: '个人设置', channels: '渠道管理',
-  users: '用户管理', settings: '系统设置', docs: '接入文档',
+  topup: '充值兑换', invite: '邀请返利', team: '代理团队', ledger: '资金流水', profile: '个人设置', channels: '渠道管理',
+  users: '用户管理', agenttree: '代理管理', settings: '系统设置', docs: '接入文档',
 };
 document.querySelectorAll('.side-nav a').forEach(a => { a.onclick = () => goto(a.dataset.page); });
 function goto(page) {
@@ -156,7 +223,7 @@ function goto(page) {
   const fn = {
     dashboard: loadDashboard, tokens: loadTokens, models: loadModels, logs: () => loadLogs(1),
     topup: loadTopup, invite: loadInvite, profile: loadProfile, channels: loadChannels,
-    users: loadUsers, settings: loadSettings, docs: () => {},
+    users: loadUsers, team: loadTeam, ledger: loadLedger, agenttree: loadAgentTree, settings: loadSettings, docs: () => {},
   }[page];
   if (fn) fn();
 }
@@ -352,15 +419,41 @@ $('btnExportLogs').onclick = () => {
 
 // 服务端生成 xlsx（双 sheet：明细 + 按模型汇总）
 function downloadXlsx(all) {
-  const url = `/api/log/export${all ? '?all=1' : ''}`;
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = '';
-  document.body.appendChild(a); a.click(); a.remove();
-  toast(all ? '正在导出全站用量…' : '正在导出使用日志…');
+  // fetch 下载以携带鉴权头（<a href> 无法带 Authorization）
+  downloadAuthed(`/api/log/export${all ? '?all=1' : ''}`, all ? '正在导出全站用量…' : '正在导出使用日志…');
+}
+// 带鉴权下载：用 fetch 取 blob 再触发保存，文件名从 Content-Disposition 解析
+async function downloadAuthed(url, tip) {
+  toast(tip || '正在导出…');
+  try {
+    const r = await fetch(url, { headers: SESSION ? { Authorization: SCHEME + SESSION } : {} });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      return toast('导出失败：' + (e.message || r.status), 'err');
+    }
+    const cd = r.headers.get('content-disposition') || '';
+    let fname = 'export.xlsx';
+    const m = cd.match(/filename\*=UTF-8''([^;]+)/i) || cd.match(/filename="?([^";]+)"?/i);
+    if (m) { try { fname = decodeURIComponent(m[1]); } catch { fname = m[1]; } }
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = fname;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    toast('已导出：' + fname);
+  } catch (e) { toast('导出失败：' + e.message, 'err'); }
 }
 $('btnExportXlsx').onclick = () => downloadXlsx(false);
 if ($('btnExportAll')) $('btnExportAll').onclick = () => downloadXlsx(true);
+
+// 结算清单下载（管理员:all / 指定用户; 普通用户:自己）
+function downloadSettle(user) {
+  downloadAuthed(`/api/settle/export?user=${encodeURIComponent(user)}`,
+    user === 'all' ? '正在导出全部用户结算清单…' : '正在导出结算清单…');
+}
+if ($('btnSettleAll')) $('btnSettleAll').onclick = () => downloadSettle('all');
+if ($('btnSettleSelf')) $('btnSettleSelf').onclick = () => downloadSettle('me');
 
 // ---------- 充值 / 签到 ----------
 async function loadTopup() {
@@ -507,11 +600,169 @@ async function loadUsers() {
       <td>${u.inviter_id ? '有' : '—'}${u.invite_reward ? ' / ' + fmtUsd(u.invite_reward) : ''}</td>
       <td class="actions">
         <button class="btn-ghost sm" onclick="editUser(${u.id},'${esc(u.username)}',${u.status},${u.role},'${esc(u.remark || '')}')">管理</button>
+        <button class="btn-ghost sm" onclick="downloadSettle(${u.id})">结算</button>
       </td>
     </tr>`).join('');
   loadRedemptions();
+  loadAudit();
 }
-$('btnReloadUsers').onclick = loadUsers;
+
+// ---------- 归属变更审计日志 ----------
+async function loadAudit() {
+  const kw = ($('auditFilter') && $('auditFilter').value.trim()) || '';
+  const q = kw ? ('?user=' + encodeURIComponent(kw)) : '';
+  const j = await api('/api/agent/audit' + q);
+  if (!j.success) { $('auditBody').innerHTML = `<tr><td colspan="9" class="empty">${esc(j.message)}</td></tr>`; return; }
+  const rows = kw ? j.data.filter(r => String(r.target_user_id) === kw || (r.target_name || '').includes(kw)) : j.data;
+  $('auditCount').textContent = rows.length + ' 条';
+  if (!rows.length) { $('auditBody').innerHTML = '<tr><td colspan="9" class="empty">暂无记录</td></tr>'; return; }
+  $('auditBody').innerHTML = rows.map(r => `
+    <tr>
+      <td>${fmtTime(r.created_at)}</td>
+      <td>${esc(r.op_username)}</td>
+      <td>${esc(r.op_role)}</td>
+      <td>${esc(r.target_name)} <span class="muted">#${r.target_user_id}</span></td>
+      <td>${esc(r.old_inviter)}</td>
+      <td><b>${esc(r.new_inviter)}</b></td>
+      <td>${r.level_before !== r.level_after ? ('L' + r.level_before + ' → L' + r.level_after) : ('L' + r.level_after)}</td>
+      <td>${esc(r.action)}</td>
+      <td>${esc(r.ip || '—')}</td>
+    </tr>`).join('');
+}
+if ($('btnReloadAudit')) $('btnReloadAudit').onclick = loadAudit;
+if ($('auditFilter')) $('auditFilter').oninput = () => { clearTimeout(window.__auditT); window.__auditT = setTimeout(loadAudit, 300); };
+$('btnReloadUsers').onclick = () => { loadUsers(); };
+$('btnViewTree').onclick = () => showUserTree();
+if ($('btnBulkCreate')) $('btnBulkCreate').onclick = openBulkCreate;
+function openBulkCreate() {
+  api('/api/admin/user/list').then(j => {
+    const users = j.success ? j.data : [];
+    const agentOpts = users.filter(u => u.agent_level > 0 || u.role >= 100)
+      .map(u => `<option value="${u.id}" data-aname="${esc(u.agent_name || '')}">#${u.id} ${esc(u.username)}${u.agent_level ? ' (L' + u.agent_level + ' ' + esc(u.agent_name || '') + ')' : (u.role >= 100 ? ' (管理员)' : '')}</option>`).join('');
+    const allOpts = users.map(u => `<option value="${u.id}" data-aname="${esc(u.agent_name || '')}">#${u.id} ${esc(u.username)}${u.agent_level ? ' (L' + u.agent_level + ')' : ''}</option>`).join('');
+    openModal(`
+    <h3>➕ 批量建用户</h3>
+    <p class="muted">按「前缀 + 序号」自动生成用户名，默认密码 <code>123456</code>（用户登录后可自行修改）。</p>
+    <label>用户名前缀</label>
+    <input id="bcPrefix" value="user" placeholder="如 user / 客户 / cs">
+    <label>数量（1-200）</label>
+    <input id="bcCount" type="number" value="10" min="1" max="200">
+    <label>起始序号（可选）</label>
+    <input id="bcStart" type="number" placeholder="留空自动（从 1 开始）">
+    <label>序号位数</label>
+    <input id="bcDigits" type="number" value="4" min="1" max="8">
+    <label>默认密码</label>
+    <input id="bcPass" value="123456">
+    <label>初始额度（USD，可选，0 = 不送）</label>
+    <input id="bcQuota" type="number" value="0" step="0.5">
+    <label>归属代理（可选，建好的用户成为其下级）</label>
+    <select id="bcInviter" style="width:100%">
+      <option value="0" data-aname="">— 不挂代理（平台直营）—</option>
+      <optgroup label="代理">${agentOpts}</optgroup>
+      <optgroup label="全部用户">${allOpts}</optgroup>
+    </select>
+    <p class="muted" style="margin-top:10px">示例：前缀 <code>user</code> + 位数 4 → user0001, user0002 …</p>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn-primary" onclick="doBulkCreate()">创建</button>
+    </div>`);
+  });
+}
+async function doBulkCreate() {
+  const prefix = ($('bcPrefix').value || 'user').trim();
+  const count = parseInt($('bcCount').value, 10) || 1;
+  const startIndex = $('bcStart').value;
+  const digits = parseInt($('bcDigits').value, 10) || 4;
+  const password = $('bcPass').value || '123456';
+  const quotaUsd = parseFloat($('bcQuota').value) || 0;
+  const inviter_id = parseInt($('bcInviter').value, 10) || 0;
+  const sel = $('bcInviter').selectedOptions[0];
+  const agent_name = sel ? (sel.dataset.aname || '') : '';
+  if (count < 1 || count > 200) return toast('数量需在 1-200 之间', 'err');
+  const j = await api('/api/admin/user/bulk', { method: 'POST', body: JSON.stringify({
+    prefix, count, startIndex, digits, password, quota: Math.round(quotaUsd * 500000), inviter_id, agent_name,
+  }) });
+  if (!j.success) return toast(j.message, 'err');
+  closeModal();
+  const list = (j.data || []).map(u => u.username).join(', ');
+  openModal(`
+    <h3>✅ ${esc(j.message)}</h3>
+    <p class="muted">默认密码：<code>${esc(password)}</code>${inviter_id ? ' ｜ 已挂到代理 #' + inviter_id : '（平台直营）'}（建议提醒用户首次登录后修改）</p>
+    <textarea readonly style="width:100%;height:180px;font-family:monospace">${esc(list)}</textarea>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="copyText(\`${list}\`)">复制用户名</button>
+      <button class="btn-primary" onclick="closeModal();loadUsers()">完成</button>
+    </div>`);
+}
+$('btnViewList').onclick = () => {
+  $('userTreeBox').classList.add('hidden'); $('userTable').classList.remove('hidden');
+  $('btnViewTree').classList.remove('active'); $('btnViewList').classList.add('active');
+  loadUsers();
+};
+
+let ALLUSERS = [];
+function showUserTree() {
+  $('userTreeBox').classList.remove('hidden'); $('userTable').classList.add('hidden');
+  $('btnViewTree').classList.add('active'); $('btnViewList').classList.remove('active');
+  loadUserTree();
+}
+async function loadUserTree() {
+  const j = await api('/api/admin/agent/tree');
+  if (!j.success) { $('userTreeBox').innerHTML = `<div class="empty">${esc(j.message)}</div>`; return; }
+  const render = (n) => `
+    <div class="tree-node">
+      <div class="tree-line">
+        <span class="tname">${esc(n.username)}</span>
+        <span class="tlevel">${n.agent_level ? '代理L' + n.agent_level + (n.agent_name ? ' · ' + esc(n.agent_name) : '') : '普通用户'}</span>
+        <span class="tmeta">ID ${n.id}</span>
+        <span class="tmeta">余额 ${fmtUsd(n.quota || 0)} | 已用 ${fmtUsd(n.used_quota || 0)}</span>
+        <button class="btn-ghost sm" onclick="editUpline(${n.id},'${esc(n.username)}')">改上级</button>
+        <button class="btn-ghost sm" onclick="editUser(${n.id},'${esc(n.username)}',${n.status || 1},${n.role || 1},'${esc(n.remark || '')}')">管理</button>
+      </div>
+      ${(n.children || []).length ? `<div class="tree-children">${n.children.map(render).join('')}</div>` : ''}
+    </div>`;
+  $('userTreeBox').innerHTML = j.data.length ? j.data.map(render).join('') : '<div class="empty">暂无用户</div>';
+}
+
+// 改上级：可指定任意用户为上级（admin 可重挂任何人）
+async function editUpline(id, name) {
+  const j = await api('/api/admin/user/list');
+  const all = (j.success ? j.data : []).filter(u => u.id !== id);
+  const self = j.success ? j.data.find(u => u.id === id) : null;
+  const cur = self ? (self.inviter_id || 0) : 0;
+  const opts = all.map(u => `<option value="${u.id}" ${u.id === cur ? 'selected' : ''}>#${u.id} ${esc(u.username)}</option>`).join('');
+  openModal(`
+    <h3>设置「${esc(name)}」(ID ${id}) 的上级</h3>
+    <p class="muted">选择新的上级用户（可搜用户名）；选「无上级」则归平台直营。</p>
+    <label>输入关键字筛选</label>
+    <input id="upFilter" placeholder="输入用户名/ID 过滤" oninput="filterUplineOptions()">
+    <label>上级用户</label>
+    <select id="upSelect" size="8" style="width:100%">
+      <option value="0" ${cur === 0 ? 'selected' : ''}>— 无上级（平台直营）—</option>
+      ${opts}
+    </select>
+    <p class="muted" style="margin-top:8px">⚠️ 不能挂到自己的下级（会形成环）。</p>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn-primary" onclick="saveUpline(${id})">保存</button>
+    </div>`);
+}
+function filterUplineOptions() {
+  const kw = $('upFilter').value.trim().toLowerCase();
+  const sel = $('upSelect');
+  Array.from(sel.options).forEach(o => {
+    if (o.value === '0') return;
+    o.style.display = (!kw || o.textContent.toLowerCase().includes(kw)) ? '' : 'none';
+  });
+}
+async function saveUpline(id) {
+  const inviter = parseInt($('upSelect').value, 10) || 0;
+  const j = await api('/api/admin/agent/set', { method: 'POST', body: JSON.stringify({ user_id: id, inviter_id: inviter }) });
+  if (!j.success) return toast(j.message, 'err');
+  toast('已更新上级');
+  closeModal();
+  loadUserTree();
+}
 function editUser(id, name, status, role, remark) {
   openModal(`
     <h3>管理用户「${esc(name)}」(ID ${id})</h3>
@@ -617,6 +868,8 @@ async function loadSettings() {
     $('sCheckin').value = s.checkin_quota || 0;
     $('sRate').value = s.rate_limit_per_min || 0;
     $('sInvite').value = s.invite_reward_rate || 0;
+    if ($('sR2')) $('sR2').value = s.agent_reward_l2 || 0;
+    if ($('sR3')) $('sR3').value = s.agent_reward_l3 || 0;
     $('sAnnounce').value = s.announcement || '';
   }
   const st = await api('/api/admin/stats');
@@ -635,6 +888,7 @@ $('btnSaveSettings').onclick = async () => {
     site_name: $('sSiteName').value.trim(),
     signup_quota: $('sSignup').value, checkin_quota: $('sCheckin').value,
     rate_limit_per_min: $('sRate').value, invite_reward_rate: $('sInvite').value,
+    agent_reward_l2: $('sR2') ? $('sR2').value : undefined, agent_reward_l3: $('sR3') ? $('sR3').value : undefined,
     announcement: $('sAnnounce').value.trim(),
   };
   const j = await api('/api/settings', { method: 'POST', body: JSON.stringify(b) });
@@ -657,9 +911,22 @@ async function loadProfile() {
   $('pfAff').textContent = ME.aff_code;
   $('pfCreated').textContent = fmtTime(ME.created_at);
   $('pfName').value = ME.display_name || '';
+  if ($('pfUsername')) $('pfUsername').value = ME.username || '';
   $('pwOld').value = ''; $('pwNew').value = ''; $('pwNew2').value = '';
   $('pwMsg').textContent = '';
 }
+
+$('btnSaveUsername').onclick = async () => {
+  const un = $('pfUsername').value.trim();
+  if (!un) return toast('用户名不能为空', 'err');
+  if (un === ME.username) return toast('用户名未变化', 'err');
+  const j = await api('/api/user/update', { method: 'POST', body: JSON.stringify({ username: un }) });
+  if (!j.success) return toast(j.message, 'err');
+  ME = j.data;
+  $('pfUser').textContent = ME.username;
+  $('sideUser').innerHTML = `<b>${esc(ME.display_name || ME.username)}</b>ID: ${ME.id}${IS_ADMIN ? ' · 管理员' : ''}`;
+  toast('✅ ' + j.message);
+};
 
 $('btnSaveName').onclick = async () => {
   const dn = $('pfName').value.trim();
@@ -694,6 +961,188 @@ $('btnChangePw').onclick = async () => {
   }, 1500);
 };
 
+// ---------- 资金流水 ----------
+const LEDGER_KIND = { recharge: '充值', transfer_in: '划入', transfer_out: '划出', redeem: '兑换码', checkin: '签到', reward: '返佣', consume: '消费', opening: '期初余额', adjust: '调整', refund: '退款' };
+async function loadLedger() {
+  const kw = ($('ledgerFilter') && $('ledgerFilter').value.trim()) || '';
+  const kind = ($('ledgerKind') && $('ledgerKind').value) || '';
+  let url = '/api/ledger?limit=300';
+  if (kw && IS_ADMIN) url += '&user=' + encodeURIComponent(kw);
+  if (kind) url += '&kind=' + encodeURIComponent(kind);
+  const j = await api(url);
+  if (!j.success) { $('ledgerBody').innerHTML = `<tr><td colspan="8" class="empty">${esc(j.message)}</td></tr>`; return; }
+  const rows = j.data;
+  $('ledgerCount').textContent = rows.length + ' 条';
+  let tin = 0, tout = 0;
+  for (const r of rows) { if (r.delta > 0) tin += r.delta; else tout += r.delta; }
+  $('ledgerStats').innerHTML = `
+    <div><b>${fmtUsd(tin)}</b><span>入账合计</span></div>
+    <div><b>${fmtUsd(tout)}</b><span>出账合计</span></div>
+    <div><b>${fmtUsd(tin + tout)}</b><span>净变动</span></div>`;
+  if (!rows.length) { $('ledgerBody').innerHTML = '<tr><td colspan="8" class="empty">暂无流水</td></tr>'; return; }
+  $('ledgerBody').innerHTML = rows.map(r => {
+    const cls = r.delta >= 0 ? 'on' : 'off';
+    return `
+    <tr>
+      <td>${fmtTime(r.created_at)}</td>
+      <td>${esc(r.username)} <span class="muted">#${r.user_id}</span></td>
+      <td><span class="tag ${cls}">${LEDGER_KIND[r.kind] || esc(r.kind)}</span></td>
+      <td style="color:${r.delta >= 0 ? '#4ade80' : '#f87171'};font-weight:600">${r.delta >= 0 ? '+' : ''}${fmtUsd(r.delta)}</td>
+      <td>${fmtUsd(r.balance_after)}</td>
+      <td class="muted">${esc(r.detail || '')}</td>
+      <td>${esc(r.op_username || '—')}${r.op_role ? ' <span class="muted">(' + esc(r.op_role) + ')</span>' : ''}</td>
+      <td class="muted">${esc(r.ip || '—')}</td>
+    </tr>`;
+  }).join('');
+}
+if ($('btnReloadLedger')) $('btnReloadLedger').onclick = loadLedger;
+if ($('ledgerFilter')) $('ledgerFilter').oninput = () => { clearTimeout(window.__lgT); window.__lgT = setTimeout(loadLedger, 300); };
+if ($('ledgerKind')) $('ledgerKind').onchange = loadLedger;
+
+// ---------- 代理团队 ----------
+async function loadTeam() {
+  const j = await api('/api/agent/team');
+  if (!j.success) { $('teamBody').innerHTML = `<tr><td colspan="9" class="empty">${esc(j.message)}</td></tr>`; return; }
+  const d = j.data, s = d.stats, by = s.byDepth || {};
+  $('tmDirect').textContent = s.direct;
+  $('tmTotal').textContent = s.total;
+  $('tmReward').textContent = fmtUsd(s.reward_total);
+  $('tmL1').textContent = fmtUsd(s.reward_l1);
+  $('tmL2').textContent = fmtUsd(s.reward_l2);
+  $('tmL3').textContent = fmtUsd(s.reward_l3);
+  const up = (d.upline || []).map(p => `${esc(p.username)}${p.agent_level ? ' (L' + p.agent_level + ')' : ''}`);
+  $('tmUpline').textContent = up.length ? ('我的上级：' + up.join(' → ')) : '我的上级：平台直营（无上级）';
+  $('tmBadge').textContent = d.downline.length + ' 人';
+  if (!d.downline.length) { $('teamBody').innerHTML = '<tr><td colspan="9" class="empty">暂无下级成员</td></tr>'; return; }
+  $('teamBody').innerHTML = d.downline.map(m => `
+    <tr>
+      <td>${m.id}</td><td>${esc(m.username)}</td>
+      <td><span class="tree-badge">L${m.depth}</span></td>
+      <td>${m.agent_level ? ('L' + m.agent_level + ' ' + esc(m.agent_name || '')) : '—'}</td>
+      <td>${fmtUsd(m.quota)}</td><td>${fmtUsd(m.used_quota)}</td><td>${fmtMe(m.request_count)}</td>
+      <td><span class="tag ${m.status === 1 ? 'on' : 'off'}">${m.status === 1 ? '正常' : '禁用'}</span></td>
+      <td class="actions">${m.depth === 1 ? `<button class="btn-ghost sm" onclick="reassignDown(${m.id},'${esc(m.username)}')">切层级</button>` : ''}<button class="btn-ghost sm" onclick="openTransfer(${m.id},'${esc(m.username)}')">💰划转</button></td>
+    </tr>`).join('');
+}
+
+// 代理自助：切换自己「下1级用户」的归属（可挂到自己或团队内其他下级）
+// 代理给下级划转额度（从自己余额）
+function openTransfer(id, name) {
+  openModal(`
+    <h3>💰 给「${esc(name)}」划转额度</h3>
+    <p class="muted">从你自己的余额中划出一部分给该下级。我的余额：<b>${fmtUsd(ME.quota)}</b></p>
+    <label>划转金额（USD）</label>
+    <input id="tfAmt" type="number" value="1" step="0.5" min="0.01">
+    <label>快捷</label>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      ${[1, 5, 10, 50].map(v => `<button class="btn-ghost sm" onclick="$('tfAmt').value=${v}">$${v}</button>`).join('')}
+      <button class="btn-ghost sm" onclick="$('tfAmt').value=($('tfAmt').value===''?'':'')">清空</button>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn-primary" onclick="doTransfer(${id})">确认划转</button>
+    </div>`);
+}
+async function doTransfer(id) {
+  const usd = parseFloat($('tfAmt').value) || 0;
+  if (usd <= 0) return toast('划转金额必须大于 0', 'err');
+  const j = await api('/api/agent/transfer', { method: 'POST', body: JSON.stringify({ user_id: id, amount: Math.round(usd * 500000) }) });
+  if (!j.success) return toast(j.message, 'err');
+  ME = j.data.from;
+  refreshBalance();
+  closeModal();
+  toast('✅ ' + j.message);
+  loadTeam();
+}
+
+async function reassignDown(id, name) {  const j = await api('/api/agent/team');
+  if (!j.success) return toast(j.message, 'err');
+  const me = j.data.me;
+  // 可选上级 = 自己 + 自己的全部下级
+  const cands = [{ id: me.id, username: me.username + '（我）' }, ...j.data.downline.filter(d => d.id !== id).map(d => ({ id: d.id, username: d.username + ' (L' + d.depth + ')' }))];
+  const cur = (j.data.downline.find(d => d.id === id) || {});
+  const opts = cands.map(c => `<option value="${c.id}">${esc(c.username)}</option>`).join('');
+  openModal(`
+    <h3>切换「${esc(name)}」的归属</h3>
+    <p class="muted">把它挂到团队成员下（可选择自己 = 收归直属）。</p>
+    <label>新的上级</label>
+    <select id="downSel" style="width:100%">${opts}</select>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn-primary" onclick="saveReassign(${id})">保存</button>
+    </div>`);
+}
+async function saveReassign(id) {
+  const inviter_id = parseInt($('downSel').value, 10);
+  const j = await api('/api/agent/reassign', { method: 'POST', body: JSON.stringify({ user_id: id, inviter_id }) });
+  if (!j.success) return toast(j.message, 'err');
+  toast('已切换归属');
+  closeModal();
+  if (typeof loadTeam === 'function') loadTeam();
+}
+
+// ---------- 代理管理（管理员） ----------
+async function loadAgentTree() {
+  const j = await api('/api/admin/agent/tree');
+  if (!j.success) { $('treeBox').innerHTML = `<div class="empty">${esc(j.message)}</div>`; return; }
+  const st = await api('/api/settings');
+  if (st.success) {
+    $('cfgR1').textContent = (parseFloat(st.data.invite_reward_rate || 0) * 100).toFixed(0) + '%';
+    $('cfgR2').textContent = (parseFloat(st.data.agent_reward_l2 || 0) * 100).toFixed(0) + '%';
+    $('cfgR3').textContent = (parseFloat(st.data.agent_reward_l3 || 0) * 100).toFixed(0) + '%';
+  }
+  const render = (n, lvl) => `
+    <div class="tree-node">
+      <div class="tree-line">
+        <span class="tname">${esc(n.username)}</span>
+        <span class="tlevel">${n.agent_level ? '代理L' + n.agent_level + (n.agent_name ? ' · ' + esc(n.agent_name) : '') : '普通用户'}</span>
+        <span class="tmeta">ID ${n.id}</span>
+        ${n.quota !== undefined ? `<span class="tmeta">余额 ${fmtUsd(n.quota)} | 已用 ${fmtUsd(n.used_quota || 0)}</span>` : ''}
+        <button class="btn-ghost sm" onclick="downloadSettle(${n.id})">结算</button>
+        <button class="btn-ghost sm" onclick="editAgent(${n.id},'${esc(n.username)}',${n.agent_level || 0},'${esc(n.agent_name || '')}')">设置</button>
+      </div>
+      ${(n.children || []).length ? `<div class="tree-children">${n.children.map(c => render(c, lvl + 1)).join('')}</div>` : ''}
+    </div>`;
+  $('treeBox').innerHTML = j.data.length ? j.data.map(r => render(r, 0)).join('') : '<div class="empty">暂无用户</div>';
+}
+$('btnReloadTree').onclick = loadAgentTree;
+if ($('btnSettleAgents')) $('btnSettleAgents').onclick = () => {
+  downloadAuthed('/api/admin/agent/settle', '正在导出全部代理结算清单…');
+};
+
+function editAgent(id, name, level, aname) {
+  openModal(`
+    <h3>设置代理层级「${esc(name)}」(ID ${id})</h3>
+    <label>上级用户 ID（0 = 无上级/平台直营）</label>
+    <input id="agUp" type="number" value="0" min="0" placeholder="输入上级的 用户ID">
+    <label>代理等级</label>
+    <select id="agLevel">
+      <option value="0" ${level === 0 ? 'selected' : ''}>普通用户</option>
+      <option value="1" ${level === 1 ? 'selected' : ''}>一级代理</option>
+      <option value="2" ${level === 2 ? 'selected' : ''}>二级代理</option>
+      <option value="3" ${level === 3 ? 'selected' : ''}>三级代理</option>
+    </select>
+    <label>代理名称（可选）</label>
+    <input id="agName" value="${esc(aname || '')}" placeholder="例如：杭州联登科技">
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn-primary" onclick="saveAgent(${id})">保存</button>
+    </div>`);
+}
+async function saveAgent(id) {
+  const b = {
+    user_id: id,
+    inviter_id: parseInt($('agUp').value || '0', 10),
+    agent_level: parseInt($('agLevel').value, 10),
+    agent_name: $('agName').value.trim(),
+  };
+  const j = await api('/api/admin/agent/set', { method: 'POST', body: JSON.stringify(b) });
+  if (!j.success) return toast(j.message, 'err');
+  toast('已保存');
+  closeModal();
+  loadAgentTree();
+}
+
 // ---------- Modal / copy ----------
 function openModal(html) { $('modalBox').innerHTML = html; $('modal').classList.remove('hidden'); }
 function closeModal() { $('modal').classList.add('hidden'); }
@@ -703,6 +1152,12 @@ function copyText(t) {
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(t).then(done).catch(() => fallbackCopy(t, done));
   } else fallbackCopy(t, done);
+}
+// 复制某个代码块（<pre class="code" id=...>）的纯文本内容
+function copyBlock(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  copyText(el.innerText.trim());
 }
 function fallbackCopy(t, done) {
   try {
