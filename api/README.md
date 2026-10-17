@@ -103,9 +103,9 @@ print(r.choices[0].message.content)
 | GET  | `/api/log/model` | 按模型统计 |
 | GET  | `/api/log/export` | **导出 Excel**（双 sheet：明细 + 按模型汇总）；`?all=1` 仅管理员可导全站 |
 | GET  | `/api/models` | 公开模型目录 |
-| GET  | `/api/pricing` | 模型目录价格（含真实 input/output + priced 标志 + default 价） |
-| PUT  | `/api/pricing/update` | **改价**（仅管理员）`{model,input,output}` → 写 pricing.json + **热重载，无需重启** |
-| POST | `/api/pricing/update` | 同上（前端用 POST） |
+| GET  | `/api/pricing` | 模型目录价格（含真实 input/output/cached + priced 标志 + default 价） |
+| POST | `/api/pricing/update` | **改价**（仅管理员）`{model,input,output,cached?}` → 写 pricing.json + **热重载，无需重启**；cached 缺省 = input×0.1 |
+
 | POST | `/api/pricing/delete` | 删除某模型定价（仅管理员），回落 default |
 | GET  | `/api/pricing/all` | 全部价格表（仅管理员，含未上架模型） |
 | GET  | `/api/channel/` | 渠道列表（仅管理员） |
@@ -123,8 +123,11 @@ print(r.choices[0].message.content)
 - **改价方式**：
   1. **控制台**（推荐）：模型目录页 → 每行「改价」按钮，或「+ 新增/修改定价」→ **立即生效，无需重启**
   2. **改文件**：编辑 `pricing.json` 后 `systemctl restart computehub-api`（启动时读盘）
-  3. **API**：`POST /api/pricing/update {model,input,output}`（仅管理员，落盘 + 热重载）
-- **优先采用上游返回的真实 `usage`**；上游不给 usage 时按字符估算兜底
+  3. **API**：`POST /api/pricing/update {model,input,output,cached?}`（仅管理员，落盘 + 热重载）
+- **三档计价**（对齐上游 SLCH）：`input`（非缓存输入）/ `output`（补全）/ `cached`（缓存读）
+  - `quota = ((输入−缓存)×input价 + 补全×output价 + 缓存×cached价) / 1e6 × 500000`
+  - 缓存读通常只占输入价的 2%~10%，**漏算缓存会导致对账两边偏差数十倍**
+- **优先采用上游返回的真实 `usage`**（含 `prompt_tokens_details.cached_tokens`）；上游不给 usage 时按字符估算兜底
   - 中文 ≈ 1 token/字，英文 ≈ 1 token/4 字符
 - 扣费三方同步：用户余额 → 令牌用量 → 渠道用量，并写入 `logs`
 
@@ -214,7 +217,7 @@ sudo systemctl restart computehub-api
 |------|------|
 | **价格列** | 每行显示 `输入 $/1M` + `输出 $/1M`（取自 `pricing.json`，非 $0） |
 | **定价状态** | 「已定价」= 显式定价；「默认价」= 未定价，按 `default` 算，悬停告知 |
-| **改价**（管理员） | 行内按钮 → 改 input/output → **立即生效，无需重启** |
+| **改价**（管理员） | 行内按钮 → 改 input/output/cached → **立即生效，无需重启** |
 | **去定价**（管理员） | 删除该模型显式价，回落 default |
 | **+ 新增/修改定价** | 给任意模型（含未上架）定价，直接输模型名 |
 | **查看全部价格表** | 列出 `pricing.json` 全部条目（62 条）+ default 价 |

@@ -374,15 +374,16 @@ async function loadModels() {
   renderModels(allModels);
 }
 function renderModels(list) {
-  const col = IS_ADMIN ? 6 : 5;
+  const col = IS_ADMIN ? 7 : 6;
   $('modelBody').innerHTML = list.length ? list.map(x => `
     <tr><td class="mono">${esc(x.name)}</td><td>${x.channels || 1}</td>
     <td class="mono">$${fmtPrice(x.input)}</td><td class="mono">$${fmtPrice(x.output)}</td>
+    <td class="mono">$${fmtPrice(x.cached)}</td>
     <td>${x.priced
       ? '<span class="tag on">已定价</span>'
       : '<span class="tag warn" title="未显式定价，走默认价">默认价</span>'}</td>
     ${IS_ADMIN ? `<td class="actions">
-        <button class="btn-ghost sm" onclick="editPrice('${esc(x.name)}',${x.input},${x.output})">改价</button>
+        <button class="btn-ghost sm" onclick="editPrice('${esc(x.name)}',${x.input},${x.output},${x.cached ?? 'undefined'})">改价</button>
         ${x.priced ? `<button class="btn-ghost sm btn-danger" onclick="delPrice('${esc(x.name)}')">去定价</button>` : ''}
       </td>` : ''}</tr>`).join('')
     : `<tr><td colspan="${col}" class="empty">无匹配模型</td></tr>`;
@@ -393,17 +394,19 @@ function fmtPrice(v) {
   return n >= 1 ? n.toFixed(2) : n.toFixed(4);
 }
 // 改价弹窗（复用：新增/编辑）
-function editPrice(model, input, output) {
+function editPrice(model, input, output, cached) {
   const isNew = input === undefined;
   openModal(`
     <h3>${isNew ? '新增/修改定价' : '修改定价 · ' + esc(model)}</h3>
     <label>模型名</label>
     <input id="prModel" value="${esc(model || '')}" ${isNew ? '' : 'readonly style="opacity:.6"'} placeholder="如 deepseek-v4-flash">
-    <label>输入价（USD / 1M tokens）</label>
+    <label>输入价（非缓存输入，USD / 1M tokens）</label>
     <input id="prIn" type="number" step="0.0001" min="0" value="${isNew ? '' : input}" placeholder="0.1">
-    <label>输出价（USD / 1M tokens）</label>
+    <label>补全价（输出，USD / 1M tokens）</label>
     <input id="prOut" type="number" step="0.0001" min="0" value="${isNew ? '' : output}" placeholder="0.3">
-    <p class="muted" style="font-size:12px;margin:6px 0">换算：quota = (输入tokens/1e6 × 输入价 + 输出tokens/1e6 × 输出价) × 500000</p>
+    <label>缓存读价（USD / 1M tokens，留空 = 输入价 ×0.1）</label>
+    <input id="prCache" type="number" step="0.00001" min="0" value="${isNew || cached === undefined ? '' : cached}" placeholder="0.01">
+    <p class="muted" style="font-size:12px;margin:6px 0">换算：quota = ((输入−缓存)×输入价 + 补全×补全价 + 缓存×缓存价)/1e6 × 500000</p>
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closeModal()">取消</button>
       <button class="btn-primary" onclick="savePrice()">保存</button>
@@ -411,8 +414,10 @@ function editPrice(model, input, output) {
 }
 async function savePrice() {
   const b = { model: $('prModel').value.trim(), input: $('prIn').value, output: $('prOut').value };
+  const ca = $('prCache').value.trim();
+  if (ca !== '') b.cached = ca;
   if (!b.model) return toast('请填写模型名', 'err');
-  if (b.input === '' || b.output === '') return toast('请填写输入/输出价格', 'err');
+  if (b.input === '' || b.output === '') return toast('请填写输入/补全价格', 'err');
   const j = await api('/api/pricing/update', { method: 'POST', body: JSON.stringify(b) });
   if (!j.success) return toast(j.message, 'err');
   closeModal(); toast(j.message || '✅ 已定价'); loadModels();
@@ -427,13 +432,13 @@ async function delPrice(model) {
 async function showAllPrices() {
   const j = await api('/api/pricing/all');
   if (!j.success) return toast(j.message, 'err');
-  const rows = j.data.map(x => `<tr><td class="mono">${esc(x.model)}</td><td class="mono">$${fmtPrice(x.input)}</td><td class="mono">$${fmtPrice(x.output)}</td>` +
-    `<td><button class="btn-ghost sm" onclick="editPrice('${esc(x.model)}',${x.input},${x.output})">改价</button></td></tr>`).join('');
+  const rows = j.data.map(x => `<tr><td class="mono">${esc(x.model)}</td><td class="mono">$${fmtPrice(x.input)}</td><td class="mono">$${fmtPrice(x.output)}</td><td class="mono">$${fmtPrice(x.cached)}</td>` +
+    `<td><button class="btn-ghost sm" onclick="editPrice('${esc(x.model)}',${x.input},${x.output},${x.cached ?? 'undefined'})">改价</button></td></tr>`).join('');
   openModal(`
     <h3>全部价格表 <span class="badge">${j.data.length}</span></h3>
-    <p class="muted" style="font-size:12px;margin:0 0 8px">含已定价但当前未上架的模型；默认价 <span class="mono">$${fmtPrice(j.default.input)}/$${fmtPrice(j.default.output)}</span></p>
+    <p class="muted" style="font-size:12px;margin:0 0 8px">含已定价但当前未上架的模型；默认价 <span class="mono">$${fmtPrice(j.default.input)}/$${fmtPrice(j.default.output)}/$${fmtPrice(j.default.cached)}</span></p>
     <div style="max-height:52vh;overflow:auto">
-      <table class="tbl"><thead><tr><th>模型名</th><th>输入 $/1M</th><th>输出 $/1M</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table>
+      <table class="tbl"><thead><tr><th>模型名</th><th>输入 $/1M</th><th>补全 $/1M</th><th>缓存 $/1M</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table>
     </div>
     <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">关闭</button></div>`);
 }
@@ -457,11 +462,12 @@ async function loadLogs(p) {
       <td>${esc(l.token_name)}</td>
       <td>${esc(l.channel_name)}</td>
       <td>${fmtTok(l.prompt_tokens)}</td>
+      <td>${l.cached_tokens ? `<span title="缓存读 ${l.cached_tokens} / 输入 ${l.prompt_tokens}（${Math.round(l.cached_tokens/l.prompt_tokens*100)}%）">${fmtTok(l.cached_tokens)}</span>` : '<span class="muted">—</span>'}</td>
       <td>${fmtTok(l.completion_tokens)}</td>
       <td>${(l.use_time || 0).toFixed(1)}s</td>
       <td>${l.quota < 0 ? '+' + fmtUsd(-l.quota) : fmtUsd(l.quota)}</td>
       <td><span class="tag ${l.status === 'success' ? 'on' : 'off'}">${l.status === 'success' ? '成功' : '失败'}</span></td>
-    </tr>`).join('') : '<tr><td colspan="9" class="empty">暂无日志</td></tr>';
+    </tr>`).join('') : '<tr><td colspan="10" class="empty">暂无日志</td></tr>';
   lastLogs = d.items;
 }
 let lastLogs = [];
@@ -469,10 +475,10 @@ $('logPrev').onclick = () => loadLogs(Math.max(1, logPage - 1));
 $('logNext').onclick = () => loadLogs(logPage + 1);
 $('btnExportLogs').onclick = () => {
   if (!lastLogs.length) return toast('当前页无数据', 'err');
-  const head = ['时间', '模型', '令牌', '渠道', '输入tok', '输出tok', '总tok', '耗时s', 'quota', '状态'];
+  const head = ['时间', '模型', '令牌', '渠道', '输入tok', '缓存读tok', '输出tok', '总tok', '耗时s', 'quota', '状态'];
   const rows = lastLogs.map(l => [
     new Date(l.created_at).toISOString(), l.model_name, l.token_name, l.channel_name,
-    l.prompt_tokens, l.completion_tokens, l.total_tokens, l.use_time, l.quota, l.status,
+    l.prompt_tokens, l.cached_tokens || 0, l.completion_tokens, l.total_tokens, l.use_time, l.quota, l.status,
   ]);
   const csv = [head, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
   const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' });

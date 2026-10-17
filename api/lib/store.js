@@ -100,6 +100,7 @@ function migrate(db) {
     channel_name      TEXT NOT NULL DEFAULT '',
     prompt_tokens     INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_tokens     INTEGER NOT NULL DEFAULT 0,
     total_tokens      INTEGER NOT NULL DEFAULT 0,
     quota             INTEGER NOT NULL DEFAULT 0,
     use_time          REAL NOT NULL DEFAULT 0,
@@ -199,6 +200,8 @@ function migrate(db) {
     db.exec("ALTER TABLE logs ADD COLUMN log_type TEXT NOT NULL DEFAULT 'consume'");
   if (!lcols.includes('source'))
     db.exec("ALTER TABLE logs ADD COLUMN source TEXT NOT NULL DEFAULT ''");
+  if (!lcols.includes('cached_tokens'))
+    db.exec('ALTER TABLE logs ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0');
 
   // sessions 增量迁移：身份切换来源（便于免密返回自己）
   const scols = db.prepare('PRAGMA table_info(sessions)').all().map(c => c.name);
@@ -544,12 +547,12 @@ function pricingCatalog(db) {
 function insertLog(db, l) {
   db.prepare(`
     INSERT INTO logs (user_id,username,token_id,token_name,model_name,channel_id,channel_name,
-      prompt_tokens,completion_tokens,total_tokens,quota,use_time,is_stream,ip,request_id,status,error,created_at,log_type,source)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      prompt_tokens,completion_tokens,cached_tokens,total_tokens,quota,use_time,is_stream,ip,request_id,status,error,created_at,log_type,source)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `).run(
     l.user_id, l.username || '', l.token_id || 0, l.token_name || '', l.model_name || '',
     l.channel_id || 0, l.channel_name || '', l.prompt_tokens || 0, l.completion_tokens || 0,
-    l.total_tokens || 0, l.quota || 0, l.use_time || 0, l.is_stream ? 1 : 0,
+    l.cached_tokens || 0, l.total_tokens || 0, l.quota || 0, l.use_time || 0, l.is_stream ? 1 : 0,
     l.ip || '', l.request_id || '', l.status || 'success', l.error || '',
     l.created_at || Date.now(), l.log_type || 'consume', l.source || '',
   );

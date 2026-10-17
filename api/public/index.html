@@ -129,8 +129,8 @@
           <input type="text" id="modelSearch" class="search" placeholder="搜索模型…">
         </div>
         <table class="tbl">
-          <thead><tr><th>模型名</th><th>渠道数</th><th>输入 $/1M</th><th>输出 $/1M</th><th>定价</th><th class="admin-only">操作</th></tr></thead>
-          <tbody id="modelBody"><tr><td colspan="6" class="empty">加载中…</td></tr></tbody>
+          <thead><tr><th>模型名</th><th>渠道数</th><th>输入 $/1M</th><th>补全 $/1M</th><th>缓存 $/1M</th><th>定价</th><th class="admin-only">操作</th></tr></thead>
+          <tbody id="modelBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
         </table>
       </div>
       <div class="panel admin-only">
@@ -161,7 +161,7 @@
           </div>
         </div>
         <table class="tbl">
-          <thead><tr><th>时间</th><th>模型</th><th>令牌</th><th>渠道</th><th>输入</th><th>输出</th><th>耗时</th><th>消费</th><th>状态</th></tr></thead>
+          <thead><tr><th>时间</th><th>模型</th><th>令牌</th><th>渠道</th><th>输入</th><th>缓存读</th><th>输出</th><th>耗时</th><th>消费</th><th>状态</th></tr></thead>
           <tbody id="logBody"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
         </table>
         <div class="pager"><button class="btn-ghost sm" id="logPrev">上一页</button><span id="logPage" class="muted"></span><button class="btn-ghost sm" id="logNext">下一页</button></div>

@@ -240,13 +240,14 @@ async function relayOnce({ ctx, up, res, body, logCtx, model, started }) {
   try { obj = JSON.parse(text); } catch {}
 
   const usage = ctx.billing.parseUsage(obj);
-  let prompt = usage?.prompt, completion = usage?.completion;
+  let prompt = usage?.prompt, completion = usage?.completion, cached = usage?.cached || 0;
   if (prompt == null) {
     prompt = ctx.billing.estimateTokens(JSON.stringify(body.messages || body.prompt || ''));
     completion = obj ? ctx.billing.estimateTokens(extractContent(obj)) : 0;
+    cached = 0;
   }
-  const quota = ctx.billing.computeQuota(model, prompt, completion || 0);
-  settle(ctx, { logCtx, model, prompt, completion: completion || 0, quota, started, stream: false });
+  const quota = ctx.billing.computeQuota(model, prompt, completion || 0, cached);
+  settle(ctx, { logCtx, model, prompt, completion: completion || 0, cached, quota, started, stream: false });
 
   res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'X-Request-Id': logCtx.request_id });
   return res.end(text);
@@ -274,7 +275,7 @@ async function relayStream({ ctx, up, res, body, logCtx, model, started }) {
   const reader = up.body.getReader();
   const dec = new TextDecoder();
   let buf = '';
-  let prompt = null, completion = null;
+  let prompt = null, completion = null, cached = 0;
   let contentChars = '';
 
   try {
@@ -295,7 +296,7 @@ async function relayStream({ ctx, up, res, body, logCtx, model, started }) {
           const j = JSON.parse(payload);
           if (j.usage) {
             const u = ctx.billing.parseUsage({ usage: j.usage });
-            if (u) { prompt = u.prompt; completion = u.completion; }
+            if (u) { prompt = u.prompt; completion = u.completion; cached = u.cached || 0; }
           }
           const d = j.choices?.[0]?.delta;
           if (d?.content) contentChars += d.content;
@@ -313,17 +314,18 @@ async function relayStream({ ctx, up, res, body, logCtx, model, started }) {
   if (prompt == null) {
     prompt = ctx.billing.estimateTokens(JSON.stringify(body.messages || body.prompt || ''));
     completion = ctx.billing.estimateTokens(contentChars);
+    cached = 0;
   }
-  const quota = ctx.billing.computeQuota(model, prompt, completion || 0);
-  settle(ctx, { logCtx, model, prompt, completion: completion || 0, quota, started, stream: true });
+  const quota = ctx.billing.computeQuota(model, prompt, completion || 0, cached);
+  settle(ctx, { logCtx, model, prompt, completion: completion || 0, cached, quota, started, stream: true });
 }
 
 // ---------- 结算 ----------
-function settle(ctx, { logCtx, model, prompt, completion, quota, started, stream }) {
+function settle(ctx, { logCtx, model, prompt, completion, cached = 0, quota, started, stream }) {
   const useSec = (Date.now() - started) / 1000;
   try {
     ctx.store.insertLog(ctx.db, {
-      ...logCtx, prompt_tokens: prompt, completion_tokens: completion,
+      ...logCtx, prompt_tokens: prompt, completion_tokens: completion, cached_tokens: cached || 0,
       total_tokens: prompt + completion, quota, use_time: useSec, status: 'success',
     });
     ctx.store.addUserUsage(ctx.db, logCtx.user_id, quota, 1);
@@ -374,7 +376,7 @@ function settle(ctx, { logCtx, model, prompt, completion, quota, started, stream
       }
     } catch (e) { console.error('[settle/agent-reward]', e.message); }
 
-    console.log(`[relay] ${logCtx.username} ${model} ch=${logCtx.channel_name} p=${prompt} c=${completion} quota=${quota} ${useSec.toFixed(1)}s${stream ? ' stream' : ''}`);
+    console.log(`[relay] ${logCtx.username} ${model} ch=${logCtx.channel_name} p=${prompt} cached=${cached || 0} c=${completion} quota=${quota} ${useSec.toFixed(1)}s${stream ? ' stream' : ''}`);
   } catch (e) { console.error('[settle]', e.message); }
 }
 
