@@ -40,6 +40,11 @@ function fmtTime(ms) {
   const d = new Date(ms); const p = n => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
+function fmtTsCsv(ms) {
+  if (!ms) return '';
+  const d = new Date(ms); const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 
 // ---------- 登录 / 注册 ----------
@@ -495,7 +500,7 @@ $('btnExportLogs').onclick = () => {
   if (!lastLogs.length) return toast('当前页无数据', 'err');
   const head = ['时间', '模型', '令牌', '渠道', '输入tok', '缓存读tok', '未命中tok', '命中率', '输出tok', '总tok', '耗时s', 'quota', '状态'];
   const rows = lastLogs.map(l => [
-    new Date(l.created_at).toISOString(), l.model_name, l.token_name, l.channel_name,
+    fmtTsCsv(l.created_at), l.model_name, l.token_name, l.channel_name,
     l.prompt_tokens, l.cached_tokens || 0, (l.prompt_tokens || 0) - (l.cached_tokens || 0),
     l.prompt_tokens ? Math.round((l.cached_tokens || 0) / l.prompt_tokens * 100) + '%' : '',
     l.completion_tokens, l.total_tokens, l.use_time, l.quota, l.status,
