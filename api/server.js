@@ -434,7 +434,36 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { success: true, data: store.publicModelCatalog(db) });
     }
     if (pathname === '/api/pricing') {
-      return json(res, 200, { success: true, data: store.pricingCatalog(db) });
+      // 模型目录：渠道聚合出的在售模型 + billing 真实价（未定价的标 priced=false，走 default）
+      const list = store.pricingCatalog(db).map(x => {
+        const p = billing.priceOf(x.model);
+        return { ...x, input: p.input, output: p.output, priced: billing.isPriced(x.model) };
+      });
+      return json(res, 200, { success: true, data: list, default: billing.DEFAULT });
+    }
+    // 改价（仅管理员）：{model, input, output} → 落盘 pricing.json + 热重载，无需重启
+    if (pathname === '/api/pricing/update' && req.method === 'POST') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      const b = await readJson(req) || {};
+      const r = billing.setPrice(b.model, b.input, b.output);
+      if (!r.ok) return json(res, 400, { success: false, message: r.error });
+      return json(res, 200, { success: true, data: r, message: `已定价 ${r.model}: $${r.input}/$${r.output} 每 M tokens` });
+    }
+    // 删除定价（仅管理员）：回落 default 价
+    if (pathname === '/api/pricing/delete' && req.method === 'POST') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      const b = await readJson(req) || {};
+      const r = billing.deletePrice(b.model);
+      if (!r.ok) return json(res, 400, { success: false, message: r.error });
+      return json(res, 200, { success: true, message: `已删除 ${r.model} 的定价，回落默认价` });
+    }
+    // 全量价格表（仅管理员）：含未上架但有定价的模型
+    if (pathname === '/api/pricing/all') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      return json(res, 200, { success: true, data: billing.allPrices(), default: billing.DEFAULT });
     }
     if (pathname === '/api/channel/' || pathname === '/api/channel') {
       const u = requireUser(req, res); if (!u) return;

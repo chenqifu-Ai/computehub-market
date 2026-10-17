@@ -103,7 +103,11 @@ print(r.choices[0].message.content)
 | GET  | `/api/log/model` | 按模型统计 |
 | GET  | `/api/log/export` | **导出 Excel**（双 sheet：明细 + 按模型汇总）；`?all=1` 仅管理员可导全站 |
 | GET  | `/api/models` | 公开模型目录 |
-| GET  | `/api/pricing` | 模型价格表 |
+| GET  | `/api/pricing` | 模型目录价格（含真实 input/output + priced 标志 + default 价） |
+| PUT  | `/api/pricing/update` | **改价**（仅管理员）`{model,input,output}` → 写 pricing.json + **热重载，无需重启** |
+| POST | `/api/pricing/update` | 同上（前端用 POST） |
+| POST | `/api/pricing/delete` | 删除某模型定价（仅管理员），回落 default |
+| GET  | `/api/pricing/all` | 全部价格表（仅管理员，含未上架模型） |
 | GET  | `/api/channel/` | 渠道列表（仅管理员） |
 | POST | `/api/channel/models` | 探测上游可用模型：`{base_url, api_key}` 纯探测不落库；`{id, persist?}` 用渠道已存 key 探测并**覆盖写入该渠道 models**（仅管理员） |
 | GET  | `/api/admin/stats` | 全站统计（仅管理员） |
@@ -113,7 +117,11 @@ print(r.choices[0].message.content)
 ## 💰 计费规则
 
 - 基准：**`quota = 美元 × 500000`**（New-API 惯例）
-- 单价表：`pricing.json`，单位 **USD / 1M tokens**，未列出的模型走 `default`
+- 单价表：**`pricing.json`**（单位 **USD / 1M tokens**，key = 对外模型名；未列出的走 `default`）
+- **改价方式**：
+  1. **控制台**（推荐）：模型目录页 → 每行「改价」按钮，或「+ 新增/修改定价」→ **立即生效，无需重启**
+  2. **改文件**：编辑 `pricing.json` 后 `systemctl restart computehub-api`（启动时读盘）
+  3. **API**：`POST /api/pricing/update {model,input,output}`（仅管理员，落盘 + 热重载）
 - **优先采用上游返回的真实 `usage`**；上游不给 usage 时按字符估算兜底
   - 中文 ≈ 1 token/字，英文 ≈ 1 token/4 字符
 - 扣费三方同步：用户余额 → 令牌用量 → 渠道用量，并写入 `logs`
@@ -195,6 +203,22 @@ sudo systemctl restart computehub-api
 
 > ⚠️ `channels.json` 含真实密钥，已加入 `.gitignore`，**不入库**。
 > 入库的是 `channels.example.json`（占位符）。
+
+### 💹 定价管理（控制台 UI）
+
+模型目录页（`page-models`）既是**对外报价单**也是**改价入口**：
+
+| 操作 | 说明 |
+|------|------|
+| **价格列** | 每行显示 `输入 $/1M` + `输出 $/1M`（取自 `pricing.json`，非 $0） |
+| **定价状态** | 「已定价」= 显式定价；「默认价」= 未定价，按 `default` 算，悬停告知 |
+| **改价**（管理员） | 行内按钮 → 改 input/output → **立即生效，无需重启** |
+| **去定价**（管理员） | 删除该模型显式价，回落 default |
+| **+ 新增/修改定价** | 给任意模型（含未上架）定价，直接输模型名 |
+| **查看全部价格表** | 列出 `pricing.json` 全部条目（62 条）+ default 价 |
+
+> 💡 改价走 `POST /api/pricing/update`，内部 `billing.setPrice()` 写盘 `pricing.json` 并**热重载内存表**，不用重启服务。
+> ⚠️ 手改 `pricing.json` 文件则需 `systemctl restart computehub-api` 才生效（启动时读盘）。
 
 ### 🖥️ 渠道管理（控制台 UI）
 

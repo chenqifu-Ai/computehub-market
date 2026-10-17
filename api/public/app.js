@@ -368,13 +368,74 @@ async function loadModels() {
   (p.success ? p.data : []).forEach(x => priceMap[x.model] = x);
   allModels = m.data.models.map(name => ({ name, ...(priceMap[name] || {}) }));
   $('modelCount').textContent = allModels.length + ' 个';
+  if (p.success && p.default && $('defaultPrice')) {
+    $('defaultPrice').textContent = `（默认 $${fmtPrice(p.default.input)} / $${fmtPrice(p.default.output)}）`;
+  }
   renderModels(allModels);
 }
 function renderModels(list) {
+  const col = IS_ADMIN ? 6 : 5;
   $('modelBody').innerHTML = list.length ? list.map(x => `
     <tr><td class="mono">${esc(x.name)}</td><td>${x.channels || 1}</td>
-    <td>$${(x.input ?? 0).toFixed(4)}</td><td>$${(x.output ?? 0).toFixed(4)}</td></tr>`).join('')
-    : '<tr><td colspan="4" class="empty">无匹配模型</td></tr>';
+    <td class="mono">$${fmtPrice(x.input)}</td><td class="mono">$${fmtPrice(x.output)}</td>
+    <td>${x.priced
+      ? '<span class="tag on">已定价</span>'
+      : '<span class="tag warn" title="未显式定价，走默认价">默认价</span>'}</td>
+    ${IS_ADMIN ? `<td class="actions">
+        <button class="btn-ghost sm" onclick="editPrice('${esc(x.name)}',${x.input},${x.output})">改价</button>
+        ${x.priced ? `<button class="btn-ghost sm btn-danger" onclick="delPrice('${esc(x.name)}')">去定价</button>` : ''}
+      </td>` : ''}</tr>`).join('')
+    : `<tr><td colspan="${col}" class="empty">无匹配模型</td></tr>`;
+}
+// 价格展示：≥1 保留 2 位，<1 保留 4 位（¥0.1 而不是 $0.1000）
+function fmtPrice(v) {
+  const n = Number(v || 0);
+  return n >= 1 ? n.toFixed(2) : n.toFixed(4);
+}
+// 改价弹窗（复用：新增/编辑）
+function editPrice(model, input, output) {
+  const isNew = input === undefined;
+  openModal(`
+    <h3>${isNew ? '新增/修改定价' : '修改定价 · ' + esc(model)}</h3>
+    <label>模型名</label>
+    <input id="prModel" value="${esc(model || '')}" ${isNew ? '' : 'readonly style="opacity:.6"'} placeholder="如 deepseek-v4-flash">
+    <label>输入价（USD / 1M tokens）</label>
+    <input id="prIn" type="number" step="0.0001" min="0" value="${isNew ? '' : input}" placeholder="0.1">
+    <label>输出价（USD / 1M tokens）</label>
+    <input id="prOut" type="number" step="0.0001" min="0" value="${isNew ? '' : output}" placeholder="0.3">
+    <p class="muted" style="font-size:12px;margin:6px 0">换算：quota = (输入tokens/1e6 × 输入价 + 输出tokens/1e6 × 输出价) × 500000</p>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn-primary" onclick="savePrice()">保存</button>
+    </div>`);
+}
+async function savePrice() {
+  const b = { model: $('prModel').value.trim(), input: $('prIn').value, output: $('prOut').value };
+  if (!b.model) return toast('请填写模型名', 'err');
+  if (b.input === '' || b.output === '') return toast('请填写输入/输出价格', 'err');
+  const j = await api('/api/pricing/update', { method: 'POST', body: JSON.stringify(b) });
+  if (!j.success) return toast(j.message, 'err');
+  closeModal(); toast(j.message || '✅ 已定价'); loadModels();
+}
+async function delPrice(model) {
+  if (!confirm(`确认删除「${model}」的定价？\n删除后将回落默认价。`)) return;
+  const j = await api('/api/pricing/delete', { method: 'POST', body: JSON.stringify({ model }) });
+  if (!j.success) return toast(j.message, 'err');
+  toast('已删除定价，回落默认价'); loadModels();
+}
+// 全部价格表（管理员）：含未上架但有定价的模型
+async function showAllPrices() {
+  const j = await api('/api/pricing/all');
+  if (!j.success) return toast(j.message, 'err');
+  const rows = j.data.map(x => `<tr><td class="mono">${esc(x.model)}</td><td class="mono">$${fmtPrice(x.input)}</td><td class="mono">$${fmtPrice(x.output)}</td>` +
+    `<td><button class="btn-ghost sm" onclick="editPrice('${esc(x.model)}',${x.input},${x.output})">改价</button></td></tr>`).join('');
+  openModal(`
+    <h3>全部价格表 <span class="badge">${j.data.length}</span></h3>
+    <p class="muted" style="font-size:12px;margin:0 0 8px">含已定价但当前未上架的模型；默认价 <span class="mono">$${fmtPrice(j.default.input)}/$${fmtPrice(j.default.output)}</span></p>
+    <div style="max-height:52vh;overflow:auto">
+      <table class="tbl"><thead><tr><th>模型名</th><th>输入 $/1M</th><th>输出 $/1M</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table>
+    </div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">关闭</button></div>`);
 }
 $('modelSearch').oninput = e => {
   const q = e.target.value.toLowerCase();
@@ -673,6 +734,8 @@ $('btnProbeGo').onclick = async () => {
     ? `✅ 共 ${j.data.count} 个模型：${j.data.models.slice(0, 30).join(', ')}${j.data.count > 30 ? ' …' : ''}`
     : '❌ ' + j.message;
 };
+$('btnNewPrice').onclick = () => editPrice('', undefined, undefined);
+$('btnAllPrices').onclick = showAllPrices;
 
 // ---------- 用户管理 ----------
 async function loadUsers() {
@@ -1377,6 +1440,7 @@ Object.assign(window, {
   showKey, delToken, editToken, saveToken, createToken,
   testChannel, toggleChannel, delChannel, createChannel: saveChannel,
   editChannel, syncChannelModels, probeIntoModal, saveChannel,
+  editPrice, savePrice, delPrice, showAllPrices,
   editUser, saveUser, genRedeem, toggleRedeem, delRedeem,
   closeModal, copyText,
 });

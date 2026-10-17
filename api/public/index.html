@@ -129,9 +129,22 @@
           <input type="text" id="modelSearch" class="search" placeholder="搜索模型…">
         </div>
         <table class="tbl">
-          <thead><tr><th>模型名</th><th>渠道数</th><th>输入 $/1M</th><th>输出 $/1M</th></tr></thead>
-          <tbody id="modelBody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
+          <thead><tr><th>模型名</th><th>渠道数</th><th>输入 $/1M</th><th>输出 $/1M</th><th>定价</th><th class="admin-only">操作</th></tr></thead>
+          <tbody id="modelBody"><tr><td colspan="6" class="empty">加载中…</td></tr></tbody>
         </table>
+      </div>
+      <div class="panel admin-only">
+        <div class="panel-head">
+          <h3>💰 定价管理</h3>
+          <div class="head-actions">
+            <button class="btn-ghost sm" id="btnNewPrice">+ 新增/修改定价</button>
+            <button class="btn-ghost sm" id="btnAllPrices">查看全部价格表</button>
+          </div>
+        </div>
+        <p class="muted" style="margin:0;font-size:12px">
+          价格单位 <b>USD / 1M tokens</b>；未定价的模型走默认价
+          <span id="defaultPrice" class="mono"></span>。改价立即生效，<b>无需重启</b>。
+        </p>
       </div>
     </section>
 
