@@ -886,9 +886,10 @@ function exportUsageXlsx(res, { userId, since, all }) {
   const summary = store.exportSummary(db, { userId, since });
 
   const detail = [
-    ['时间', '类型', '用户', '用户ID', '令牌名称', '模型', '输入token数', '输出token数', '花费金额', '用时(秒)', '流式'],
+    ['时间', '类型', '用户', '用户ID', '令牌名称', '模型', '输入token数', '缓存读token数', '未命中token数', '命中率', '输出token数', '花费金额', '用时(秒)', '流式'],
   ];
   for (const l of rows) {
+    const ca = l.cached_tokens || 0;
     detail.push([
       fmtTs(l.created_at),
       typeLabel(l),
@@ -896,7 +897,9 @@ function exportUsageXlsx(res, { userId, since, all }) {
       String(l.user_id),
       l.token_name || '',
       l.model_name || '',
-      l.prompt_tokens, l.completion_tokens,
+      l.prompt_tokens, ca, Math.max(0, (l.prompt_tokens || 0) - ca),
+      l.prompt_tokens ? Math.round(ca / l.prompt_tokens * 100) + '%' : '',
+      l.completion_tokens,
       fmtYuan(l.quota),
       Math.round(l.use_time || 0),
       l.is_stream ? '是' : '否',
@@ -919,7 +922,7 @@ function exportUsageXlsx(res, { userId, since, all }) {
 
   const sheet1Name = all ? '全部明细' : '使用日志';
   const buf = xlsx.build([
-    { name: sheet1Name, rows: detail, colWidths: [20, 8, 14, 9, 16, 24, 13, 13, 13, 10, 8], freezeHeader: true },
+    { name: sheet1Name, rows: detail, colWidths: [20, 8, 14, 9, 16, 24, 13, 13, 13, 8, 13, 13, 10, 8], freezeHeader: true },
     { name: '按模型汇总', rows: sum, colWidths: [14, 9, 16, 9, 24, 10, 13, 13, 13, 13], freezeHeader: true },
   ]);
 

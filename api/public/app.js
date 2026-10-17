@@ -470,23 +470,35 @@ async function loadLogs(p) {
       <td>${esc(l.token_name)}</td>
       <td>${esc(l.channel_name)}</td>
       <td>${fmtTok(l.prompt_tokens)}</td>
-      <td>${l.cached_tokens ? `<span title="缓存读 ${l.cached_tokens} / 输入 ${l.prompt_tokens}（${Math.round(l.cached_tokens/l.prompt_tokens*100)}%）">${fmtTok(l.cached_tokens)}</span>` : '<span class="muted">—</span>'}</td>
+      <td>${l.cached_tokens ? `<span title="命中 ${l.cached_tokens} / 输入 ${l.prompt_tokens}">${fmtTok(l.cached_tokens)}</span>` : '<span class="muted">—</span>'}</td>
+      <td>${l.prompt_tokens ? fmtTok(l.prompt_tokens - (l.cached_tokens || 0)) : '<span class="muted">—</span>'}</td>
+      <td>${l.prompt_tokens ? hitRateTag(l.cached_tokens, l.prompt_tokens) : '<span class="muted">—</span>'}</td>
       <td>${fmtTok(l.completion_tokens)}</td>
       <td>${(l.use_time || 0).toFixed(1)}s</td>
       <td>${l.quota < 0 ? '+' + fmtUsd(-l.quota) : fmtUsd(l.quota)}</td>
       <td><span class="tag ${l.status === 'success' ? 'on' : 'off'}">${l.status === 'success' ? '成功' : '失败'}</span></td>
-    </tr>`).join('') : '<tr><td colspan="10" class="empty">暂无日志</td></tr>';
+    </tr>`).join('') : '<tr><td colspan="12" class="empty">暂无日志</td></tr>';
   lastLogs = d.items;
+}
+// 缓存命中率标签：0% 灰（全 miss）/ <50% 橙 / ≥50% 绿
+function hitRateTag(cached, prompt) {
+  const p = Number(prompt) || 0;
+  if (!p) return '<span class="muted">—</span>';
+  const r = Math.round((Number(cached) || 0) / p * 100);
+  const cls = r === 0 ? '' : (r < 50 ? 'warn' : 'on');
+  return `<span class="tag ${cls}" title="命中 ${cached || 0} / 输入 ${p}">${r}%</span>`;
 }
 let lastLogs = [];
 $('logPrev').onclick = () => loadLogs(Math.max(1, logPage - 1));
 $('logNext').onclick = () => loadLogs(logPage + 1);
 $('btnExportLogs').onclick = () => {
   if (!lastLogs.length) return toast('当前页无数据', 'err');
-  const head = ['时间', '模型', '令牌', '渠道', '输入tok', '缓存读tok', '输出tok', '总tok', '耗时s', 'quota', '状态'];
+  const head = ['时间', '模型', '令牌', '渠道', '输入tok', '缓存读tok', '未命中tok', '命中率', '输出tok', '总tok', '耗时s', 'quota', '状态'];
   const rows = lastLogs.map(l => [
     new Date(l.created_at).toISOString(), l.model_name, l.token_name, l.channel_name,
-    l.prompt_tokens, l.cached_tokens || 0, l.completion_tokens, l.total_tokens, l.use_time, l.quota, l.status,
+    l.prompt_tokens, l.cached_tokens || 0, (l.prompt_tokens || 0) - (l.cached_tokens || 0),
+    l.prompt_tokens ? Math.round((l.cached_tokens || 0) / l.prompt_tokens * 100) + '%' : '',
+    l.completion_tokens, l.total_tokens, l.use_time, l.quota, l.status,
   ]);
   const csv = [head, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
   const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' });
