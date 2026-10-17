@@ -127,6 +127,7 @@ print(r.choices[0].message.content)
 - **三档计价**（对齐上游 SLCH）：`input`（非缓存输入）/ `output`（补全）/ `cached`（缓存读）
   - `quota = ((输入−缓存)×input价 + 补全×output价 + 缓存×cached价) / 1e6 × 500000`
   - 缓存读通常只占输入价的 2%~10%，**漏算缓存会导致对账两边偏差数十倍**
+- **⚠️ 上游时段倍率**：SLCH 对部分模型（如 `deepseek-v4.1-flash`）在 **9:00-12:00 / 14:00-18:00（Asia/Shanghai）按 ×2 计费**；本表零售价只保「非高峰」成本，高峰时段会亏（需靠毛利或后续做时变定价缓冲）
 - **优先采用上游返回的真实 `usage`**（含 `prompt_tokens_details.cached_tokens`）；上游不给 usage 时按字符估算兜底
   - 中文 ≈ 1 token/字，英文 ≈ 1 token/4 字符
 - 扣费三方同步：用户余额 → 令牌用量 → 渠道用量，并写入 `logs`
