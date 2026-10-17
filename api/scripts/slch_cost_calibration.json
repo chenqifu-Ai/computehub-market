@@ -1,0 +1,83 @@
+{
+  "fx_cny_per_usd": 7.3,
+  "quota_per_unit": 500000,
+  "models": [
+    {
+      "model": "deepseek-v4-flash",
+      "cost_in_usd": 0.2671,
+      "cost_out_usd": 0.8014,
+      "our_in": 0.1,
+      "our_out": 0.3,
+      "recovery_in": 0.3744,
+      "recovery_out": 0.3744,
+      "profit_per_1M_pair": -0.6685,
+      "expr": "p*3 + c*9        (×0.65 折扣)"
+    },
+    {
+      "model": "deepseek-v4.1-flash",
+      "cost_in_usd": 0.137,
+      "cost_out_usd": 0.5479,
+      "our_in": 0.1,
+      "our_out": 0.3,
+      "recovery_in": 0.73,
+      "recovery_out": 0.5475,
+      "profit_per_1M_pair": -0.2849,
+      "expr": "p*1 + c*4        (时段×2)"
+    },
+    {
+      "model": "deepseek-v4-pro",
+      "cost_in_usd": 0.8014,
+      "cost_out_usd": 2.4052,
+      "our_in": 0.55,
+      "our_out": 2.19,
+      "recovery_in": 0.6863,
+      "recovery_out": 0.9105,
+      "profit_per_1M_pair": -0.4666,
+      "expr": "p*9 + c*27       (×0.65 折扣)"
+    },
+    {
+      "model": "glm-5.2",
+      "cost_in_usd": 1.0959,
+      "cost_out_usd": 3.8356,
+      "our_in": 0.6,
+      "our_out": 2.2,
+      "recovery_in": 0.5475,
+      "recovery_out": 0.5736,
+      "profit_per_1M_pair": -2.1315,
+      "expr": "p*8 + c*28"
+    },
+    {
+      "model": "kimi-k3",
+      "cost_in_usd": 2.7397,
+      "cost_out_usd": 13.6986,
+      "our_in": 0.6,
+      "our_out": 2.5,
+      "recovery_in": 0.219,
+      "recovery_out": 0.1825,
+      "profit_per_1M_pair": -13.3384,
+      "expr": "ratio 10.0001 / completion_ratio 5"
+    },
+    {
+      "model": "doubao-seed-2.1-pro",
+      "cost_in_usd": 0.7233,
+      "cost_out_usd": 3.6164,
+      "our_in": 0.5,
+      "our_out": 1.5,
+      "recovery_in": 0.6913,
+      "recovery_out": 0.4148,
+      "profit_per_1M_pair": -2.3397,
+      "expr": "p*6 + c*30       (×0.88 折扣)"
+    },
+    {
+      "model": "doubao-seed-2.0-pro",
+      "cost_in_usd": 0.4384,
+      "cost_out_usd": 2.1918,
+      "our_in": 0.5,
+      "our_out": 1.5,
+      "recovery_in": 1.1406,
+      "recovery_out": 0.6844,
+      "profit_per_1M_pair": -0.6301,
+      "expr": "p*3.2 + c*16     (×0.88 折扣)"
+    }
+  ]
+}
