@@ -104,7 +104,7 @@ print(r.choices[0].message.content)
 | GET  | `/api/log/export` | **导出 Excel**（双 sheet：明细 + 按模型汇总）；`?all=1` 仅管理员可导全站 |
 | GET  | `/api/models` | 公开模型目录 |
 | GET  | `/api/pricing` | 模型目录价格（含真实 input/output/cached + priced 标志 + default 价） |
-| POST | `/api/pricing/update` | **改价**（仅管理员）`{model,input,output,cached?}` → 写 pricing.json + **热重载，无需重启**；cached 缺省 = input×0.1 |
+| POST | `/api/pricing/update` | **改价**（仅管理员）`{model,input,output,cached?,peak?}` → 写 pricing.json + **热重载，无需重启**；cached 缺省=input×0.1；peak=true 启用默认高峰窗口(9-12/14-18 ×2) |
 
 | POST | `/api/pricing/delete` | 删除某模型定价（仅管理员），回落 default |
 | GET  | `/api/pricing/all` | 全部价格表（仅管理员，含未上架模型） |
@@ -127,7 +127,11 @@ print(r.choices[0].message.content)
 - **三档计价**（对齐上游 SLCH）：`input`（非缓存输入）/ `output`（补全）/ `cached`（缓存读）
   - `quota = ((输入−缓存)×input价 + 补全×output价 + 缓存×cached价) / 1e6 × 500000`
   - 缓存读通常只占输入价的 2%~10%，**漏算缓存会导致对账两边偏差数十倍**
-- **⚠️ 上游时段倍率**：SLCH 对部分模型（如 `deepseek-v4.1-flash`）在 **9:00-12:00 / 14:00-18:00（Asia/Shanghai）按 ×2 计费**；本表零售价只保「非高峰」成本，高峰时段会亏（需靠毛利或后续做时变定价缓冲）
+- **✅ 时段倍率（时变定价）**：对齐上游 SLCH，`deepseek-v4.1-flash` 等模型在 **9:00-12:00 / 14:00-18:00（Asia/Shanghai）按 ×2 计费**
+  - 配置：`pricing.json` 里该模型加 `"peak": { "windows": [[9,12],[14,18]], "multiplier": 2 }`
+  - 控制台「改价」弹窗可勾选「高峰时段倍率」，无需改文件
+  - 计费时按**请求开始时刻**（Asia/Shanghai）自动选倍率；实测高峰保本比 1.019 ✅
+  - ⚠️ 只有上游 expr 里带 `hour()` 的模型才有倍率（目前仅 `deepseek-v4.1-flash`），其他模型恒定价
 - **优先采用上游返回的真实 `usage`**（含 `prompt_tokens_details.cached_tokens`）；上游不给 usage 时按字符估算兜底
   - 中文 ≈ 1 token/字，英文 ≈ 1 token/4 字符
 - 扣费三方同步：用户余额 → 令牌用量 → 渠道用量，并写入 `logs`

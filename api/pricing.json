@@ -1,5 +1,5 @@
 {
-  "_comment": "价格表 USD / 1M tokens；三档 input/output/cached。SLCH chat 模型按真实成本 × 1.02（保本）核算；图片/视频/上游未定价模型保留原价。⚠️ SLCH 9-12/14-18 点有 ×2 时段倍率，本表仅保非高峰。",
+  "_comment": "价格表 USD / 1M tokens；三档 input(非缓存输入)/output(补全)/cached(缓存读)；可选 peak 时段倍率 {windows,multiplier}（对齐上游 SLCH 9-12/14-18 ×2）。chat 模型按 SLCH 真实成本 ×1.02（保本）核算。未列出走 default。",
   "deepseek-v4-flash": {
     "input": 0.27247,
     "output": 0.8174,
@@ -13,7 +13,20 @@
   "deepseek-v4.1-flash": {
     "input": 0.13973,
     "output": 0.5589,
-    "cached": 0.00279
+    "cached": 0.00279,
+    "peak": {
+      "windows": [
+        [
+          9,
+          12
+        ],
+        [
+          14,
+          18
+        ]
+      ],
+      "multiplier": 2
+    }
   },
   "glm-5.2": {
     "input": 1.11781,

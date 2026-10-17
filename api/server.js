@@ -437,18 +437,20 @@ const server = http.createServer(async (req, res) => {
       // 模型目录：渠道聚合出的在售模型 + billing 真实价（未定价的标 priced=false，走 default）
       const list = store.pricingCatalog(db).map(x => {
         const p = billing.priceOf(x.model);
-        return { ...x, input: p.input, output: p.output, cached: p.cached, priced: billing.isPriced(x.model) };
+        return { ...x, input: p.input, output: p.output, cached: p.cached, peak: p.peak,
+                 peak_now: billing.peakMultiplier(x.model), priced: billing.isPriced(x.model) };
       });
       return json(res, 200, { success: true, data: list, default: billing.DEFAULT });
     }
-    // 改价（仅管理员）：{model, input, output, cached?} → 落盘 pricing.json + 热重载，无需重启
+    // 改价（仅管理员）：{model, input, output, cached?, peak?} → 落盘 pricing.json + 热重载
     if (pathname === '/api/pricing/update' && req.method === 'POST') {
       const u = requireUser(req, res); if (!u) return;
       if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
       const b = await readJson(req) || {};
-      const r = billing.setPrice(b.model, b.input, b.output, b.cached);
+      const r = billing.setPrice(b.model, b.input, b.output, b.cached, b.peak);
       if (!r.ok) return json(res, 400, { success: false, message: r.error });
-      return json(res, 200, { success: true, data: r, message: `已定价 ${r.model}: 输入 $${r.input} / 补全 $${r.output} / 缓存 $${r.cached} 每 M tokens` });
+      const pk = r.peak ? `（高峰 ${r.peak.windows.map(w => w.join('-')).join('/')} ×${r.peak.multiplier}）` : '';
+      return json(res, 200, { success: true, data: r, message: `已定价 ${r.model}: 输入 $${r.input} / 补全 $${r.output} / 缓存 $${r.cached}${pk} 每 M tokens` });
     }
     // 删除定价（仅管理员）：回落 default 价
     if (pathname === '/api/pricing/delete' && req.method === 'POST') {

@@ -21,8 +21,29 @@ const DEFAULT_PRICE = { input: 0.5, output: 1.5, cached: 0.01 };
 // _comment 等非模型键，遍历时必须跳过
 const META_KEYS = new Set(['_comment', '_note', '_readme', 'default']);
 
+// 时段倍率：默认高峰窗口 9-12 / 14-18（Asia/Shanghai），倍率 2（对齐上游 SLCH）
+const DEFAULT_PEAK = { windows: [[9, 12], [14, 18]], multiplier: 2 };
+
 let PRICING = {};
 let DEF = DEFAULT_PRICE;
+
+/** 取当前小时（Asia/Shanghai，与服务器时区无关） */
+function hourShanghai(d = new Date()) {
+  const s = d.toLocaleString('en-US', { timeZone: 'Asia/Shanghai', hour: '2-digit', hour12: false });
+  return parseInt(s, 10) % 24;
+}
+
+/** 某模型当前时段倍率（无 peak 配置则 1） */
+function peakMultiplier(model, when = new Date()) {
+  const p = PRICING[model] || PRICING[String(model || '').toLowerCase()];
+  const pk = p?.peak;
+  if (!pk || !pk.windows || !pk.windows.length) return 1;
+  const h = hourShanghai(when);
+  for (const [s, e] of pk.windows) {
+    if (h >= s && h < e) return Number(pk.multiplier) || 1;
+  }
+  return 1;
+}
 
 function normalize(v, fallback) {
   const o = {
@@ -31,6 +52,13 @@ function normalize(v, fallback) {
     cached: Number.isFinite(+v?.cached) ? +v.cached
           : (Number.isFinite(+v?.cache) ? +v.cache : fallback.cached),
   };
+  // 时段倍率（可选）：{ windows:[[9,12],[14,18]], multiplier:2 }
+  if (v?.peak && Array.isArray(v.peak.windows) && v.peak.windows.length) {
+    const wins = v.peak.windows
+      .filter(w => Array.isArray(w) && w.length === 2 && Number.isFinite(+w[0]) && Number.isFinite(+w[1]))
+      .map(w => [parseInt(w[0], 10), parseInt(w[1], 10)]);
+    if (wins.length) o.peak = { windows: wins, multiplier: Number(v.peak.multiplier) || 1 };
+  }
   return o;
 }
 
@@ -60,7 +88,7 @@ reload();
 // 单位：USD / 1M tokens
 function priceOf(model) {
   const p = PRICING[model] || PRICING[String(model || '').toLowerCase()] || DEF;
-  return { input: p.input, output: p.output, cached: p.cached };
+  return { input: p.input, output: p.output, cached: p.cached, peak: p.peak || null };
 }
 
 /** 是否显式定价（区别于走 default） */
@@ -71,14 +99,16 @@ function isPriced(model) {
 /** 全部显式定价（不含 default / 注释），按模型名排序 */
 function allPrices() {
   return Object.keys(PRICING).filter(k => !META_KEYS.has(k) && k !== '_default').sort()
-    .map(model => ({ model, input: PRICING[model].input, output: PRICING[model].output, cached: PRICING[model].cached }));
+    .map(model => ({ model, input: PRICING[model].input, output: PRICING[model].output,
+                     cached: PRICING[model].cached, peak: PRICING[model].peak || null }));
 }
 
 /**
  * 设置/更新单模型价格（USD / 1M tokens）并落盘 + 热重载
  * @param cached 可选，缺省时按 input×0.1 推导
+ * @param peak   可选：true=默认高峰窗口(9-12/14-18 ×2)；{windows,multiplier} 自定义；false/''=清除；undefined=保留原值
  */
-function setPrice(model, input, output, cached) {
+function setPrice(model, input, output, cached, peak) {
   model = String(model || '').trim();
   if (!model) return { ok: false, error: '模型名不能为空' };
   if (META_KEYS.has(model)) return { ok: false, error: `「${model}」是保留名，不能定价` };
@@ -93,7 +123,22 @@ function setPrice(model, input, output, cached) {
 
   let raw = {};
   try { raw = JSON.parse(fs.readFileSync(PRICING_PATH, 'utf8')); } catch { raw = {}; }
+  const prev = raw[model] || {};
   raw[model] = { input: i, output: o, cached: ca };
+  // 保留/设置时段倍率（peak 未传则沿用原值）
+  if (peak !== undefined && peak !== null) {
+    if (peak === false || peak === '') {
+      // 清除
+    } else if (typeof peak === 'object') {
+      const wins = (peak.windows || []).filter(w => Array.isArray(w) && w.length === 2)
+        .map(w => [parseInt(w[0], 10), parseInt(w[1], 10)]);
+      if (wins.length) raw[model].peak = { windows: wins, multiplier: Number(peak.multiplier) || 2 };
+    } else if (peak === true) {
+      raw[model].peak = { windows: [[9, 12], [14, 18]], multiplier: 2 };   // 默认高峰窗口
+    }
+  } else if (prev.peak) {
+    raw[model].peak = prev.peak;
+  }
   if (!raw.default) raw.default = { ...DEFAULT_PRICE };
   try {
     fs.writeFileSync(PRICING_PATH, JSON.stringify(raw, null, 2) + '\n');
@@ -101,7 +146,8 @@ function setPrice(model, input, output, cached) {
     return { ok: false, error: '写盘失败: ' + e.message };
   }
   reload();
-  return { ok: true, model, input: i, output: o, cached: ca };
+  const saved = PRICING[model] || {};
+  return { ok: true, model, input: i, output: o, cached: ca, peak: saved.peak || null };
 }
 
 /** 删除某模型定价（回落 default） */
@@ -151,16 +197,19 @@ function parseUsage(obj) {
 }
 
 /**
- * 计算 quota —— 三档计价（输入/补全/缓存读）
- * @param cached 缓存读 tokens（已含在 prompt 内）
+ * 计算 quota —— 三档计价（输入/补全/缓存读）+ 可选时段倍率
+ * @param cached  缓存读 tokens（已含在 prompt 内）
+ * @param when    计费时刻（默认 now），用于算时段倍率
  */
-function computeQuota(model, prompt, completion, cached = 0) {
+function computeQuota(model, prompt, completion, cached = 0, when = new Date()) {
   const p = priceOf(model);
   const cachedTok = Math.max(0, Math.min(Number(cached) || 0, prompt));
   const uncached = prompt - cachedTok;
-  const usd = (uncached / 1e6) * p.input
-            + (completion / 1e6) * p.output
-            + (cachedTok / 1e6) * p.cached;
+  let usd = (uncached / 1e6) * p.input
+          + (completion / 1e6) * p.output
+          + (cachedTok / 1e6) * p.cached;
+  const mult = peakMultiplier(model, when);
+  if (mult !== 1) usd *= mult;
   return Math.max(0, Math.round(usd * QUOTA_PER_USD));
 }
 
@@ -170,8 +219,9 @@ function quotaToUsd(q) {
 }
 
 module.exports = {
-  QUOTA_PER_USD, PRICING_PATH,
+  QUOTA_PER_USD, PRICING_PATH, DEFAULT_PEAK,
   priceOf, isPriced, allPrices, setPrice, deletePrice, reload,
+  peakMultiplier, hourShanghai,
   estimateTokens, parseUsage, computeQuota, quotaToUsd,
   get PRICING() { return PRICING; },
   get DEFAULT() { return DEF; },

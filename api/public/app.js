@@ -380,10 +380,10 @@ function renderModels(list) {
     <td class="mono">$${fmtPrice(x.input)}</td><td class="mono">$${fmtPrice(x.output)}</td>
     <td class="mono">$${fmtPrice(x.cached)}</td>
     <td>${x.priced
-      ? '<span class="tag on">已定价</span>'
+      ? (x.peak ? `<span class="tag warn" title="高峰 ${(x.peak.windows||[]).map(w=>w.join('-')).join('/')} ×${x.peak.multiplier}（Asia/Shanghai）">时段 ×${x.peak.multiplier}${x.peak_now > 1 ? ' 生效中' : ''}</span>` : '<span class="tag on">已定价</span>')
       : '<span class="tag warn" title="未显式定价，走默认价">默认价</span>'}</td>
     ${IS_ADMIN ? `<td class="actions">
-        <button class="btn-ghost sm" onclick="editPrice('${esc(x.name)}',${x.input},${x.output},${x.cached ?? 'undefined'})">改价</button>
+        <button class="btn-ghost sm" onclick='editPrice(${JSON.stringify(x.name)},${x.input},${x.output},${x.cached ?? 'undefined'},${JSON.stringify(x.peak || null)})'>改价</button>
         ${x.priced ? `<button class="btn-ghost sm btn-danger" onclick="delPrice('${esc(x.name)}')">去定价</button>` : ''}
       </td>` : ''}</tr>`).join('')
     : `<tr><td colspan="${col}" class="empty">无匹配模型</td></tr>`;
@@ -394,19 +394,22 @@ function fmtPrice(v) {
   return n >= 1 ? n.toFixed(2) : n.toFixed(4);
 }
 // 改价弹窗（复用：新增/编辑）
-function editPrice(model, input, output, cached) {
+function editPrice(model, input, output, cached, peak) {
   const isNew = input === undefined;
+  const peakOn = !!(peak && peak.windows && peak.windows.length);
   openModal(`
     <h3>${isNew ? '新增/修改定价' : '修改定价 · ' + esc(model)}</h3>
     <label>模型名</label>
     <input id="prModel" value="${esc(model || '')}" ${isNew ? '' : 'readonly style="opacity:.6"'} placeholder="如 deepseek-v4-flash">
     <label>输入价（非缓存输入，USD / 1M tokens）</label>
-    <input id="prIn" type="number" step="0.0001" min="0" value="${isNew ? '' : input}" placeholder="0.1">
+    <input id="prIn" type="number" step="0.00001" min="0" value="${isNew ? '' : input}" placeholder="0.1">
     <label>补全价（输出，USD / 1M tokens）</label>
-    <input id="prOut" type="number" step="0.0001" min="0" value="${isNew ? '' : output}" placeholder="0.3">
+    <input id="prOut" type="number" step="0.00001" min="0" value="${isNew ? '' : output}" placeholder="0.3">
     <label>缓存读价（USD / 1M tokens，留空 = 输入价 ×0.1）</label>
     <input id="prCache" type="number" step="0.00001" min="0" value="${isNew || cached === undefined ? '' : cached}" placeholder="0.01">
-    <p class="muted" style="font-size:12px;margin:6px 0">换算：quota = ((输入−缓存)×输入价 + 补全×补全价 + 缓存×缓存价)/1e6 × 500000</p>
+    <label style="margin-top:10px"><input type="checkbox" id="prPeak" ${peakOn ? 'checked' : ''}> 高峰时段倍率（上游 9-12 / 14-18 点 ×2）</label>
+    <input id="prPeakMul" type="number" step="0.1" min="1" value="${peakOn ? peak.multiplier : 2}" placeholder="2" style="margin-top:4px">
+    <p class="muted" style="font-size:12px;margin:6px 0">换算：quota = ((输入−缓存)×输入价 + 补全×补全价 + 缓存×缓存价)/1e6 × 500000（× 高峰倍率）</p>
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closeModal()">取消</button>
       <button class="btn-primary" onclick="savePrice()">保存</button>
@@ -416,6 +419,11 @@ async function savePrice() {
   const b = { model: $('prModel').value.trim(), input: $('prIn').value, output: $('prOut').value };
   const ca = $('prCache').value.trim();
   if (ca !== '') b.cached = ca;
+  if ($('prPeak').checked) {
+    b.peak = { windows: [[9, 12], [14, 18]], multiplier: parseFloat($('prPeakMul').value) || 2 };
+  } else {
+    b.peak = false;   // 清除时段倍率
+  }
   if (!b.model) return toast('请填写模型名', 'err');
   if (b.input === '' || b.output === '') return toast('请填写输入/补全价格', 'err');
   const j = await api('/api/pricing/update', { method: 'POST', body: JSON.stringify(b) });

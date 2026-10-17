@@ -246,7 +246,7 @@ async function relayOnce({ ctx, up, res, body, logCtx, model, started }) {
     completion = obj ? ctx.billing.estimateTokens(extractContent(obj)) : 0;
     cached = 0;
   }
-  const quota = ctx.billing.computeQuota(model, prompt, completion || 0, cached);
+  const quota = ctx.billing.computeQuota(model, prompt, completion || 0, cached, new Date(started));
   settle(ctx, { logCtx, model, prompt, completion: completion || 0, cached, quota, started, stream: false });
 
   res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'X-Request-Id': logCtx.request_id });
@@ -316,7 +316,7 @@ async function relayStream({ ctx, up, res, body, logCtx, model, started }) {
     completion = ctx.billing.estimateTokens(contentChars);
     cached = 0;
   }
-  const quota = ctx.billing.computeQuota(model, prompt, completion || 0, cached);
+  const quota = ctx.billing.computeQuota(model, prompt, completion || 0, cached, new Date(started));
   settle(ctx, { logCtx, model, prompt, completion: completion || 0, cached, quota, started, stream: true });
 }
 
