@@ -283,12 +283,12 @@ const server = http.createServer(async (req, res) => {
         const r = store.setInviterSafe(db, uid, parseInt(b.inviter_id || 0, 10));
         if (!r.ok) return json(res, 400, { success: false, message: r.message });
       }
-      if (b.agent_level !== undefined || b.agent_name !== undefined) {
-        store.setAgentInfo(db, uid, { agent_level: b.agent_level, agent_name: b.agent_name });
+      if (b.agent_level !== undefined || b.agent_name !== undefined || b.agent_channel_id !== undefined) {
+        store.setAgentInfo(db, uid, { agent_level: b.agent_level, agent_name: b.agent_name, agent_channel_id: b.agent_channel_id });
       }
       const after = store.getUserById(db, uid);
       // 审计
-      if (before.inviter_id !== after.inviter_id || before.agent_level !== after.agent_level || before.agent_name !== after.agent_name) {
+      if (before.inviter_id !== after.inviter_id || before.agent_level !== after.agent_level || before.agent_name !== after.agent_name || (before.agent_channel_id || 0) !== (after.agent_channel_id || 0)) {
         const oi = before.inviter_id ? store.getUserById(db, before.inviter_id) : null;
         const ni = after.inviter_id ? store.getUserById(db, after.inviter_id) : null;
         store.addAgentAudit(db, {
@@ -299,7 +299,7 @@ const server = http.createServer(async (req, res) => {
           op_user_id: u.id, op_username: u.username, op_role: '管理员', ip: clientIp(req),
         });
       }
-      console.log(`[agent] ${u.username} 设置 uid=${uid} inviter=${b.inviter_id ?? '-'} level=${b.agent_level ?? '-'}`);
+      console.log(`[agent] ${u.username} 设置 uid=${uid} inviter=${b.inviter_id ?? '-'} level=${b.agent_level ?? '-'} channel=${b.agent_channel_id ?? '-'}`);
       return json(res, 200, { success: true, data: store.publicUser(db, after) });
     }
 

@@ -193,6 +193,8 @@ function migrate(db) {
   if (!cols.includes('reward_l1')) db.exec('ALTER TABLE users ADD COLUMN reward_l1 INTEGER NOT NULL DEFAULT 0');
   if (!cols.includes('reward_l2')) db.exec('ALTER TABLE users ADD COLUMN reward_l2 INTEGER NOT NULL DEFAULT 0');
   if (!cols.includes('reward_l3')) db.exec('ALTER TABLE users ADD COLUMN reward_l3 INTEGER NOT NULL DEFAULT 0');
+  // 代理指定渠道供应商：该代理（及其名下）的调用强制走此渠道（0=不指定，走通用路由）
+  if (!cols.includes('agent_channel_id')) db.exec('ALTER TABLE users ADD COLUMN agent_channel_id INTEGER NOT NULL DEFAULT 0');
 
   // logs 增量迁移：记录类型（consume/recharge/reward/system/admin）
   const lcols = db.prepare('PRAGMA table_info(logs)').all().map(c => c.name);
@@ -272,6 +274,9 @@ function publicUser(db, u) {
     aff_code: u.aff_code,
     inviter_id: u.inviter_id || 0,
     invite_reward: u.invite_reward || 0,
+    agent_level: u.agent_level || 0,
+    agent_name: u.agent_name || '',
+    agent_channel_id: u.agent_channel_id || 0,
     remark: u.remark,
     created_at: u.created_at,
   };
@@ -505,8 +510,9 @@ function deleteChannel(db, id) { db.prepare('DELETE FROM channels WHERE id=?').r
 function touchChannel(db, id) { db.prepare('UPDATE channels SET tested_at=? WHERE id=?').run(Date.now(), id); }
 
 // 找出能服务某模型的渠道（按优先级/权重）
-function channelsForModel(db, model) {
-  const all = listChannelsRaw(db).filter(c => c.status === 1);
+function channelsForModel(db, model, onlyChannelId) {
+  let all = listChannelsRaw(db).filter(c => c.status === 1);
+  if (onlyChannelId) all = all.filter(c => c.id === parseInt(onlyChannelId, 10));
   const hit = [];
   for (const c of all) {
     let list = [];
@@ -765,13 +771,29 @@ function setInviterSafe(db, userId, inviterId) {
   db.prepare('UPDATE users SET inviter_id=? WHERE id=?').run(inviterId || 0, userId);
   return { ok: true };
 }
-/** 设置代理等级/名称 */
-function setAgentInfo(db, userId, { agent_level, agent_name }) {
+/** 设置代理等级/名称/指定渠道 */
+function setAgentInfo(db, userId, { agent_level, agent_name, agent_channel_id }) {
   const f = [], v = [];
   if (agent_level !== undefined) { f.push('agent_level=?'); v.push(parseInt(agent_level, 10) || 0); }
   if (agent_name !== undefined) { f.push('agent_name=?'); v.push(String(agent_name)); }
+  if (agent_channel_id !== undefined) { f.push('agent_channel_id=?'); v.push(parseInt(agent_channel_id, 10) || 0); }
   if (f.length) { v.push(userId); db.prepare(`UPDATE users SET ${f.join(',')} WHERE id=?`).run(...v); }
   return getUserById(db, userId);
+}
+
+/**
+ * 解析某用户「生效的指定渠道」：从自己沿 inviter_id 链向上，取最近一个设了 agent_channel_id 的代理。
+ * 返回 { channel_id, owner_id, owner_name, depth }（自己 depth=0）或 null。
+ */
+function agentChannelForUser(db, userId, maxDepth = 6) {
+  let cur = getUserById(db, userId);
+  for (let d = 0; cur && d <= maxDepth; d++) {
+    const cid = parseInt(cur.agent_channel_id, 10) || 0;
+    if (cid > 0) return { channel_id: cid, owner_id: cur.id, owner_name: cur.username, depth: d };
+    if (!cur.inviter_id) break;
+    cur = getUserById(db, cur.inviter_id);
+  }
+  return null;
 }
 
 /** 记录某级返佣（level=1/2/3） */
@@ -892,7 +914,7 @@ module.exports = {
   createRedemptions, getRedemption, redeemCode, listRedemptions, setRedemptionStatus, deleteRedemption,
   DEFAULT_SETTINGS, getSettings, getSetting, setSettings,
   getInviter, listInvitees, setInviter, inviteStats, addInviteReward,
-  getUpline, listDownline, teamStats, setInviterSafe, setAgentInfo, addAgentReward, subtreeOf,
+  getUpline, listDownline, teamStats, setInviterSafe, setAgentInfo, agentChannelForUser, addAgentReward, subtreeOf,
   addAgentAudit, listAgentAudit, addLedger, listLedger, ledgerStats,
   doCheckin, checkinStatus,
   hashKey, newTokenKey,

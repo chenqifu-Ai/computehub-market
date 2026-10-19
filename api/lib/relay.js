@@ -80,8 +80,8 @@ function modelAllowed(token, model) {
 }
 
 // ---------- 渠道选择 ----------
-function rankChannels(ctx, model) {
-  const list = ctx.store.channelsForModel(ctx.db, model);
+function rankChannels(ctx, model, onlyChannelId) {
+  const list = ctx.store.channelsForModel(ctx.db, model, onlyChannelId);
   if (!list.length) return [];
   // 按 priority 降序，同优先级按权重随机（加权轮询的简化版）
   const groups = {};
@@ -180,9 +180,18 @@ async function handle(ctx, req, res, pathname, query) {
     is_stream: isStream, ip, request_id: requestId,
   };
 
-  // 渠道路由：按优先级依次尝试，失败自动换下一个（故障转移 + 熔断跳过）
-  const ranked = rankChannels(ctx, model).filter(c => health.available(c.id));
+  // 代理指定渠道：该代理名下调用强制走其绑定渠道（找不到/不可用则如实报错，不回退到通用路由）
+  const pin = ctx.store.agentChannelForUser(ctx.db, a.user.id);
+  let ranked = rankChannels(ctx, model, pin ? pin.channel_id : 0).filter(c => health.available(c.id));
   if (!ranked.length) {
+    if (pin) {
+      const ch = ctx.store.getChannel(ctx.db, pin.channel_id);
+      let msg;
+      if (!ch) msg = `所属代理「${pin.owner_name}」指定的渠道 #${pin.channel_id} 不存在`;
+      else if (ch.status !== 1) msg = `所属代理「${pin.owner_name}」指定的渠道「${ch.name}」已禁用`;
+      else msg = `所属代理「${pin.owner_name}」指定的渠道「${ch.name}」不支持模型 ${model} 或已熔断`;
+      return ctx.json(res, 503, { error: { message: msg, type: 'channel_pinned_unavailable' } });
+    }
     return ctx.json(res, 503, { error: { message: `没有可用渠道支持模型 ${model}（可能全部熔断）`, type: 'api_error' } });
   }
 

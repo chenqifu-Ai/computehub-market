@@ -637,9 +637,11 @@ async function loadInvite() {
 }
 
 // ---------- 渠道 ----------
+let CH_LIST = [];   // 渠道缓存（供代理设置弹窗选择指定渠道）
 async function loadChannels() {
   const j = await api('/api/channel/');
   if (!j.success) { $('channelBody').innerHTML = `<tr><td colspan="9" class="empty">${esc(j.message)}</td></tr>`; return; }
+  CH_LIST = j.data;
   $('channelBody').innerHTML = j.data.length ? j.data.map(c => {
     const h = c.health || {};
     const healthy = c.status !== 1 ? '<span class="tag off">已禁用</span>'
@@ -1364,7 +1366,7 @@ async function loadAgentTree() {
         <span class="tmeta">ID ${n.id}</span>
         ${n.quota !== undefined ? `<span class="tmeta">余额 ${fmtUsd(n.quota)} | 已用 ${fmtUsd(n.used_quota || 0)}</span>` : ''}
         <button class="btn-ghost sm" onclick="downloadSettle(${n.id})">结算</button>
-        <button class="btn-ghost sm" onclick="editAgent(${n.id},'${esc(n.username)}',${n.agent_level || 0},'${esc(n.agent_name || '')}')">设置</button>
+        <button class="btn-ghost sm" onclick="editAgent(${n.id},'${esc(n.username)}',${n.agent_level || 0},'${esc(n.agent_name || '')}',${n.agent_channel_id || 0})">设置</button>
       </div>
       ${hasKids ? `<div class="tree-children">${kids.map(c => render(c, lvl + 1)).join('')}</div>` : ''}
     </div>`;
@@ -1408,9 +1410,14 @@ function doAgentSettleExport() {
   downloadAuthed(qs, '正在导出全部代理结算清单…');
 }
 
-function editAgent(id, name, level, aname) {
+async function editAgent(id, name, level, aname, chId) {
+  if (!CH_LIST.length) {
+    try { const jc = await api('/api/channel/'); if (jc.success) CH_LIST = jc.data; } catch (e) {}
+  }
+  const chOpts = CH_LIST.map(c =>
+    `<option value="${c.id}" data-cname="${esc(c.name)}" ${Number(chId) === c.id ? 'selected' : ''}>#${c.id} ${esc(c.name)}${c.status === 1 ? '' : '（已禁用）'}</option>`).join('');
   openModal(`
-    <h3>设置代理层级「${esc(name)}」(ID ${id})</h3>
+    <h3>设置代理「${esc(name)}」(ID ${id})</h3>
     <label>上级用户 ID（0 = 无上级/平台直营）</label>
     <input id="agUp" type="number" value="0" min="0" placeholder="输入上级的 用户ID">
     <label>代理等级</label>
@@ -1422,6 +1429,12 @@ function editAgent(id, name, level, aname) {
     </select>
     <label>代理名称（可选）</label>
     <input id="agName" value="${esc(aname || '')}" placeholder="例如：杭州联登科技">
+    <label>指定渠道供应商（该代理名下调用强制走此渠道）</label>
+    <select id="agChannel">
+      <option value="0" ${!chId ? 'selected' : ''}>— 不指定（走通用路由：优先级+权重+故障转移）—</option>
+      ${chOpts}
+    </select>
+    <p class="muted" style="font-size:12px">指定后，此代理及其名下所有成员的请求只会走该渠道；若该渠道不支持所请求的模型或已熔断，将直接报错（不会回退到其他渠道）。</p>
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closeModal()">取消</button>
       <button class="btn-primary" onclick="saveAgent(${id})">保存</button>
@@ -1433,6 +1446,7 @@ async function saveAgent(id) {
     inviter_id: parseInt($('agUp').value || '0', 10),
     agent_level: parseInt($('agLevel').value, 10),
     agent_name: $('agName').value.trim(),
+    agent_channel_id: parseInt(($('agChannel') && $('agChannel').value) || '0', 10),
   };
   const j = await api('/api/admin/agent/set', { method: 'POST', body: JSON.stringify(b) });
   if (!j.success) return toast(j.message, 'err');
