@@ -92,13 +92,14 @@ function rankChannels(ctx, model) {
   const prios = Object.keys(groups).map(Number).sort((a, b) => b - a);
   const out = [];
   for (const p of prios) {
-    const g = groups[p].slice();
-    // 组内加权洗牌
-    for (let i = g.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [g[i], g[j]] = [g[j], g[i]];
-    }
-    out.push(...g);
+    // 组内加权洗牌（Efraimidis–Spirakis 无放回加权抽样：key=U^(1/w)，降序）
+    // 权重越大 → 越可能排在前面（即越可能被选中）；weight<=0 视为最低优先，排最后
+    const keyed = groups[p].map(c => {
+      const w = Number(c.weight);
+      return { c, k: (w > 0) ? Math.pow(Math.random(), 1 / w) : -1 };
+    });
+    keyed.sort((a, b) => b.k - a.k);
+    for (const x of keyed) out.push(x.c);
   }
   return out;
 }
@@ -389,4 +390,4 @@ function readRaw(req, limit = 32 * 1024 * 1024) {
   });
 }
 
-module.exports = { handle, status, init };
+module.exports = { handle, status, init, rankChannels };
