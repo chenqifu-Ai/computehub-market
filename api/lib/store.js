@@ -565,8 +565,9 @@ function insertLog(db, l) {
 }
 function listLogs(db, { userId, p = 1, size = 20 }) {
   const off = (p - 1) * size;
-  const total = db.prepare('SELECT COUNT(*) c FROM logs WHERE user_id=?').get(userId).c;
-  const items = db.prepare('SELECT * FROM logs WHERE user_id=? ORDER BY id DESC LIMIT ? OFFSET ?').all(userId, size, off);
+  // 过滤返佣流水（request_id 以 invite: 开头）——返佣统一在「资金流水」页看，避免刷屏目标任务
+  const total = db.prepare("SELECT COUNT(*) c FROM logs WHERE user_id=? AND request_id NOT LIKE 'invite:%'").get(userId).c;
+  const items = db.prepare("SELECT * FROM logs WHERE user_id=? AND request_id NOT LIKE 'invite:%' ORDER BY id DESC LIMIT ? OFFSET ?").all(userId, size, off);
   return { items, total, page: p, page_size: size };
 }
 
