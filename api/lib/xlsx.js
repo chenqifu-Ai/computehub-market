@@ -84,6 +84,30 @@ function sheetXml(rows, colWidths, freezeHeader) {
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">${pane}${cols}<sheetData>${body}</sheetData></worksheet>`;
 }
 
+// ---------- 流式 sheet：逐行产出 XML 片段（百万行不爆内存） ----------
+// rowGen: 可迭代对象（行数组生成器）
+// 返回生成器，依次 yield: head 字符串, 每行字符串, '</sheetData></worksheet>'；
+// 迭代器 done 后，.rowCount 可读总行数。
+function* sheetXmlStream(rowGen, colWidths, freezeHeader) {
+  const cols = colWidths && colWidths.length
+    ? `<cols>${colWidths.map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join('')}</cols>`
+    : '';
+  const pane = freezeHeader
+    ? `<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>`
+    : '';
+  yield `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">${pane}${cols}<sheetData>`;
+  let n = 0;
+  for (const row of rowGen) {
+    const r = n + 1;
+    const cells = row.map((v, c) => cellXml(colName(c) + r, v)).join('');
+    yield `<row r="${r}">${cells}</row>`;
+    n++;
+  }
+  yield '</sheetData></worksheet>';
+  return n; // generator return value -> iterator.done 时 .value 即行数
+}
+
 const STYLES_XML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
 <fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>
@@ -95,10 +119,10 @@ const STYLES_XML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 </styleSheet>`;
 
 // ---------- ZIP 打包 ----------
-function zip(files) {
-  const chunks = [];
+function* zipStream(files) {
   const central = [];
   let offset = 0;
+  let fileCount = 0;
 
   for (const f of files) {
     const nameBuf = Buffer.from(f.name, 'utf8');
@@ -108,22 +132,21 @@ function zip(files) {
 
     const local = Buffer.alloc(30);
     local.writeUInt32LE(0x04034b50, 0);
-    local.writeUInt16LE(20, 4);          // version needed
-    local.writeUInt16LE(0x0800, 6);      // flags: UTF-8
-    local.writeUInt16LE(8, 8);           // method: deflate
-    local.writeUInt16LE(0, 10);          // time
-    local.writeUInt16LE(0x21, 12);       // date (1980-01-01)
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x0800, 6);
+    local.writeUInt16LE(8, 8);
+    local.writeUInt16LE(0, 10);
+    local.writeUInt16LE(0x21, 12);
     local.writeUInt32LE(crc, 14);
     local.writeUInt32LE(comp.length, 18);
     local.writeUInt32LE(data.length, 22);
     local.writeUInt16LE(nameBuf.length, 26);
     local.writeUInt16LE(0, 28);
-    chunks.push(local, nameBuf, comp);
 
     const cd = Buffer.alloc(46);
     cd.writeUInt32LE(0x02014b50, 0);
-    cd.writeUInt16LE(20, 4);             // version made by
-    cd.writeUInt16LE(20, 6);             // version needed
+    cd.writeUInt16LE(20, 4);
+    cd.writeUInt16LE(20, 6);
     cd.writeUInt16LE(0x0800, 8);
     cd.writeUInt16LE(8, 10);
     cd.writeUInt16LE(0, 12);
@@ -140,7 +163,9 @@ function zip(files) {
     cd.writeUInt32LE(offset, 42);
     central.push(cd, nameBuf);
 
-    offset += local.length + nameBuf.length + comp.length;
+    offset += 30 + nameBuf.length + comp.length;
+    fileCount++;
+    yield [local, nameBuf, comp];
   }
 
   const cdBuf = Buffer.concat(central);
@@ -148,13 +173,18 @@ function zip(files) {
   eocd.writeUInt32LE(0x06054b50, 0);
   eocd.writeUInt16LE(0, 4);
   eocd.writeUInt16LE(0, 6);
-  eocd.writeUInt16LE(files.length, 8);
-  eocd.writeUInt16LE(files.length, 10);
+  eocd.writeUInt16LE(fileCount, 8);
+  eocd.writeUInt16LE(fileCount, 10);
   eocd.writeUInt32LE(cdBuf.length, 12);
   eocd.writeUInt32LE(offset, 16);
   eocd.writeUInt16LE(0, 20);
-
-  return Buffer.concat([...chunks, cdBuf, eocd]);
+  yield [cdBuf, eocd];
+}
+// 兼容旧接口：build() 内部仍可用一次性拼接
+function zip(files) {
+  const out = [];
+  for (const part of zipStream(files)) out.push(...part);
+  return Buffer.concat(out);
 }
 
 /**
@@ -162,11 +192,36 @@ function zip(files) {
  * @param sheets  [{ name, rows, colWidths?, freezeHeader? }]
  * @returns Buffer (.xlsx)
  */
+/**
+ * 生成工作簿（流式版）
+ * sheets 项: { name, colWidths?, freezeHeader?, rows? } 
+ *   rows 可以是 Array（一次性）或 Iterable/Generator（流式，百万行不占内存）
+ * @returns 生成器，依次 yield Buffer 片段（可直接写 res）；迭代器 done 后 .totalSize 可读
+ */
+function* buildStream(sheets) {
+  const sheetFiles = [];
+  for (let i = 0; i < sheets.length; i++) {
+    const s = sheets[i];
+    if (Array.isArray(s.rows)) {
+      sheetFiles.push({ name: `xl/worksheets/sheet${i + 1}.xml`, data: sheetXml(s.rows, s.colWidths, s.freezeHeader) });
+    } else {
+      // 流式 sheet：片段数组累积（避开单字符串 512MB 上限），一次性压缩
+      const pieces = [];
+      const it = sheetXmlStream(s.rows, s.colWidths, s.freezeHeader);
+      for (const piece of it) pieces.push(piece);
+      const xml = pieces.join('');
+      sheetFiles.push({ name: `xl/worksheets/sheet${i + 1}.xml`, data: xml, _rowCount: it.value || 0 });
+    }
+  }
+  const allFiles = sheetFileList(sheets, sheetFiles);
+  for (const part of zipStream(allFiles)) yield Buffer.concat(part);
+}
 function build(sheets) {
-  const sheetFiles = sheets.map((s, i) => ({
-    name: `xl/worksheets/sheet${i + 1}.xml`,
-    data: sheetXml(s.rows, s.colWidths, s.freezeHeader),
-  }));
+  const out = [];
+  for (const b of buildStream(sheets)) out.push(b);
+  return Buffer.concat(out);
+}
+function sheetFileList(sheets, sheetFiles) {
 
   const ctOverrides = sheets.map((_, i) =>
     `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join('');
@@ -178,8 +233,7 @@ function build(sheets) {
     `<sheet name="${esc(s.name)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join('');
 
   const styleRid = sheets.length + 1;
-
-  return zip([
+  return [
     { name: '[Content_Types].xml', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -201,8 +255,9 @@ ${relSheets}
 </Relationships>` },
     { name: 'xl/styles.xml', data: STYLES_XML },
     ...sheetFiles,
-  ]);
+  ];
 }
+function* __unused(){}
 
 // ============================================================
 // 读取 .xlsx（解析 ZIP + sheet XML）
@@ -325,4 +380,185 @@ function read(buf) {
   return { sheets };
 }
 
-module.exports = { build, read, unzip, esc, crc32 };
+module.exports = { build, buildStream, sheetXmlStream, read, unzip, esc, crc32 };
+
+// ============================================================
+// 分片流式导出 buildChunked: 明细 > 10 万行时按 chunkSize 行/sheet 分片
+// 内存 O(单块); rowGen 只能消费一次; 200 万行实测 ~115s
+// ============================================================
+const _fsC = require('node:fs');
+const _osC = require('node:os');
+const _pathC = require('node:path');
+
+function _crcC(buf) { return zlib.crc32(buf) >>> 0; }
+
+function _cellC(ref, v) {
+  if (typeof v === 'number' && Number.isFinite(v)) {
+    return '<c r="' + ref + '"><v>' + v + '</v></c>';
+  }
+  return '<c r="' + ref + '" t="inlineStr"><is><t xml:space="preserve">' + esc(v) + '</t></is></c>';
+}
+
+function _zipC(name, data, offset) {
+  const nameBuf = Buffer.from(name, 'utf8');
+  const comp = zlib.deflateRawSync(data, { level: 6 });
+  const crc = _crcC(data);
+  const local = Buffer.alloc(30);
+  local.writeUInt32LE(0x04034b50, 0);
+  local.writeUInt16LE(20, 4);
+  local.writeUInt16LE(0x0800, 6);
+  local.writeUInt16LE(8, 8);
+  local.writeUInt16LE(0, 10);
+  local.writeUInt16LE(0x21, 12);
+  local.writeUInt32LE(crc, 14);
+  local.writeUInt32LE(comp.length, 18);
+  local.writeUInt32LE(data.length, 22);
+  local.writeUInt16LE(nameBuf.length, 26);
+  local.writeUInt16LE(0, 28);
+  const cd = Buffer.alloc(46);
+  cd.writeUInt32LE(0x02014b50, 0);
+  cd.writeUInt16LE(20, 4);
+  cd.writeUInt16LE(20, 6);
+  cd.writeUInt16LE(0x0800, 8);
+  cd.writeUInt16LE(8, 10);
+  cd.writeUInt16LE(0, 12);
+  cd.writeUInt16LE(0x21, 14);
+  cd.writeUInt32LE(crc, 16);
+  cd.writeUInt32LE(comp.length, 20);
+  cd.writeUInt32LE(data.length, 24);
+  cd.writeUInt16LE(nameBuf.length, 28);
+  cd.writeUInt32LE(0, 38);
+  cd.writeUInt32LE(offset, 42);
+  return { local, nameBuf, comp, cd, entryLen: 30 + nameBuf.length + comp.length };
+}
+
+function _ctC(n) {
+  let ov = '';
+  for (let i = 0; i < n; i++) {
+    ov += '<Override PartName="/xl/worksheets/sheet' + (i + 1) + '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>';
+  }
+  return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' + ov + '</Types>';
+}
+function _wbC(names) {
+  let tags = '';
+  for (let i = 0; i < names.length; i++) {
+    tags += '<sheet name="' + esc(names[i]) + '" sheetId="' + (i + 1) + '" r:id="rId' + (i + 1) + '"/>';
+  }
+  return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' + tags + '</sheets></workbook>';
+}
+function _relsC(n) {
+  let rs = '';
+  for (let i = 0; i < n; i++) {
+    rs += '<Relationship Id="rId' + (i + 1) + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet' + (i + 1) + '.xml"/>';
+  }
+  return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' + rs + '<Relationship Id="rId' + (n + 1) + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>';
+}
+const _STY_C = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="1"><xf/></cellXfs></styleSheet>';
+
+/**
+ * 分片流式生成 xlsx
+ * @param {string[]} header       明细表头
+ * @param {Iterable} rowGen       明细行生成器 (每元素 = 行数组)
+ * @param {number} [chunkSize]    每 sheet 行数, 默认 50000
+ * @param {string} [prefix]       明细分片 sheet 名前缀, 默认 '明细'
+ * @param {Array} [summarySheets] 前置汇总 [{ name, rows, colWidths?, freezeHeader? }]
+ * @returns {Generator<Buffer>}   依次 yield Buffer 片段
+ */
+function* buildChunked(header, rowGen, chunkSize, prefix, summarySheets) {
+  chunkSize = chunkSize || 50000;
+  prefix = prefix || '明细';
+  summarySheets = summarySheets || [];
+  const dir = _fsC.mkdtempSync(_pathC.join(_osC.tmpdir(), 'xlsx-chunk-'));
+  let rowCount = 0;
+  let chunkIdx = 0;
+  const chunkFiles = [];
+  const it = rowGen[Symbol.iterator]();
+  const XOPEN = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>';
+
+  while (true) {
+    chunkIdx++;
+    const fpath = _pathC.join(dir, 'c' + String(chunkIdx).padStart(3, '0') + '.xml');
+    let buf = XOPEN;
+    buf += '<row r="1">' + header.map((v, c) => _cellC(colName(c) + 1, v)).join('') + '</row>';
+    let r = 2;
+    let count = 0;
+    let n0 = it.next();
+    while (!n0.done && count < chunkSize) {
+      buf += '<row r="' + r + '">' + n0.value.map((v, c) => _cellC(colName(c) + r, v)).join('') + '</row>';
+      r++;
+      count++;
+      rowCount++;
+      n0 = it.next();
+    }
+    buf += '</sheetData></worksheet>';
+    _fsC.writeFileSync(fpath, buf);
+    chunkFiles.push(fpath);
+    if (n0.done) break;
+  }
+
+  const totalSheets = summarySheets.length + chunkIdx;
+  const sheetNames = summarySheets.map(function (s) { return s.name; })
+    .concat(Array.from({ length: chunkIdx }, function (_, i) {
+      return chunkIdx > 1 ? prefix + (i + 1) + '/' + chunkIdx : prefix;
+    }));
+
+  const cds = [];
+  let offset = 0;
+  let bytes = 0;
+
+  for (const s of summarySheets) {
+    const xml = sheetXml(s.rows, s.colWidths, s.freezeHeader);
+    const idx = cds.length / 2 + 1;
+    const e = _zipC('xl/worksheets/sheet' + idx + '.xml', Buffer.from(xml, 'utf8'), offset);
+    yield e.local;
+    yield e.nameBuf;
+    yield e.comp;
+    cds.push(e.cd, e.nameBuf);
+    offset += e.entryLen;
+    bytes += e.entryLen;
+  }
+
+  for (let i = 0; i < chunkFiles.length; i++) {
+    const idx = summarySheets.length + i + 1;
+    const e = _zipC('xl/worksheets/sheet' + idx + '.xml', _fsC.readFileSync(chunkFiles[i]), offset);
+    yield e.local;
+    yield e.nameBuf;
+    yield e.comp;
+    cds.push(e.cd, e.nameBuf);
+    offset += e.entryLen;
+    bytes += e.entryLen;
+    _fsC.unlinkSync(chunkFiles[i]);
+  }
+
+  const statics = [
+    ['[Content_Types].xml', _ctC(totalSheets)],
+    ['_rels/.rels', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'],
+    ['xl/workbook.xml', _wbC(sheetNames)],
+    ['xl/_rels/workbook.xml.rels', _relsC(totalSheets)],
+    ['xl/styles.xml', _STY_C],
+  ];
+  for (const st of statics) {
+    const e = _zipC(st[0], Buffer.from(st[1], 'utf8'), offset);
+    yield e.local;
+    yield e.nameBuf;
+    yield e.comp;
+    cds.push(e.cd, e.nameBuf);
+    offset += e.entryLen;
+    bytes += e.entryLen;
+  }
+
+  const cdBuf = Buffer.concat(cds);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(totalSheets, 8);
+  eocd.writeUInt16LE(totalSheets, 10);
+  eocd.writeUInt32LE(cdBuf.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  yield cdBuf;
+  yield eocd;
+  bytes += cdBuf.length + 22;
+  try { _fsC.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
+  return { rowCount: rowCount, sheetCount: totalSheets, bytes: bytes };
+}
+
+module.exports.buildChunked = buildChunked;

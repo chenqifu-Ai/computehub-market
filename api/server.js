@@ -426,7 +426,9 @@ const server = http.createServer(async (req, res) => {
         since: fromQ || since,
         until: untilQ || 0,
       };
-      return exportSettleXlsx(res, { target, since: range.since, until: range.until });
+      // 明细上限: 防超大用户 OOM(>50万行自动截断, 汇总表不受影响)
+      const limit = Math.min(parseInt(query.get('limit') || '0', 10) || 500000, 2000000);
+      return exportSettleXlsx(res, { target, since: range.since, until: range.until, limit });
     }
 
     // ---------- 模型 / 渠道（对外目录：不含密钥） ----------
@@ -885,29 +887,9 @@ function typeLabel(l) {
 
 function exportUsageXlsx(res, { userId, since, all }) {
   const xlsx = require('./lib/xlsx');
-  const rows = store.exportLogs(db, { userId, since });
+  const t0 = Date.now();
   const summary = store.exportSummary(db, { userId, since });
 
-  const detail = [
-    ['时间', '类型', '用户', '用户ID', '令牌名称', '模型', '输入token数', '缓存读token数', '未命中token数', '命中率', '输出token数', '花费金额', '用时(秒)', '流式'],
-  ];
-  for (const l of rows) {
-    const ca = l.cached_tokens || 0;
-    detail.push([
-      fmtTs(l.created_at),
-      typeLabel(l),
-      l.username,
-      String(l.user_id),
-      l.token_name || '',
-      l.model_name || '',
-      l.prompt_tokens, ca, Math.max(0, (l.prompt_tokens || 0) - ca),
-      l.prompt_tokens ? Math.round(ca / l.prompt_tokens * 100) + '%' : '',
-      l.completion_tokens,
-      fmtYuan(l.quota),
-      Math.round(l.use_time || 0),
-      l.is_stream ? '是' : '否',
-    ]);
-  }
 
   const sum = [
     ['用户', '用户ID', '令牌名称', '令牌ID', '模型', '请求次数', '输入token数', '输出token数', '总token数', '消费金额'],
@@ -923,11 +905,26 @@ function exportUsageXlsx(res, { userId, since, all }) {
   }
   sum.push(['合计', '', '', '', '', tReq, tIn, tOut, tTok, fmtYuan(tQ)]);
 
-  const sheet1Name = all ? '全部明细' : '使用日志';
-  const buf = xlsx.build([
-    { name: sheet1Name, rows: detail, colWidths: [20, 8, 14, 9, 16, 24, 13, 13, 13, 8, 13, 13, 10, 8], freezeHeader: true },
-    { name: '按模型汇总', rows: sum, colWidths: [14, 9, 16, 9, 24, 10, 13, 13, 13, 13], freezeHeader: true },
-  ]);
+  const header = ['时间', '类型', '用户', '用户ID', '令牌名称', '模型', '输入token数', '缓存读token数', '未命中token数', '命中率', '输出token数', '花费金额', '用时(秒)', '流式'];
+  function* dataRows() {
+    for (const l of store.exportLogsIter(db, { userId, since })) {
+      const ca = l.cached_tokens || 0;
+      yield [
+        fmtTs(l.created_at),
+        typeLabel(l),
+        l.username,
+        String(l.user_id),
+        l.token_name || '',
+        l.model_name || '',
+        l.prompt_tokens, ca, Math.max(0, (l.prompt_tokens || 0) - ca),
+        l.prompt_tokens ? Math.round(ca / l.prompt_tokens * 100) + '%' : '',
+        l.completion_tokens,
+        fmtYuan(l.quota),
+        Math.round(l.use_time || 0),
+        l.is_stream ? '是' : '否',
+      ];
+    }
+  }
 
   const d = new Date();
   const stamp = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
@@ -935,16 +932,22 @@ function exportUsageXlsx(res, { userId, since, all }) {
   res.writeHead(200, {
     'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     'Content-Disposition': `attachment; filename="${fname}"`,
-    'Content-Length': buf.length,
     'Cache-Control': 'no-store',
     'Access-Control-Allow-Origin': '*',
   });
-  res.end(buf);
-  console.log(`[export] ${all ? 'ALL' : 'uid'} xlsx: ${rows.length} 条明细 / ${summary.length} 行汇总`);
+  // 分片流式：内存 O(块)，百万行不 OOM
+  const gen = xlsx.buildChunked(header, dataRows(), 50000, all ? '全部明细' : '使用日志',
+    [{ name: '按模型汇总', rows: sum, colWidths: [14, 9, 16, 9, 24, 10, 13, 13, 13, 13], freezeHeader: true }]);
+  let sent = 0;
+  for (const chunk of gen) {
+    res.write(chunk); sent += chunk.length;
+  }
+  res.end();
+  console.log(`[export] ${all ? 'ALL' : 'uid'} xlsx 分片流式: ${sent / 1024 / 1024 | 0}MB / ${summary.length} 行汇总 / ${(Date.now() - t0) / 1000 | 0}s`);
 }
 
 /** 结算清单导出：target = 'all' 或 用户ID 字符串 */
-function exportSettleXlsx(res, { target, since, until = 0 }) {
+function exportSettleXlsx(res, { target, since, until = 0, limit = 500000 }) {
   const xlsx = require('./lib/xlsx');
   const TYPE = { consume: '消费', recharge: '充值', reward: '返利', system: '系统', admin: '管理' };
   const usdS = q => '$' + ((q || 0) / QUOTA_PER_USD).toFixed(6);
@@ -980,7 +983,7 @@ function exportSettleXlsx(res, { target, since, until = 0 }) {
   let G={c:0,ok:0,err:0,tin:0,tout:0,tok:0,q:0,rc:0};
 
   for (const u of users) {
-    const logs = store.exportLogs(db, { userId: u.id, since, until });
+    const logs = store.exportLogs(db, { userId: u.id, since, until, limit: target === 'all' ? 20000 : limit });
     const agg = aggOf(u.id);
     const rc = rcOf(u.id);
     const first = logs.length ? logs[logs.length-1].created_at : u.created_at;  // exportLogs 为 DESC
@@ -1000,7 +1003,7 @@ function exportSettleXlsx(res, { target, since, until = 0 }) {
 
   if (target !== 'all') {
     const u = users[0];
-    const logs = store.exportLogs(db, { userId: u.id, since, until });
+    const logs = store.exportLogs(db, { userId: u.id, since, until, limit });
     const agg = aggOf(u.id);
     const rc = rcOf(u.id);
     const first = logs.length ? logs[logs.length-1].created_at : u.created_at;  // exportLogs 为 DESC
@@ -1016,6 +1019,7 @@ function exportSettleXlsx(res, { target, since, until = 0 }) {
       ['',''], ['调用统计',''],
       ['请求总数', String(agg.c)], ['成功', String(agg.ok||0)], ['失败', String(agg.err||0)],
       ['输入token', String(agg.tin)], ['输出token', String(agg.tout)], ['总token', String(agg.tok)],
+      ['明细行数', logs.length < agg.c ? `前 ${logs.length} 条(共 ${agg.c} 条, 已截断)` : String(logs.length)],
       ['导出时间', fmtTs(Date.now())],
     ];
     const detail = [['时间','类型','模型','渠道','令牌','输入token','输出token','总token','消费(USD)','耗时(秒)','流式','状态','错误','来源IP']];
@@ -1040,11 +1044,29 @@ function exportSettleXlsx(res, { target, since, until = 0 }) {
     for (const r of byCh) { cSheet.push([r.channel_name||'-',r.c,r.tok,usdS(r.q)]); cR+=r.c;cT+=r.tok;cQ+=r.q; }
     cSheet.push(['合计',cR,cT,usdS(cQ)]);
 
+    // 返佣汇总(该用户作为邀请人获得的各级返佣, 来自 invite: 行)
+    const rwRows = db.prepare(`SELECT CASE WHEN username='agent-reward-L1' THEN 'L1'
+       WHEN username='agent-reward-L2' THEN 'L2' ELSE 'L3' END lv, COUNT(*) c, COALESCE(SUM(quota),0) q
+       FROM logs WHERE user_id=? AND log_type='consume' AND username LIKE 'agent-reward-L%' GROUP BY lv`).all(u.id);
+    const rwSheet = [['返佣层级','笔数','返佣(USD)']];
+    let rwQ = 0;
+    for (const r of rwRows) { rwSheet.push([r.lv, r.c, usdS(r.q)]); rwQ += r.q; }
+    rwSheet.push(['合计', rwRows.reduce((a, r) => a + r.c, 0), usdS(rwQ)]);
+    const rwUsers = db.prepare(`SELECT u.id, u.username, COALESCE(SUM(r.quota),0) q
+       FROM logs c
+       JOIN logs r ON r.request_id = 'invite:' || c.request_id
+       JOIN users u ON u.id = r.user_id
+       WHERE c.user_id=? AND c.log_type='consume' AND c.username=? AND c.request_id NOT LIKE 'invite:%'
+         AND r.log_type='consume' AND r.username LIKE 'agent-reward-L%'
+       GROUP BY u.id ORDER BY q`).all(u.id, u.username);
+    const rwSheet2 = [['返佣获得用户','ID','返佣(USD)']];
+    for (const r of rwUsers) rwSheet2.push([r.username, String(r.id), usdS(r.q)]);
     const buf = xlsx.build([
       { name: '结算概要', rows: info, colWidths: [16, 44] },
       { name: '调用明细', rows: detail, colWidths: [19,8,22,24,14,11,11,11,13,8,6,7,40,16], freezeHeader: true },
       { name: '按模型汇总', rows: mSheet, colWidths: [24,10,13,13,13,14], freezeHeader: true },
       { name: '按渠道汇总', rows: cSheet, colWidths: [26,10,13,14], freezeHeader: true },
+      { name: '返佣汇总', rows: rwSheet.concat([['',''],['按用户',''], ...rwSheet2]), colWidths: [20,10,14], freezeHeader: true },
     ]);
     const fname = `结算清单_${u.username}_${u.id}_${stamp}.xlsx`;
     return sendXlsx(res, buf, fname, `[settle] uid=${u.id} ${logs.length} 条`);

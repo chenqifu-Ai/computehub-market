@@ -572,13 +572,27 @@ function listLogs(db, { userId, p = 1, size = 20 }) {
 }
 
 // 导出用：明细 + 汇总（userId=null 表示全站）
-function exportLogs(db, { userId, since = 0, until = 0 } = {}) {
+function exportLogs(db, { userId, since = 0, until = 0, limit = 0 } = {}) {
   const cond = [], v = [];
   if (userId) { cond.push('user_id=?'); v.push(userId); }
   if (since) { cond.push('created_at>=?'); v.push(since); }
   if (until) { cond.push('created_at<=?'); v.push(until); }
+  cond.push('log_type=?'); v.push('consume');  // 结算/导出只算消费行, 排除 invite: 返佣行(防双计)
   const where = cond.length ? ('WHERE ' + cond.join(' AND ')) : '';
-  return db.prepare(`SELECT * FROM logs ${where} ORDER BY created_at DESC`).all(...v);
+  const lim = limit ? ` LIMIT ${parseInt(limit, 10)}` : '';
+  return db.prepare(`SELECT * FROM logs ${where} ORDER BY created_at DESC${lim}`).all(...v);
+}
+// 流式导出：sqlite 原生 iterate()，百万行不占内存
+function* exportLogsIter(db, { userId, since = 0, until = 0, limit = 0 } = {}) {
+  const cond = [], v = [];
+  if (userId) { cond.push('user_id=?'); v.push(userId); }
+  if (since) { cond.push('created_at>=?'); v.push(since); }
+  if (until) { cond.push('created_at<=?'); v.push(until); }
+  cond.push('log_type=?'); v.push('consume');
+  const where = cond.length ? ('WHERE ' + cond.join(' AND ')) : '';
+  const lim = limit ? ` LIMIT ${parseInt(limit, 10)}` : '';
+  const rs = db.prepare(`SELECT * FROM logs ${where} ORDER BY created_at DESC${lim}`).iterate(...v);
+  try { yield* rs; } finally { rs.close?.(); }
 }
 function exportSummary(db, { userId, since = 0 } = {}) {
   const cond = []; const v = [];
@@ -909,7 +923,7 @@ module.exports = {
   listChannels, listChannelsRaw, getChannel, channelsForModel, addChannelUsage,
   addChannel, updateChannel, deleteChannel, touchChannel,
   publicModelCatalog, pricingCatalog, maskKey,
-  insertLog, listLogs, logStatsByModel, exportLogs, exportSummary,
+  insertLog, listLogs, logStatsByModel, exportLogs, exportLogsIter, exportSummary,
   logExists, recomputeUserStats, countLogs,
   listUsers, adminUpdateUser, systemStats, userByAff,
   createRedemptions, getRedemption, redeemCode, listRedemptions, setRedemptionStatus, deleteRedemption,
