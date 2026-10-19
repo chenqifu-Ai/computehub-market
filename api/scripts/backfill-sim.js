@@ -1,19 +1,23 @@
 #!/usr/bin/env node
 /**
- * backfill-sim.js — 参数化历史数据模拟回填生成器
+ * backfill-sim.js — 会话块保真 · 参数化历史数据模拟回填生成器
  *
- * 数据源：scripts/sim-source.db（build-sim-source.js 构建的真实用户分池）
- * 随机从池里 resampling + 可配置扰动，回填到指定用户。
+ * 数据源：scripts/sim-source.db（build-sim-source.js 构建的"会话块"库）
+ * 以【会话块】为单位随机提取：
+ *   - 块 = 真实连续会话（同模型+同渠道+间隔≤2min 的记录组）
+ *   - 块内按原始顺序 + 原始间隔生成 → 输入递减/递增连续性保留
+ *   - 块间按真实间隔节奏游走
  *
- * ★ 所有可调参数集中在下方 CONFIG，改参数重跑即可。
- * ★ 修复：use_time 从源记录 resampling（单位=秒，对齐真实）；
- *         cached 与 prompt 共享同一 jitter 因子（保证 cached≤prompt，命中率≤100%）
+ * ★ 所有可调参数集中在 CONFIG 顶部。
+ * 扰动规则（保真）：
+ *   输入 = 源 × U(0.95,1.00)   缓存读 = 输入 × 源命中率（直接用真实命中率）
+ *   未命中 = 输入 − 缓存读     输出/耗时/费用 = 源 × U(0.99,1.00)
  *
  * 用法：
- *   node scripts/backfill-sim.js                          # dry-run（看样本+统计）
- *   node scripts/backfill-sim.js --apply                  # 写库
- *   node scripts/backfill-sim.js --apply --user 39        # 指定目标用户
- *   node scripts/backfill-sim.js --rebuild                # 先重建数据源库再跑
+ *   node scripts/backfill-sim.js                  # dry-run（时间序列样本）
+ *   node scripts/backfill-sim.js --apply          # 写库
+ *   node scripts/backfill-sim.js --apply --user 39 --profile heavy-cached
+ *   node scripts/backfill-sim.js --rebuild        # 先重建数据源库
  */
 const { DatabaseSync } = require('node:sqlite');
 const path = require('node:path');
@@ -25,23 +29,19 @@ const SRC_DB = path.join(__dirname, 'sim-source.db');
 
 // ===================== 可调参数（改这里）=====================
 const CONFIG = {
-  user_id: 39,            // 目标用户（sutoukeji005）
-  profile: 'heavy-cached',// 数据源池：heavy-cached / cached / no-cache / mixed / all
-  // 时间区间（本地时区 +08:00）
+  user_id: 39,            // 目标用户
+  profile: 'heavy-cached',// 数据池：heavy-cached / cached / no-cache / mixed / all
   t0: '2026-07-01T00:00:00+08:00',
   t1: '2026-10-19T14:50:00+08:00',
-  // 强度曲线：月 -> 满强度比例（满强度=peak_per_day）
-  peak_per_day: 2110,
+  peak_per_day: 2110,     // 满强度日均单量
   ramp: { '2026-07': 0.10, '2026-08': 0.25, '2026-09': 0.50, '2026-10': 1.0 },
-  // 随机变量
   jitter_day: 0.10,       // 每日单量波动 ±10%
-  jitter_req: 0.05,       // 每笔 tokens 扰动 ±5%（prompt/cached 共享因子）
+  jitter_req: 0.05,       // 输入扰动幅度（100%-5% ~ 100%）
   weekend_factor: 0.8,    // 周末单量系数
   seed: 20261019,         // 随机种子（可复现）
-  // 其他
-  source_prefix: 'sim:',  // request_id 前缀（区分模拟数据）
-  ip_pool: '192.168.2.',  // 模拟 IP 段
-  mark: null,             // 幂等标记（默认自动）
+  source_prefix: 'sim:',
+  ip_pool: '192.168.2.',
+  mark: null,
 };
 // ==============================================================
 
@@ -55,7 +55,6 @@ if (profArg >= 0) CONFIG.profile = args[profArg + 1];
 const T0 = Date.parse(CONFIG.t0);
 const T1 = Date.parse(CONFIG.t1);
 
-// 重建数据源
 if (REBUILD) {
   console.log('→ 重建数据源库...');
   const { execSync } = require('node:child_process');
@@ -74,20 +73,33 @@ db.exec('PRAGMA busy_timeout=15000');
 const QPS = 500000;
 const MARK = CONFIG.mark || `sim_backfill_${CONFIG.user_id}_${new Date().toISOString().slice(0, 10).replace(/-/g, '')}`;
 
-// ===== 读数据源池 =====
-let pool;
-if (CONFIG.profile === 'all') {
-  pool = odb.prepare('SELECT * FROM sim_records').all();
-} else {
-  pool = odb.prepare('SELECT * FROM sim_records WHERE profile=?').all(CONFIG.profile);
+// ===== 读会话块 =====
+const blocks = CONFIG.profile === 'all'
+  ? odb.prepare('SELECT * FROM sim_blocks').all()
+  : odb.prepare('SELECT * FROM sim_blocks WHERE profile=?').all(CONFIG.profile);
+if (!blocks.length) { console.error(`❌ 池 '${CONFIG.profile}' 无块`); process.exit(1); }
+for (const b of blocks) b.recs = JSON.parse(b.recs);
+const totalRecs = blocks.reduce((s, b) => s + b.n, 0);
+console.log(`数据源池 '${CONFIG.profile}': ${blocks.length} 块 / ${totalRecs} 条`);
+
+// ===== 块大小分布（按记录数加权 → 长会话更多被抽到）=====
+const sizeBuckets = [[1, 1], [2, 2], [3, 5], [6, 15], [16, 10 ** 9]];
+const sizeDist = sizeBuckets.map(([lo, hi]) => ({
+  lo, hi,
+  w: blocks.filter(b => b.n >= lo && b.n <= hi).reduce((s, b) => s + b.n, 0) / totalRecs,
+})).filter(d => d.w > 0);
+
+// ===== 真实块间间隔（对数正态，从块内 gap 学）=====
+const allGaps = [];
+for (const b of blocks) for (const r of b.recs) if (r.gap > 0 && r.gap < 3600) allGaps.push(r.gap);
+allGaps.sort((a, b) => a - b);
+let gapMu = Math.log(15), gapSigma = 1.0;
+if (allGaps.length >= 10) {
+  const lg = allGaps.map(g => Math.log(g));
+  gapMu = lg.reduce((a, b) => a + b, 0) / lg.length;
+  gapSigma = Math.sqrt(lg.reduce((a, b) => a + (b - gapMu) ** 2, 0) / lg.length);
 }
-if (!pool.length) { console.error(`❌ 池 '${CONFIG.profile}' 无记录`); process.exit(1); }
-// 按模型分组
-const byModel = {};
-for (const r of pool) { (byModel[r.model_name] ||= []).push(r); }
-const modelDist = Object.entries(byModel).map(([m, a]) => ({ name: m, w: a.length / pool.length, pool: a }));
-console.log(`数据源池 '${CONFIG.profile}': ${pool.length} 条`);
-console.log('模型分布:', modelDist.map(d => `${d.name} ${(d.w * 100).toFixed(1)}%`).join(' / '));
+console.log(`块内间隔中位 ${allGaps[Math.floor(allGaps.length / 2)].toFixed(1)}s, 块间间隔拟合 logN(mu=${gapMu.toFixed(2)}, sigma=${gapSigma.toFixed(2)})`);
 
 // ===== PRNG =====
 function mulberry32(seed) {
@@ -99,18 +111,48 @@ function mulberry32(seed) {
   };
 }
 const rand = mulberry32(CONFIG.seed);
+function randn() {
+  let u = 0, v = 0; while (u === 0) u = rand(); while (v === 0) v = rand();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+function sampleGap() { return Math.max(2, Math.min(1800, Math.exp(gapMu + gapSigma * randn()))); }
 function weightedPick(items, r) { let s = 0; for (const it of items) { s += it.w; if (r < s) return it; } return items[items.length - 1]; }
-// 共享 jitter 因子：prompt 和 cached 用同一个，保证 cached≤prompt
-function genRecord() {
-  const md = weightedPick(modelDist, rand());
-  const rec = md.pool[Math.floor(rand() * md.pool.length)];
-  const f = 1 + (rand() * 2 - 1) * CONFIG.jitter_req; // 同一因子
-  const pin = Math.max(1, Math.round((rec.prompt_tokens || 0) * f));
-  const pc = Math.min(pin, Math.max(0, Math.round((rec.cached_tokens || 0) * f))); // ≤ prompt
-  const pout = Math.max(0, Math.round((rec.completion_tokens || 0) * (1 + (rand() * 2 - 1) * CONFIG.jitter_req)));
-  const quota = Math.max(0, Math.round((rec.quota || 0) * (1 + (rand() * 2 - 1) * CONFIG.jitter_req)));
-  const use_time = Math.max(0, (rec.use_time || 0) * (1 + (rand() * 2 - 1) * CONFIG.jitter_req)); // 秒，对齐真实
-  return { ...rec, pin, pc, pout, quota, use_time };
+function pickBlock() {
+  const sz = weightedPick(sizeDist, rand());
+  const cand = blocks.filter(b => b.n >= sz.lo && b.n <= sz.hi);
+  const wsum = cand.reduce((s, b) => s + b.n, 0);
+  let r = rand() * wsum;
+  for (const b of cand) { r -= b.n; if (r < 0) return b; }
+  return cand[cand.length - 1];
+}
+// 块内单条：输入 95-100%，缓存=输入×源命中率（真实），输出/耗时/费用 1% 内
+function genRec(rec) {
+  const srcHit = rec.pin > 0 ? rec.pc / rec.pin : 0;
+  const pin = Math.max(1, Math.round(rec.pin * (0.95 + rand() * 0.05)));
+  const pc = Math.min(pin, Math.round(pin * srcHit));
+  const pout = Math.max(0, Math.round(rec.pout * (0.99 + rand() * 0.01)));
+  const quota = Math.max(0, Math.round(rec.quota * (0.99 + rand() * 0.01)));
+  const use_time = Math.max(0, rec.ut * (0.99 + rand() * 0.01));
+  return { pin, pc, pout, quota, use_time };
+}
+
+// ===== 生成一天（按块拼装，块内原始间隔，块间真实间隔）=====
+// 块内采样：长块按 (15/n) 概率抽条 → 每块贡献期望~15条，长会话不会霸屏；短块全取
+function genDay(day, dayEnd, targetN) {
+  const out = [];
+  let t = day.getTime() + Math.floor(rand() * 3600000); // 从当天随机小时开始
+  while (t < dayEnd && out.length < targetN) {
+    const b = pickBlock();
+    const p = Math.min(1, 15 / b.n); // 块内采样概率
+    for (let i = 0; i < b.recs.length && t < dayEnd && out.length < targetN; i++) {
+      if (rand() > p) continue;
+      const rec = b.recs[i];
+      out.push({ t: Math.floor(t), rec, model: b.model_name, cid: b.channel_id, cname: b.channel_name });
+      t += (rec.gap || 2) * 1000;
+    }
+    t += sampleGap() * 1000; // 块间间隔
+  }
+  return out;
 }
 
 // ===== 天数计划 =====
@@ -121,33 +163,34 @@ for (let d = new Date(T0); d.getTime() <= T1; d.setDate(d.getDate() + 1)) {
   const dow = d.getDay();
   const wf = (dow === 0 || dow === 6) ? CONFIG.weekend_factor : 1.0;
   const dj = 1 + (rand() * 2 - 1) * CONFIG.jitter_day;
-  days.push({ date: new Date(d), n: Math.max(0, Math.round(CONFIG.peak_per_day * ramp * wf * dj)), month: key });
+  const n = Math.max(0, Math.round(CONFIG.peak_per_day * ramp * wf * dj));
+  days.push({ date: new Date(d), month: key, items: genDay(d, Math.min(d.getTime() + 86400000, T1), n) });
 }
-days[days.length - 1].n = Math.round(days[days.length - 1].n * ((T1 % 86400000) / 86400000 || 0.5));
-const totalN = days.reduce((s, d) => s + d.n, 0);
-console.log(`\n计划: ${days.length} 天, ${totalN} 单`);
+const totalN = days.reduce((s, d) => s + d.items.length, 0);
+console.log(`\n计划: ${days.length} 天`);
 for (const m of Object.keys(CONFIG.ramp).sort()) {
-  const n = days.filter(x => x.month === m).reduce((s, x) => s + x.n, 0);
+  const n = days.filter(x => x.month === m).reduce((s, x) => s + x.items.length, 0);
   console.log(`  ${m}: ${n} 单 (${(n / totalN * 100).toFixed(1)}%)`);
 }
-
-// ===== 预估 =====
-let estCost = 0, estUT = 0;
-for (let i = 0; i < 2000; i++) { const g = genRecord(); estCost += g.quota; estUT += g.use_time; }
-const avgCost = estCost / 2000, avgUT = estUT / 2000;
-console.log(`\n预估: 均$${(avgCost / QPS).toFixed(6)}/单 × ${totalN} = $${(avgCost * totalN / QPS).toFixed(2)}, 均耗时 ${avgUT.toFixed(1)}s`);
+const estQuota = days[days.length - 1].items.reduce((s, x) => s + x.rec.quota, 0) / Math.max(1, days[days.length - 1].items.length);
+console.log(`预估: 均$${(estQuota / QPS).toFixed(6)}/单 × ${totalN} ≈ $${(estQuota * totalN / QPS).toFixed(2)}`);
 
 // ===== DRY-RUN =====
 if (!APPLY) {
-  console.log('\n=== 30 条样本（use_time 单位=秒, cached≤prompt）===');
-  for (let i = 0; i < 30; i++) {
-    const day = days[Math.floor(rand() * days.length)];
-    const g = genRecord();
-    const h = g.hour ?? 12;
-    const ts = new Date(day.date); ts.setHours(h, Math.floor(rand() * 60), Math.floor(rand() * 60), 0);
-    const ratio = g.pin ? (g.pc / g.pin * 100) : 0;
-    console.log(`  ${ts.toISOString().slice(5, 19)} ${g.model_name.padEnd(20)} ${String(g.channel_name).padEnd(14)} in=${String(g.pin).padStart(7)} cached=${String(g.pc).padStart(7)}(${ratio.toFixed(0)}%) out=${g.pout} use=${g.use_time.toFixed(1)}s $${(g.quota / QPS).toFixed(5)}`);
+  const mid = days[Math.floor(days.length / 2)];
+  console.log(`\n=== 时间序列样本（${mid.month} 中段，显示块边界 ◆）===`);
+  let lastBlock = null;
+  const shown = mid.items.slice(0, 40);
+  for (const it of shown) {
+    const g = genRec(it.rec);
+    const t = new Date(it.t);
+    const local = `${t.getMonth() + 1}-${String(t.getDate()).padStart(2, '0')} ${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}:${String(t.getSeconds()).padStart(2, '0')}`;
+    const hit = g.pin ? (g.pc / g.pin * 100) : 0;
+    const bmark = (it !== shown[0] && it.rec !== lastBlock) ? ' ◆' : '';
+    lastBlock = it.rec;
+    console.log(`  ${local} ${it.model.slice(0, 18).padEnd(18)} ${String(it.cname).slice(0, 12).padEnd(12)} in=${String(g.pin).padStart(7)} cached=${String(g.pc).padStart(7)}(${hit.toFixed(0)}%) out=${g.pout} use=${g.use_time.toFixed(1)}s $${(g.quota / QPS).toFixed(5)}${bmark}`);
   }
+  console.log('\n◆ = 新会话块开始（块内连续，块间随机间隔）');
   console.log('\n(dry-run, 加 --apply 写库)');
   odb.close(); db.close();
   process.exit(0);
@@ -156,11 +199,9 @@ if (!APPLY) {
 // ===== APPLY =====
 const done = db.prepare('SELECT value FROM settings WHERE key=?').get(MARK);
 if (done) { console.error(`❌ 已执行过 (${MARK}=${done.value})`); process.exit(1); }
-
 const target = db.prepare('SELECT id,username,inviter_id FROM users WHERE id=?').get(CONFIG.user_id);
 if (!target) { console.error('❌ 目标用户不存在'); process.exit(1); }
 
-// 返佣链
 const upline = [];
 let cur = target;
 while (cur && cur.inviter_id) {
@@ -175,7 +216,6 @@ const RATES = [
 
 const tStart = Date.now();
 db.exec('BEGIN IMMEDIATE');
-// 预编译
 const insMain = db.prepare(`INSERT INTO logs (user_id,username,token_id,token_name,model_name,channel_id,channel_name,
   prompt_tokens,completion_tokens,cached_tokens,total_tokens,quota,use_time,is_stream,ip,request_id,status,error,created_at,log_type,source)
   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
@@ -183,41 +223,32 @@ const insReward = db.prepare(`INSERT INTO logs (user_id,username,token_id,token_
   prompt_tokens,completion_tokens,cached_tokens,total_tokens,quota,use_time,is_stream,ip,request_id,status,error,created_at,log_type,source)
   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
 
-let nLogs = 0, nReward = 0, totalQuota = 0, over100 = 0;
+let nLogs = 0, nReward = 0, totalQuota = 0;
 const rewardDelta = {}, chDelta = {};
-
 try {
   for (const day of days) {
-    for (let i = 0; i < day.n; i++) {
-      const g = genRecord();
-      if (g.pc > g.pin) { g.pc = g.pin; over100++; }
-      const h = g.hour ?? 12;
-      const ts = new Date(day.date); ts.setHours(h, Math.floor(rand() * 60), Math.floor(rand() * 60), 0);
-      const created_at = ts.getTime();
-      if (created_at > T1) continue;
+    for (const it of day.items) {
+      const g = genRec(it.rec);
       const rid = CONFIG.source_prefix + crypto.randomBytes(8).toString('hex');
       const ip = CONFIG.ip_pool + (10 + Math.floor(rand() * 200));
       const tot = g.pin + g.pout + g.pc;
-
-      insMain.run(CONFIG.user_id, target.username, 0, '', g.model_name, g.channel_id || 0, g.channel_name || '',
-        g.pin, g.pout, g.pc, tot, g.quota, g.use_time, 0, ip, rid, 'success', '', created_at, 'consume', 'sim');
+      insMain.run(CONFIG.user_id, target.username, 0, '', it.model, it.cid || 0, it.cname || '',
+        g.pin, g.pout, g.pc, tot, g.quota, g.use_time, 0, ip, rid, 'success', '', it.t, 'consume', 'sim');
       nLogs++; totalQuota += g.quota;
-      if (g.channel_id) chDelta[g.channel_id] = (chDelta[g.channel_id] || 0) + g.quota;
-
+      if (it.cid) chDelta[it.cid] = (chDelta[it.cid] || 0) + g.quota;
       for (let li = 0; li < upline.length && li < 3; li++) {
         const rate = RATES[li];
         if (!rate || rate <= 0) continue;
         const rw = Math.floor(g.quota * rate);
         if (rw <= 0) continue;
-        insReward.run(upline[li].id, 'agent-reward-L' + (li + 1), 0, '返佣L' + (li + 1), g.model_name, 0, '',
-          g.pin, g.pout, g.pc, tot, -rw, g.use_time, 0, ip, 'invite:' + rid, 'success', '', created_at, 'consume', 'sim');
+        insReward.run(upline[li].id, 'agent-reward-L' + (li + 1), 0, '返佣L' + (li + 1), it.model, 0, '',
+          g.pin, g.pout, g.pc, tot, -rw, g.use_time, 0, ip, 'invite:' + rid, 'success', '', it.t, 'consume', 'sim');
         nReward++;
         const rd = rewardDelta[upline[li].id] || (rewardDelta[upline[li].id] = { name: upline[li].username, ir: 0, l: [0, 0, 0] });
         rd.ir += rw; rd.l[li] += rw;
       }
     }
   }
-
   db.prepare('UPDATE users SET quota = quota - ?, used_quota = used_quota + ?, request_count = request_count + ? WHERE id=?')
     .run(totalQuota, totalQuota, nLogs, CONFIG.user_id);
   for (const [uid, rd] of Object.entries(rewardDelta)) {
@@ -228,7 +259,7 @@ try {
   const bal = db.prepare('SELECT quota FROM users WHERE id=?').get(CONFIG.user_id).quota;
   db.prepare(`INSERT INTO wallet_ledger (user_id,username,delta,balance_after,kind,detail,op_user_id,op_username,op_role,request_id,created_at)
     VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(CONFIG.user_id, target.username, -totalQuota, bal, 'adjust',
-    `模拟历史回填 共${nLogs}单 消费$${(totalQuota / QPS).toFixed(4)} [${CONFIG.profile}]`, 0, 'system', '系统', 'sim-backfill:' + CONFIG.user_id + ':' + Date.now(), Date.now());
+    `模拟历史回填(会话块) 共${nLogs}单 消费$${(totalQuota / QPS).toFixed(4)} [${CONFIG.profile}]`, 0, 'system', '系统', 'sim-backfill:' + CONFIG.user_id + ':' + Date.now(), Date.now());
   for (const [uid, rd] of Object.entries(rewardDelta)) {
     const rb = db.prepare('SELECT quota FROM users WHERE id=?').get(uid).quota;
     db.prepare(`INSERT INTO wallet_ledger (user_id,username,delta,balance_after,kind,detail,op_user_id,op_username,op_role,request_id,created_at)
@@ -238,7 +269,7 @@ try {
   db.prepare('INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)').run(MARK, 'done');
   db.exec('COMMIT');
   const dt = (Date.now() - tStart) / 1000;
-  console.log(`\n✅ 完成 (${dt.toFixed(1)}s): ${nLogs} 主行 + ${nReward} 返佣行, cached>prompt 已钳制 ${over100} 条`);
+  console.log(`\n✅ 完成 (${dt.toFixed(1)}s): ${nLogs} 主行 + ${nReward} 返佣行`);
   console.log(`   消费 $${(totalQuota / QPS).toFixed(4)}`);
   for (const [uid, rd] of Object.entries(rewardDelta)) console.log(`   返佣 #${uid} ${rd.name}: +$${(rd.ir / QPS).toFixed(4)}`);
   console.log(`   渠道:`, Object.entries(chDelta).map(([id, d]) => `#${id}+$${(d / QPS).toFixed(2)}`).join(' '));
