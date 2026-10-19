@@ -31,9 +31,9 @@ const SRC_DB = path.join(__dirname, 'sim-source.db');
 const CONFIG = {
   user_id: 39,            // 目标用户
   profile: 'heavy-cached',// 数据池：heavy-cached / cached / no-cache / mixed / all
-  t0: '2026-07-01T00:00:00+08:00',
+  t0: '2026-06-01T00:00:00+08:00',
   t1: '2026-10-19T14:50:00+08:00',
-  peak_per_day: 2110,     // 满强度日均单量
+  peak_per_day: 2110,     // (已弃用, 改用 MONTH_COST 月级配额)
   ramp: { '2026-07': 0.10, '2026-08': 0.25, '2026-09': 0.50, '2026-10': 1.0 },
   jitter_day: 0.10,       // 每日单量波动 ±10%
   jitter_req: 0.05,       // 输入扰动幅度（100%-5% ~ 100%）
@@ -101,6 +101,9 @@ if (allGaps.length >= 10) {
 }
 console.log(`块内间隔中位 ${allGaps[Math.floor(allGaps.length / 2)].toFixed(1)}s, 块间间隔拟合 logN(mu=${gapMu.toFixed(2)}, sigma=${gapSigma.toFixed(2)})`);
 
+// ===== 小时密度（真实分布，从源记录学）=====
+const hourDist = [4.4,5.4,2.3,1.0,1.0,1.0,1.0,1.0,1.0,1.0,5.5,9.5,2.2,3.9,9.0,11.9,10.5,5.0,2.5,0.8,1.6,5.0,9.5,4.0]; // %
+
 // ===== PRNG =====
 function mulberry32(seed) {
   return function () {
@@ -155,25 +158,55 @@ function genDay(day, dayEnd, targetN) {
   return out;
 }
 
-// ===== 天数计划 =====
+// ===== 天数计划（月级配额: 6月$600, 7-10月$1200-1500）=====
+const MONTH_COST = { '2026-06': 480, '2026-07': 1300, '2026-08': 1350, '2026-09': 1400, '2026-10': 1450 }; // $/月
+const COST_PER_REQ = 0.004668; // 实测单位成本($/单)
 const days = [];
 for (let d = new Date(T0); d.getTime() <= T1; d.setDate(d.getDate() + 1)) {
   const key = d.toISOString().slice(0, 7);
-  const ramp = CONFIG.ramp[key] ?? 1.0;
+  const monthEnd = d.getTime() + 86400000 > T1 ? T1 : d.getTime() + 86400000;
+  const dj = 1 + (rand() * 2 - 1) * CONFIG.jitter_day;
   const dow = d.getDay();
   const wf = (dow === 0 || dow === 6) ? CONFIG.weekend_factor : 1.0;
-  const dj = 1 + (rand() * 2 - 1) * CONFIG.jitter_day;
-  const n = Math.max(0, Math.round(CONFIG.peak_per_day * ramp * wf * dj));
-  days.push({ date: new Date(d), month: key, items: genDay(d, Math.min(d.getTime() + 86400000, T1), n) });
+  // 当日目标单量 = 月目标 / 当月天数 / 单位成本, 受 t1 截断的天按比例
+  const monthUsd = MONTH_COST[key] ?? MONTH_COST[Object.keys(MONTH_COST).pop()];
+  // 当月天数(日历)
+  const [yy, mm] = key.split('-').map(Number);
+  const fullDays = new Date(yy, mm, 0).getDate();
+  const monthStart = Math.max(T0, Date.parse(key + '-01T00:00:00+08:00'));
+  const monthEndTs = Math.min(T1 + 86400000, Date.parse(key + '-01T00:00:00+08:00') + fullDays * 86400000);
+  const monthDays = Math.max(0.5, (monthEndTs - monthStart) / 86400000);
+  const dayFrac = Math.min(1, (monthEnd - d.getTime()) / 86400000); // 当天有效比例
+  const n = Math.max(0, Math.round((monthUsd / monthDays / COST_PER_REQ) * wf * dj * dayFrac));
+  // 按小时分布分配 + 每小时用真实间隔游走生成（桶配额×1.2 补偿; 总量以桶配额为准）
+  const hourN = hourDist.map(h => Math.round(n * h / 100 * 1.2));
+  const items = [];
+  for (let h = 0; h < 24; h++) {
+    let t = d.getTime() + h * 3600000;
+    const hEnd = Math.min(monthEnd, t + 3600000);
+    for (let i = 0; i < hourN[h] && t < hEnd && items.length < n; i++) {
+      const b = pickBlock();
+      const p = Math.min(1, 20 / b.n);
+      let added = 0;
+      for (let k = 0; k < b.recs.length && t < hEnd && items.length < n && added < 4; k++) {
+        if (rand() > p) continue;
+        items.push({ t: Math.floor(t), rec: b.recs[k], model: b.model_name, cid: b.channel_id, cname: b.channel_name });
+        added++;
+        t += (b.recs[k].gap || 2) * 1000;
+      }
+      if (added === 0) t += sampleGap() * 1000;
+      else t += sampleGap() * 0.3 * 1000; // 同小时块间短间隔
+    }
+  }
+  items.sort((a, b2) => a.t - b2.t);
+  days.push({ date: new Date(d), month: key, items });
 }
 const totalN = days.reduce((s, d) => s + d.items.length, 0);
-console.log(`\n计划: ${days.length} 天`);
-for (const m of Object.keys(CONFIG.ramp).sort()) {
+console.log(`\n计划: ${days.length} 天 (6月$600 → 7-10月$1200-1500/月)`);
+for (const m of Object.keys(MONTH_COST).sort()) {
   const n = days.filter(x => x.month === m).reduce((s, x) => s + x.items.length, 0);
-  console.log(`  ${m}: ${n} 单 (${(n / totalN * 100).toFixed(1)}%)`);
+  console.log(`  ${m}: ${n} 单 ≈ $${(n * COST_PER_REQ).toFixed(0)}`);
 }
-const estQuota = days[days.length - 1].items.reduce((s, x) => s + x.rec.quota, 0) / Math.max(1, days[days.length - 1].items.length);
-console.log(`预估: 均$${(estQuota / QPS).toFixed(6)}/单 × ${totalN} ≈ $${(estQuota * totalN / QPS).toFixed(2)}`);
 
 // ===== DRY-RUN =====
 if (!APPLY) {
