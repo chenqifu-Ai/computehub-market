@@ -230,6 +230,27 @@ sudo systemctl restart computehub-api
 > 💡 改价走 `POST /api/pricing/update`，内部 `billing.setPrice()` 写盘 `pricing.json` 并**热重载内存表**，不用重启服务。
 > ⚠️ 手改 `pricing.json` 文件则需 `systemctl restart computehub-api` 才生效（启动时读盘）。
 
+### 🚨 未定价模型告警（防静默亏损）
+
+模型目录页顶部**自动比对**「在售模型」与「已定价模型」：
+
+- 任何在售但**无显式定价**的模型 → 走 `default` 价 → **红色告警条 + 模型行标红闪烁「未定价」**
+- 点「仅看未定价」一键筛出，逐个改价
+- 接口：`GET /api/pricing` 返回 `alert: {unpriced_count, unpriced[], default}`
+
+> 背景：新增上游渠道/模型后若不及时定价，会**静默按默认价计费造成亏损**（例：啊翀 9 个模型漏定价 → 单渠道单日净亏 $22.26）。
+> 硬性建议：**新增渠道后立即为全部模型定价**，红标清零再收工。
+
+### 🧪 上游缓存价校准工具
+
+`scripts/calibrate-cache-price.py` —— 对指定上游渠道发长 prompt 逼出真实缓存命中，从上游用量接口反推 `cached` 单价并与本地对比（可 `--apply` 写回）：
+
+```bash
+python3 scripts/calibrate-cache-price.py --channel 8                     # 仅预览
+python3 scripts/calibrate-cache-price.py --channel 8 --apply --mark 1.02 # 写回
+```
+凭据从环境变量 `SUB2_EMAIL`/`SUB2_PASS` 或本地（不入库）`.sub2-credentials.json` 读取。
+
 ### 🖥️ 渠道管理（控制台 UI）
 
 渠道页支持：

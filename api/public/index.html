@@ -123,6 +123,7 @@
 
     <!-- 模型目录 -->
     <section class="page hidden" id="page-models">
+      <div id="pricingAlert" class="alert-banner hidden"></div>
       <div class="panel">
         <div class="panel-head">
           <h3>可用模型 <span class="badge" id="modelCount">-</span></h3>
@@ -132,6 +133,7 @@
           <thead><tr><th>模型名</th><th>渠道数</th><th>输入 $/1M</th><th>补全 $/1M</th><th>缓存 $/1M</th><th>定价</th><th class="admin-only">操作</th></tr></thead>
           <tbody id="modelBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
         </table>
+        <p class="muted" style="margin:8px 0 0;font-size:12px" id="unpricedNote"></p>
       </div>
       <div class="panel admin-only">
         <div class="panel-head">

@@ -376,17 +376,44 @@ async function loadModels() {
   if (p.success && p.default && $('defaultPrice')) {
     $('defaultPrice').textContent = `（默认 $${fmtPrice(p.default.input)} / $${fmtPrice(p.default.output)}）`;
   }
+  renderPricingAlert(p);
   renderModels(allModels);
+}
+// 未定价告警条：在售模型走了 default = 静默亏损风险
+function renderPricingAlert(p) {
+  const box = $('pricingAlert');
+  if (!box) return;
+  const al = (p && p.alert) || {};
+  const n = al.unpriced_count || 0;
+  if (!n) {
+    box.classList.add('hidden');
+    box.innerHTML = '';
+  } else {
+    const d = al.default || {};
+    const names = (al.unpriced || []);
+    const shown = names.slice(0, 8).map(x => `<span class="mono">${esc(x)}</span>`).join(' ');
+    const more = names.length > 8 ? ` …等 ${names.length} 个` : '';
+    box.classList.remove('hidden');
+    box.innerHTML = `⚠️ <b>${n} 个在售模型未定价</b>，正按默认价 <span class="mono">$${fmtPrice(d.input)}/$${fmtPrice(d.output)}</span> 计费，可能<b>静默亏损</b>。` +
+      `<span style="flex:1"></span>${IS_ADMIN ? `<button class="btn-ghost sm" onclick="filterUnpriced()">仅看未定价</button>` : ''}` +
+      `<div style="width:100%;margin-top:6px;font-size:12px;opacity:.9">${shown}${more}</div>`;
+  }
+  const note = $('unpricedNote');
+  if (note) note.innerHTML = n ? `🔴 标红模型 = 未定价（走默认价）` : '';
+}
+function filterUnpriced() {
+  if ($('modelSearch')) $('modelSearch').value = '';
+  renderModels(allModels.filter(x => !x.priced));
 }
 function renderModels(list) {
   const col = IS_ADMIN ? 7 : 6;
   $('modelBody').innerHTML = list.length ? list.map(x => `
-    <tr><td class="mono">${esc(x.name)}</td><td>${x.channels || 1}</td>
+    <tr${!x.priced ? ' style="background:rgba(232,84,84,.07)"' : ''}><td class="mono">${esc(x.name)}</td><td>${x.channels || 1}</td>
     <td class="mono">$${fmtPrice(x.input)}</td><td class="mono">$${fmtPrice(x.output)}</td>
     <td class="mono">$${fmtPrice(x.cached)}</td>
     <td>${x.priced
       ? (x.peak ? `<span class="tag warn" title="高峰 ${(x.peak.windows||[]).map(w=>w.join('-')).join('/')} ×${x.peak.multiplier}（Asia/Shanghai）">时段 ×${x.peak.multiplier}${x.peak_now > 1 ? ' 生效中' : ''}</span>` : '<span class="tag on">已定价</span>')
-      : '<span class="tag warn" title="未显式定价，走默认价">默认价</span>'}</td>
+      : '<span class="tag danger blink" title="未显式定价，走默认价 → 有亏损风险">未定价</span>'}</td>
     ${IS_ADMIN ? `<td class="actions">
         <button class="btn-ghost sm" onclick='editPrice(${JSON.stringify(x.name)},${x.input},${x.output},${x.cached ?? 'undefined'},${JSON.stringify(x.peak || null)})'>改价</button>
         ${x.priced ? `<button class="btn-ghost sm btn-danger" onclick="delPrice('${esc(x.name)}')">去定价</button>` : ''}

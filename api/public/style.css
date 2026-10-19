@@ -93,6 +93,14 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
 .tag.off{background:rgba(232,84,84,.12);border-color:rgba(232,84,84,.35);color:#f08a8a}
 .tag.warn{background:rgba(245,166,35,.13);border-color:rgba(245,166,35,.35);color:#f7c46c}
 .tag.admin{background:rgba(124,92,255,.15);border-color:rgba(124,92,255,.4);color:#b9a6ff}
+.tag.danger{background:rgba(232,84,84,.18);border-color:rgba(232,84,84,.5);color:#ff9a9a;font-weight:600}
+.tag.blink{animation:pulseDanger 1.4s ease-in-out infinite}
+@keyframes pulseDanger{0%,100%{opacity:1}50%{opacity:.45}}
+.alert-banner{display:flex;align-items:center;gap:10px;padding:10px 14px;margin:0 0 12px;border-radius:10px;font-size:13px;line-height:1.5;
+  background:rgba(232,84,84,.12);border:1px solid rgba(232,84,84,.45);color:#ffb3b3}
+.alert-banner.warn{background:rgba(245,166,35,.12);border-color:rgba(245,166,35,.45);color:#f7c46c}
+.alert-banner b{color:#fff}
+.alert-banner .mono{background:rgba(0,0,0,.25);padding:1px 6px;border-radius:5px}
 .search{background:var(--panel2);border:1px solid var(--border);border-radius:9px;color:var(--txt);padding:9px 13px;font-size:13px;width:230px;font-family:inherit}
 .search:focus{outline:none;border-color:var(--accent)}
 .pager{display:flex;align-items:center;gap:12px;margin-top:14px;justify-content:flex-end}

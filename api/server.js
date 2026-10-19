@@ -440,7 +440,10 @@ const server = http.createServer(async (req, res) => {
         return { ...x, input: p.input, output: p.output, cached: p.cached, peak: p.peak,
                  peak_now: billing.peakMultiplier(x.model), priced: billing.isPriced(x.model) };
       });
-      return json(res, 200, { success: true, data: list, default: billing.DEFAULT });
+      // 未定价告警：在售但走 default 的模型（静默亏损风险）
+      const unpriced = list.filter(x => !x.priced).map(x => x.model);
+      return json(res, 200, { success: true, data: list, default: billing.DEFAULT,
+        alert: { unpriced_count: unpriced.length, unpriced, default: billing.DEFAULT } });
     }
     // 改价（仅管理员）：{model, input, output, cached?, peak?} → 落盘 pricing.json + 热重载
     if (pathname === '/api/pricing/update' && req.method === 'POST') {
