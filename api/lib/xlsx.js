@@ -384,6 +384,7 @@ module.exports = { build, buildStream, sheetXmlStream, read, unzip, esc, crc32 }
 
 // ============================================================
 // 分片流式导出 buildChunked: 明细 > 10 万行时按 chunkSize 行/sheet 分片
+// 两遍扫描：遍1 只数行数（不物化 XML，内存 O(1)，给进度用）；遍2 物化+发送
 // 内存 O(单块); rowGen 只能消费一次; 200 万行实测 ~115s
 // ============================================================
 const _fsC = require('node:fs');
@@ -464,15 +465,42 @@ const _STY_C = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<styleS
  * @param {Array} [summarySheets] 前置汇总 [{ name, rows, colWidths?, freezeHeader? }]
  * @returns {Generator<Buffer>}   依次 yield Buffer 片段
  */
+const _EMPTY = Buffer.alloc(0);
+// 进度信号（非 Buffer，由 server 拦截写入 X-Xlsx-Progress 头；前端据此渲染进度条）
+// { rowsDone, chunksTotal, chunksSent }
+function _PROGRESS(rowsDone, chunksTotal, chunksSent) { return { __xlsxProgress: true, rowsDone, chunksTotal, chunksSent }; }
+
 function* buildChunked(header, rowGen, chunkSize, prefix, summarySheets) {
   chunkSize = chunkSize || 50000;
   prefix = prefix || '明细';
   summarySheets = summarySheets || [];
   const dir = _fsC.mkdtempSync(_pathC.join(_osC.tmpdir(), 'xlsx-chunk-'));
+  try { // wrap: 提前中断也清理临时目录
+  // 阶段0：快速数行数（不物化 XML），前端据此显示进度条
+  let totalRows = 0;
+  {
+    // rowGen 兼容：数组/生成器/生成器函数。遍1 物化到内存数组（预读模式）或快速计数
+    const _rows = (Array.isArray(rowGen)) ? rowGen : null;
+    if (_rows) {
+      totalRows = _rows.length;
+    } else {
+      const _src = (typeof rowGen === 'function') ? rowGen() : rowGen;
+      const it0 = _src[Symbol.iterator]();
+      for (let n0 = it0.next(); !n0.done; n0 = it0.next()) {
+        totalRows++;
+        if (totalRows % 20000 === 0) yield _EMPTY;
+      }
+    }
+  }
+  const totalChunks = Math.max(1, Math.ceil(totalRows / chunkSize));
+  yield _PROGRESS(0, totalChunks, 0);
+  // 阶段1：物化 chunk 到磁盘（数组模式=内存已有，纯 XML 拼装）
+  const _arrMode = Array.isArray(rowGen);
+  rowGen = _arrMode ? rowGen : ((typeof rowGen === 'function') ? rowGen() : rowGen);
   let rowCount = 0;
   let chunkIdx = 0;
   const chunkFiles = [];
-  const it = rowGen[Symbol.iterator]();
+  const it = _arrMode ? rowGen[Symbol.iterator]() : rowGen[Symbol.iterator]();
   const XOPEN = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>';
 
   while (true) {
@@ -488,11 +516,14 @@ function* buildChunked(header, rowGen, chunkSize, prefix, summarySheets) {
       r++;
       count++;
       rowCount++;
+      // 每 5000 行强制让出事件循环（防单块内 20000 次同步 DB 读取冻结全站）
+      if (count % 5000 === 0) { yield _EMPTY; }
       n0 = it.next();
     }
     buf += '</sheetData></worksheet>';
     _fsC.writeFileSync(fpath, buf);
     chunkFiles.push(fpath);
+    yield _EMPTY; // 阶段1让出事件循环，防大导出冻结全站
     if (n0.done) break;
   }
 
@@ -516,6 +547,7 @@ function* buildChunked(header, rowGen, chunkSize, prefix, summarySheets) {
     cds.push(e.cd, e.nameBuf);
     offset += e.entryLen;
     bytes += e.entryLen;
+    yield _PROGRESS(totalRows, totalChunks, 0); // 阶段2开始：已生成全部明细
   }
 
   for (let i = 0; i < chunkFiles.length; i++) {
@@ -528,6 +560,7 @@ function* buildChunked(header, rowGen, chunkSize, prefix, summarySheets) {
     offset += e.entryLen;
     bytes += e.entryLen;
     _fsC.unlinkSync(chunkFiles[i]);
+    yield _PROGRESS(rowCount, totalChunks, i + 1); // 阶段2：每发完一片报进度
   }
 
   const statics = [
@@ -557,8 +590,10 @@ function* buildChunked(header, rowGen, chunkSize, prefix, summarySheets) {
   yield cdBuf;
   yield eocd;
   bytes += cdBuf.length + 22;
-  try { _fsC.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
   return { rowCount: rowCount, sheetCount: totalSheets, bytes: bytes };
+  } finally {
+    try { _fsC.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
+  }
 }
 
 module.exports.buildChunked = buildChunked;

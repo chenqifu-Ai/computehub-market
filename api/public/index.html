@@ -163,7 +163,7 @@
           </div>
         </div>
         <table class="tbl">
-          <thead><tr><th>时间</th><th>模型</th><th>令牌</th><th>渠道</th><th>输入</th><th>缓存读</th><th>未命中</th><th>命中率</th><th>输出</th><th>耗时</th><th>消费</th><th>状态</th></tr></thead>
+          <thead id="logHead"><tr><th>时间</th><th>模型</th><th>令牌</th><th>输入</th><th>缓存读</th><th>未命中</th><th>命中率</th><th>输出</th><th>耗时</th><th>消费</th><th>状态</th></tr></thead>
           <tbody id="logBody"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
         </table>
         <div class="pager"><button class="btn-ghost sm" id="logPrev">上一页</button><span id="logPage" class="muted"></span><button class="btn-ghost sm" id="logNext">下一页</button></div>
@@ -660,6 +660,8 @@ console.log(r.choices[0].message.content);</pre>
 </div>
 
 <div id="toast" class="toast hidden"></div>
+<div id="dlProgress" class="toast hidden" style="top:auto;bottom:24px;width:min(520px,90vw)">  <div id="dlText" style="margin-bottom:8px">正在生成文件…</div>
+  <div style="height:8px;background:var(--panel2,#222);border-radius:4px;overflow:hidden"><div id="dlBar" style="height:100%;width:0%;background:var(--accent,#4a9);border-radius:4px;transition:width .3s"></div></div></div>
 <div id="modal" class="modal hidden"><div class="modal-box" id="modalBox"></div></div>
 <script src="/app.js"></script>
 </body>

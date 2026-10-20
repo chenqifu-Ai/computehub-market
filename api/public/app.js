@@ -488,6 +488,15 @@ $('modelSearch').oninput = e => {
 };
 
 // ---------- 日志 ----------
+// 渠道列仅管理员可见（权限加固：渠道数据不暴露给代理及以下）
+(function initLogHead() {
+  const th = $('logHead') && $('logHead').querySelector('tr');
+  if (th && IS_ADMIN) {
+    const cell = document.createElement('th');
+    cell.textContent = '渠道';
+    th.insertBefore(cell, th.children[3]);  // 令牌之后
+  }
+})();
 async function loadLogs(p) {
   logPage = p;
   const j = await api(`/api/log/self?p=${p}&size=${LOG_SIZE}`);
@@ -500,7 +509,7 @@ async function loadLogs(p) {
       <td>${fmtTime(l.created_at)}</td>
       <td class="mono">${esc(l.model_name)}</td>
       <td>${esc(l.token_name)}</td>
-      <td>${esc(l.channel_name)}</td>
+      ${IS_ADMIN ? `<td>${esc(l.channel_name)}</td>` : ''}
       <td>${fmtTok(l.prompt_tokens)}</td>
       <td>${l.cached_tokens ? `<span title="命中 ${l.cached_tokens} / 输入 ${l.prompt_tokens}">${fmtTok(l.cached_tokens)}</span>` : '<span class="muted">—</span>'}</td>
       <td>${l.prompt_tokens ? fmtTok(l.prompt_tokens - (l.cached_tokens || 0)) : '<span class="muted">—</span>'}</td>
@@ -525,9 +534,9 @@ $('logPrev').onclick = () => loadLogs(Math.max(1, logPage - 1));
 $('logNext').onclick = () => loadLogs(logPage + 1);
 $('btnExportLogs').onclick = () => {
   if (!lastLogs.length) return toast('当前页无数据', 'err');
-  const head = ['时间', '模型', '令牌', '渠道', '输入tok', '缓存读tok', '未命中tok', '命中率', '输出tok', '总tok', '耗时s', 'quota', '状态'];
+  const head = ['时间', '模型', '令牌', ...(IS_ADMIN ? ['渠道'] : []), '输入tok', '缓存读tok', '未命中tok', '命中率', '输出tok', '总tok', '耗时s', 'quota', '状态'];
   const rows = lastLogs.map(l => [
-    fmtTsCsv(l.created_at), l.model_name, l.token_name, l.channel_name,
+    fmtTsCsv(l.created_at), l.model_name, l.token_name, ...(IS_ADMIN ? [l.channel_name] : []),
     l.prompt_tokens, l.cached_tokens || 0, (l.prompt_tokens || 0) - (l.cached_tokens || 0),
     l.prompt_tokens ? Math.round((l.cached_tokens || 0) / l.prompt_tokens * 100) + '%' : '',
     l.completion_tokens, l.total_tokens, l.use_time, l.quota, l.status,
@@ -543,30 +552,109 @@ $('btnExportLogs').onclick = () => {
 
 // 服务端生成 xlsx（双 sheet：明细 + 按模型汇总）
 function downloadXlsx(all) {
-  // fetch 下载以携带鉴权头（<a href> 无法带 Authorization）
-  downloadAuthed(`/api/log/export${all ? '?all=1' : ''}`, all ? '正在导出全站用量…' : '正在导出使用日志…');
+  // 异步导出：提交任务 → 轮询状态 → 完成后下载文件
+  const url = `/api/log/export${all ? '?all=1' : ''}&limit=2000000`;
+  api(url, { method: 'GET' }).then(j => {
+    if (!j.success) return toast(j.message || '导出失败', 'err');
+    const job = j.job;
+    toast('导出任务已启动，后台生成中（不影响页面操作）…');
+    const timer = setInterval(async () => {
+      try {
+        const r = await fetch(`/api/log/export/job?job=${job}`, { headers: { Authorization: SCHEME + SESSION } });
+        const ct = r.headers.get('content-type') || '';
+        if (ct.includes('json')) {
+          const s = await r.json();
+          if (s.status === 'running') return; // 继续轮询
+          if (s.status === 'error') { clearInterval(timer); return toast('导出失败：' + s.error, 'err'); }
+          // 任务已完成，触发下载
+          clearInterval(timer);
+          await downloadAuthed(`/api/log/export/job?job=${job}`, '正在下载导出文件…');
+        } else {
+          // content-type 是 xlsx = 已完成，downloadAuthed 会处理 blob
+          clearInterval(timer);
+          await downloadAuthed(`/api/log/export/job?job=${job}`, '正在下载导出文件…');
+        }
+      } catch (e) { /* 网络抖动，继续轮询 */ }
+    }, 3000);
+  }).catch(e => toast('导出提交失败：' + e.message, 'err'));
 }
-// 带鉴权下载：用 fetch 取 blob 再触发保存，文件名从 Content-Disposition 解析
+// 带鉴权下载：用 fetch 流式读（边下边显示进度，不全攒内存），文件名从 Content-Disposition 解析
 async function downloadAuthed(url, tip) {
   toast(tip || '正在导出…');
+  const box = $("dlProgress");
+  const bar = $("dlBar");
+  const txt = $("dlText");
+  const show = (t) => { if (txt) txt.textContent = t; if (box) box.classList.remove('hidden'); };
+  const hide = () => { if (box) box.classList.add('hidden'); };
   try {
     const r = await fetch(url, { headers: SESSION ? { Authorization: SCHEME + SESSION } : {} });
     if (!r.ok) {
       const e = await r.json().catch(() => ({}));
+      hide();
       return toast('导出失败：' + (e.message || r.status), 'err');
     }
     const cd = r.headers.get('content-disposition') || '';
     let fname = 'export.xlsx';
     const m = cd.match(/filename\*=UTF-8''([^;]+)/i) || cd.match(/filename="?([^";]+)"?/i);
     if (m) { try { fname = decodeURIComponent(m[1]); } catch { fname = m[1]; } }
-    const blob = await r.blob();
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = fname;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-    toast('已导出：' + fname);
-  } catch (e) { toast('导出失败：' + e.message, 'err'); }
+    // 进度来源：服务端 X-Xlsx-Progress 头（生成/发送阶段）+ 下载字节数
+    const total = Number(r.headers.get('content-length')) || 0;
+    let got = 0;
+    let pRows = 0, pCTotal = 0, pCSent = 0;
+    const paint = () => {
+      const elapsed = (performance.now() / 1000).toFixed(0);
+      let line, pct;
+      if (pCTotal > 0) {
+        // 服务端已知总片数：发送阶段精确，生成阶段显示片数
+        const sentPct = pCSent / pCTotal;
+        pct = 0.5 * sentPct; // 生成占 50%，发送占 50%（粗略，体验优先）
+        line = pCSent > 0 ? '正在下载 ' + (pCSent + 0) + '/' + pCTotal + ' 片 · ' + (got / 1024 / 1024).toFixed(1) + 'MB · 已用 ' + elapsed + 's'
+                          : '正在生成文件… ' + pRows + ' 行 / ' + pCTotal + ' 片 · 已用 ' + elapsed + 's';
+        if (total) pct = Math.max(pct, 0.5 + 0.5 * got / total);
+      } else if (total) {
+        pct = got / total;
+        line = '正在下载 ' + (got / 1024 / 1024).toFixed(1) + ' / ' + (total / 1024 / 1024).toFixed(1) + 'MB · 已用 ' + elapsed + 's';
+      } else {
+        pct = null;
+        line = '正在生成文件… ' + (got / 1024 / 1024).toFixed(1) + 'MB · 已用 ' + elapsed + 's（数据量大请耐心等待，请勿关闭页面）';
+      }
+      show(line);
+      if (bar) bar.style.width = (pct != null ? Math.min(99, pct * 100) : 6) + '%';
+    };
+    if (!r.body) { // 老浏览器不支持流式读取，退回 blob
+      const blob = await r.blob();
+      hide();
+      return saveBlob(blob, fname);
+    }
+    show('正在生成文件…');
+    const reader = r.body.getReader();
+    const chunks = [];
+    let totalBytes = 0;
+    let lastPaint = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      totalBytes += value.length;
+      got += value.length;
+      const hp = r.headers.get('x-xlsx-progress');
+      if (hp) { try { const p = JSON.parse(hp); pRows = p.rowsDone || 0; pCTotal = p.chunksTotal || 0; pCSent = p.chunksSent || 0; } catch {} }
+      const now = Date.now();
+      if (now - lastPaint > 300) { lastPaint = now; paint(); }
+    }
+    // 拼装（blob 内存占用不可避免，但下载过程有进度反馈；拼装仅几十ms）
+    const blob = new Blob(chunks, { type: 'application/octet-stream' });
+    hide();
+    saveBlob(blob, fname);
+  } catch (e) { hide(); toast('导出失败：' + e.message, 'err'); }
+}
+function saveBlob(blob, fname) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = fname;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  toast('已导出：' + fname);
 }
 $('btnExportXlsx').onclick = () => downloadXlsx(false);
 if ($('btnExportAll')) $('btnExportAll').onclick = () => downloadXlsx(true);

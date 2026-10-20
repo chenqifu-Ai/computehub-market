@@ -23,6 +23,8 @@ const PORT = parseInt(process.env.PORT || '58880', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'api.db');
 const PUBLIC_DIR = path.join(__dirname, 'public');
+// 导出任务表（内存，重启即清空；文件保留在 logs/exports/）
+const _exportJobs = new Map();
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // 1 美元基准 quota（New-API 惯例 500000 = $1）
 const QUOTA_PER_USD = 500000;
@@ -427,6 +429,35 @@ const server = http.createServer(async (req, res) => {
       }
       const limit = Math.min(parseInt(query.get('limit') || '0', 10) || 500000, 2000000); // 明细行数硬上限，防全站冻结/OOM
       return exportUsageXlsx(res, { userId, since, until, all, admin: isAdmin, limit });
+    }
+    // 导出任务状态/下载（异步导出模式）
+    if (pathname === '/api/log/export/job') {
+      const u = requireUser(req, res); if (!u) return;
+      const j = _exportJobs.get(query.get('job') || '');
+      if (!j) return json(res, 404, { success: false, message: '任务不存在或已过期' });
+      if (j.status === 'running') return json(res, 200, { success: true, status: 'running', started: j.started });
+      if (j.status === 'error') return json(res, 200, { success: true, status: 'error', error: j.error });
+      // done → 下载文件
+      res.writeHead(200, {
+        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'Content-Disposition': `attachment; filename="${j.fname}"`,
+        'Content-Length': j.size,
+        'Cache-Control': 'no-store',
+      });
+      const st = fs.createReadStream(j.file);
+      st.on('error', (e) => { if (!res.headersSent) json(res, 500, { success: false, message: e.message }); else res.destroy(); });
+      st.pipe(res);
+      res.on('close', () => { // 下载完成/中断后延迟清理文件（任务记录保留 24h）
+        setTimeout(() => { fs.unlink(j.file, () => {}); }, 3600000);
+      });
+      return;
+    }
+    if (pathname === '/api/log/export/jobs') {
+      const u = requireUser(req, res); if (!u) return;
+      const list = [];
+      for (const [k, j] of _exportJobs) list.push({ job: k, ...j, size: j.file ? (j.size || 0) : 0 });
+      list.sort((a, b) => b.started - a.started);
+      return json(res, 200, { success: true, data: list.slice(0, 20) });
     }
 
     // 结算清单导出（xlsx，管理员：全部或指定用户；普通用户：自己）
@@ -911,67 +942,118 @@ function typeLabel(l) {
 }
 
 function exportUsageXlsx(res, { userId, since, until = 0, all, admin = false, limit = 500000 }) {
-  const xlsx = require('./lib/xlsx');
-  const t0 = Date.now();
-  const summary = store.exportSummary(db, { userId, since, until });
-
-
-  const sum = [
-    ['用户', '用户ID', '令牌名称', '令牌ID', '模型', '请求次数', '输入token数', '输出token数', '总token数', '消费金额'],
-  ];
-  let tReq = 0, tIn = 0, tOut = 0, tTok = 0, tQ = 0;
-  for (const s of summary) {
-    sum.push([
-      s.username, String(s.user_id), s.token_name || '-', String(s.token_id || ''),
-      s.model_name, s.req_count, s.prompt_tokens, s.completion_tokens,
-      s.total_tokens, fmtYuan(s.quota),
-    ]);
-    tReq += s.req_count; tIn += s.prompt_tokens; tOut += s.completion_tokens; tTok += s.total_tokens; tQ += s.quota;
-  }
-  sum.push(['合计', '', '', '', '', tReq, tIn, tOut, tTok, fmtYuan(tQ)]);
-
-  const header = ['时间', '类型', '用户', '用户ID', '令牌名称', '模型', '输入token数', '缓存读token数', '未命中token数', '命中率', '输出token数', '花费金额', '用时(秒)', '流式'];
-  function* dataRows() {
-    let n = 0;
-    for (const l of store.exportLogsIter(db, { userId, since, until, limit, wide: admin })) {
-      if (n >= limit) break;   // 双保险：生成器层再截一次
-      n++;
-      const ca = l.cached_tokens || 0;
-      yield [
-        fmtTs(l.created_at),
-        typeLabel(l),
-        l.username,
-        String(l.user_id),
-        l.token_name || '',
-        l.model_name || '',
-        l.prompt_tokens, ca, Math.max(0, (l.prompt_tokens || 0) - ca),
-        l.prompt_tokens ? Math.round(ca / l.prompt_tokens * 100) + '%' : '',
-        l.completion_tokens,
-        fmtYuan(l.quota),
-        Math.round(l.use_time || 0),
-        l.is_stream ? '是' : '否',
+  // 【死锁修复 2026-10-21 最终版】导出是重操作（全站 95 万行要 100s+），
+  // 主线程同步执行会阻塞所有其他请求（relay/登录/页面全卡）。
+  // 改为：响应立即 202 返回 + 后台异步入盘，下载链接见 /api/log/export/job。
+  // 前端下载按钮改为轮询任务状态。
+  const jobKey = crypto.randomBytes(8).toString('hex');
+  const outFile = path.join(__dirname, 'logs', 'exports', jobKey + '.xlsx');
+  fs.mkdirSync(path.join(__dirname, 'logs', 'exports'), { recursive: true });
+  _exportJobs.set(jobKey, { status: 'running', user: 'admin', started: Date.now() });
+  // 后台异步执行，不阻塞事件循环
+  setImmediate(async () => {
+    try {
+      const xlsx = require('./lib/xlsx');
+      const t0 = Date.now();
+      const summary = store.exportSummary(db, { userId, since, until });
+      const sum = [
+        ['用户', '用户ID', '令牌名称', '令牌ID', '模型', '请求次数', '输入token数', '输出token数', '总token数', '消费金额'],
       ];
+      let tReq = 0, tIn = 0, tOut = 0, tTok = 0, tQ = 0;
+      for (const s of summary) {
+        sum.push([s.username, String(s.user_id), s.token_name || '-', String(s.token_id || ''), s.model_name, s.req_count, s.prompt_tokens, s.completion_tokens, s.total_tokens, fmtYuan(s.quota)]);
+        tReq += s.req_count; tIn += s.prompt_tokens; tOut += s.completion_tokens; tTok += s.total_tokens; tQ += s.quota;
+      }
+      sum.push(['合计', '', '', '', '', tReq, tIn, tOut, tTok, fmtYuan(tQ)]);
+      const header = ['时间', '类型', '用户', '用户ID', '令牌名称', '模型', '输入token数', '缓存读token数', '未命中token数', '命中率', '输出token数', '花费金额', '用时(秒)', '流式'];
+      const _tRead = Date.now();
+      // 【分批预读】每 2 万行暂停一拍，让事件循环处理 HTTP；同时释放 DB 读锁间隙
+      const rowsPre = [];
+      {
+        let n = 0;
+        const it = store.exportLogsIter(db, { userId, since, until, limit, wide: admin });
+        for (let l = it.next(); !l.done; l = it.next()) {
+          if (n >= limit) break;
+          n++;
+          const row = l.value;
+          const ca = row.cached_tokens || 0;
+          rowsPre.push([fmtTs(row.created_at), typeLabel(row), row.username, String(row.user_id), row.token_name || '', row.model_name || '', row.prompt_tokens, ca, Math.max(0, (row.prompt_tokens || 0) - ca), row.prompt_tokens ? Math.round(ca / row.prompt_tokens * 100) + '%' : '', row.completion_tokens, fmtYuan(row.quota), Math.round(row.use_time || 0), row.is_stream ? '是' : '否']);
+          if (n % 20000 === 0) await new Promise(r => setImmediate(r));
+        }
+      }
+      console.log(`[export] job=${jobKey} 预读 ${rowsPre.length} 行 / ${Date.now() - _tRead}ms（DB读锁已释放）`);
+      const d = new Date();
+      const stamp = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+      const fname = `${all ? 'all' : 'usage'}-logs-${stamp}.xlsx`;
+      // 【CPU 密集任务隔离到子进程】XML 拼装+crc32+deflate 不卡主进程事件循环
+      // worker 协议见 lib/xlsx-worker.js；行数据分批(5000行/批)通过 stdin 传入
+      const { spawn } = require('node:child_process');
+      const wp = path.join(__dirname, 'lib', 'xlsx-worker.js');
+      const child = spawn(process.execPath, [wp, outFile], { stdio: ['pipe', 'pipe', 'inherit'] });
+      let wBuf = '';
+      child.stdout.on('data', (d) => {
+        wBuf += d.toString('utf8');
+        let i;
+        while ((i = wBuf.indexOf('\n')) >= 0) {
+          const line = wBuf.slice(0, i); wBuf = wBuf.slice(i + 1);
+          if (!line.trim()) continue;
+          let m; try { m = JSON.parse(line); } catch { continue; }
+          if (m.t === 'progress') { _exportJobs.get(jobKey).progress = m; }
+          if (m.t === 'error') { wErr = m.message; }
+        }
+      });
+      let wErr = null;
+      const wDone = new Promise((resolve) => {
+        child.on('close', (code) => { if (code !== 0 && !wErr) wErr = 'worker exit ' + code; resolve(); });
+      });
+      child.stdin.write(JSON.stringify({ t: 'init', header, chunkSize: 50000, prefix: all ? '全部明细' : '使用日志', summarySheets: [{ name: '按模型汇总', rows: sum, colWidths: [14, 9, 16, 9, 24, 10, 13, 13, 13, 13], freezeHeader: true }] }) + '\n');
+      const BATCH = 5000;
+      for (let i = 0; i < rowsPre.length; i += BATCH) {
+        child.stdin.write(JSON.stringify({ t: 'rows', rows: rowsPre.slice(i, i + BATCH) }) + '\n');
+        if (!child.stdin.writable) { wErr = 'worker stdin broken'; break; }
+        if (i % 50000 === 0 && i > 0) await new Promise(r => setImmediate(r)); // 发送间隙让出事件循环
+      }
+      rowsPre.length = 0; // 及时释放父进程内存
+      child.stdin.end(JSON.stringify({ t: 'end' }) + '\n');
+      await wDone;
+      if (wErr) throw new Error(wErr);
+      _exportJobs.set(jobKey, { status: 'done', file: outFile, fname, size: fs.statSync(outFile).size, started: _exportJobs.get(jobKey)?.started || t0, finished: Date.now() });
+      console.log(`[export] job=${jobKey} 完成: ${fs.statSync(outFile).size / 1024 / 1024 | 0}MB / ${rowsPre.length} 行 / ${Date.now() - t0}s → ${outFile}`);
+      // 清理旧任务（保留最近 10 个文件）
+      try {
+        const files = fs.readdirSync(path.dirname(outFile)).filter(f => f.endsWith('.xlsx')).map(f => ({ f, m: fs.statSync(path.join(path.dirname(outFile), f)).mtimeMs })).sort((a, b) => b.m - a.m);
+        for (const old of files.slice(10)) fs.unlink(path.join(path.dirname(outFile), old.f), () => {});
+      } catch {}
+    } catch (e) {
+      console.error(`[export] job=${jobKey} 失败:`, e.message);
+      _exportJobs.set(jobKey, { status: 'error', error: e.message });
     }
-  }
-
-  const d = new Date();
-  const stamp = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
-  const fname = `${all ? 'all' : 'usage'}-logs-${stamp}.xlsx`;
-  res.writeHead(200, {
-    'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    'Content-Disposition': `attachment; filename="${fname}"`,
-    'Cache-Control': 'no-store',
-    'Access-Control-Allow-Origin': '*',
+    // 任务记录保留 24h 供下载（文件单独按 mtime 清理）
+    setTimeout(() => { const j = _exportJobs.get(jobKey); if (j && j.status !== 'done') _exportJobs.delete(jobKey); }, 86400000);
   });
-  // 分片流式：内存 O(块)，百万行不 OOM
-  const gen = xlsx.buildChunked(header, dataRows(), 50000, all ? '全部明细' : '使用日志',
-    [{ name: '按模型汇总', rows: sum, colWidths: [14, 9, 16, 9, 24, 10, 13, 13, 13, 13], freezeHeader: true }]);
-  let sent = 0;
-  for (const chunk of gen) {
-    res.write(chunk); sent += chunk.length;
-  }
-  res.end();
-  console.log(`[export] ${all ? 'ALL' : 'uid'} xlsx 分片流式: ${sent / 1024 / 1024 | 0}MB / ${summary.length} 行汇总 / ${(Date.now() - t0) / 1000 | 0}s`);
+  // 立即返回 202 + 任务 key，前端轮询
+  return json(res, 202, { success: true, async: true, job: jobKey, message: '导出任务已启动，稍后可在下载中心获取' });
+}
+
+/** 异步文件生成：后台把 Buffer 写入 logs/exports/ 并登记任务，立即 202 返回；前端轮询 /api/log/export/job 下载 */
+function asyncXlsxJob(res, { build, fname, logPrefix }) {
+  const jobKey = crypto.randomBytes(8).toString('hex');
+  const outDir = path.join(__dirname, 'logs', 'exports');
+  fs.mkdirSync(outDir, { recursive: true });
+  const outFile = path.join(outDir, jobKey + '.xlsx');
+  _exportJobs.set(jobKey, { status: 'running', started: Date.now() });
+  setImmediate(() => {
+    try {
+      const buf = build(); // 同步生成（重活，但此时导出 job 互斥概率低；settle 本身也秒级）
+      fs.writeFileSync(outFile, buf);
+      _exportJobs.set(jobKey, { status: 'done', file: outFile, fname, size: buf.length, started: _exportJobs.get(jobKey).started, finished: Date.now() });
+      console.log(`${logPrefix} 完成: ${buf.length / 1024 / 1024 | 0}MB → ${outFile}`);
+    } catch (e) {
+      console.error(`${logPrefix} 失败:`, e.message);
+      _exportJobs.set(jobKey, { status: 'error', error: e.message });
+    }
+  });
+  return json(res, 202, { success: true, async: true, job: jobKey, message: '生成任务已启动' });
 }
 
 /** 结算清单导出：target = 'all' 或 用户ID 字符串 */
@@ -1124,10 +1206,10 @@ function exportSettleXlsx(res, { target, since, until = 0, limit = 500000 }) {
     ]);
     sheets.push({ name: nm, rows, colWidths: [19,24,24,11,11,11,13,7], freezeHeader: true });
   }
-  const buf = xlsx.build(sheets);
   const fname = `结算清单_全部用户_${stamp}.xlsx`;
-  return sendXlsx(res, buf, fname, `[settle] ALL ${users.length} 用户`);
+  return asyncXlsxJob(res, { build: () => xlsx.build(sheets), fname, logPrefix: `[settle] ALL ${users.length} 用户` });
 }
+function _settleStamp() { const d = new Date(); return `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`; }
 
 /** 代理结算导出：每个代理一行（团队人数/团队消费/各级返佣）+ 每代理一个明细 sheet */
 function exportAgentSettleXlsx(res, { since = 0, until = 0 } = {}) {
@@ -1193,10 +1275,7 @@ function exportAgentSettleXlsx(res, { since = 0, until = 0 } = {}) {
     used.add(s.name);
   }
   const sheets = [{ name: '代理结算总表', rows: master, colWidths: [8,16,14,6,9,10,14,14,14,14,14,14,14], freezeHeader: true }, ...detailSheets.slice(0, 30)];
-  const buf = xlsx.build(sheets);
-  const d = new Date();
-  const stamp = `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
-  return sendXlsx(res, buf, `代理结算清单_${stamp}.xlsx`, `[settle] agents=${agents.length}`);
+  return asyncXlsxJob(res, { build: () => xlsx.build(sheets), fname: `代理结算清单_${_settleStamp()}.xlsx`, logPrefix: `[settle] agents=${agents.length}` });
 }
 
 function sendXlsx(res, buf, fname, logMsg) {
