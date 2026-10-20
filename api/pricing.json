@@ -34,9 +34,9 @@
     "cached": 0.27945
   },
   "doubao-seed-2.0-pro": {
-    "input": 0.39347,
-    "output": 1.96734,
-    "cached": 0.07869
+    "input": 0.44717,
+    "output": 2.23564,
+    "cached": 0.08943
   },
   "doubao-seed-2.1-pro": {
     "input": 0.73775,
@@ -46,7 +46,7 @@
   "kimi-k3": {
     "input": 2.79455,
     "output": 13.97262,
-    "cached": 0.05589
+    "cached": 0.27945
   },
   "Qwen3.8-27B": {
     "input": 0.3,
