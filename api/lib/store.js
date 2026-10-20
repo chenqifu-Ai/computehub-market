@@ -276,8 +276,23 @@ function publicUser(db, u) {
     invite_reward: u.invite_reward || 0,
     agent_level: u.agent_level || 0,
     agent_name: u.agent_name || '',
-    agent_channel_id: u.agent_channel_id || 0,
+    agent_channel_id: u.role >= 100 ? (u.agent_channel_id || 0) : 0,   // 渠道指派仅管理员可见
     remark: u.remark,
+    created_at: u.created_at,
+  };
+}
+// 公开用户视图（不暴露 role / 渠道指派 / 邀请码等敏感字段），供代理及下级接口使用
+function publicUserPublic(u) {
+  return {
+    id: u.id,
+    username: u.username,
+    display_name: u.display_name,
+    quota: u.quota,
+    used_quota: u.used_quota,
+    request_count: u.request_count,
+    status: u.status,
+    agent_level: u.agent_level || 0,
+    agent_name: u.agent_name || '',
     created_at: u.created_at,
   };
 }
@@ -476,6 +491,11 @@ function listChannels(db, withKey = true) {
   return rows.map(c => withKey ? c : { ...c, api_key: maskKey(c.api_key) });
 }
 function listChannelsRaw(db) { return db.prepare('SELECT * FROM channels ORDER BY priority DESC, id ASC').all(); }
+// 安全视图：隐藏 base_url（含 IP/端口）与 api_key，供非管理员接口使用
+function publicChannelView(c) {
+  const { base_url, api_key, ...rest } = c;
+  return { ...rest, api_key: maskKey(c.api_key || ''), base_url_masked: true };
+}
 function getChannel(db, id) { return db.prepare('SELECT * FROM channels WHERE id=?').get(id) || null; }
 function addChannelUsage(db, id, quota) {
   db.prepare('UPDATE channels SET used_quota = used_quota + ? WHERE id=?').run(quota, id);
@@ -583,7 +603,7 @@ function exportLogs(db, { userId, since = 0, until = 0, limit = 0 } = {}) {
   return db.prepare(`SELECT * FROM logs ${where} ORDER BY created_at DESC${lim}`).all(...v);
 }
 // 流式导出：sqlite 原生 iterate()，百万行不占内存
-function* exportLogsIter(db, { userId, since = 0, until = 0, limit = 0 } = {}) {
+function* exportLogsIter(db, { userId, since = 0, until = 0, limit = 0, wide = false } = {}) {
   const cond = [], v = [];
   if (userId) { cond.push('user_id=?'); v.push(userId); }
   if (since) { cond.push('created_at>=?'); v.push(since); }
@@ -591,13 +611,18 @@ function* exportLogsIter(db, { userId, since = 0, until = 0, limit = 0 } = {}) {
   cond.push('log_type=?'); v.push('consume');
   const where = cond.length ? ('WHERE ' + cond.join(' AND ')) : '';
   const lim = limit ? ` LIMIT ${parseInt(limit, 10)}` : '';
-  const rs = db.prepare(`SELECT * FROM logs ${where} ORDER BY created_at DESC${lim}`).iterate(...v);
+  // 明细列：wide=true（管理员）加 渠道/IP/error 三列；否则窄列
+  const COLS = wide
+    ? 'id,user_id,username,token_id,token_name,channel_name,model_name,prompt_tokens,completion_tokens,total_tokens,quota,use_time,is_stream,status,error,ip,created_at,log_type'
+    : 'id,user_id,username,token_id,token_name,model_name,prompt_tokens,completion_tokens,total_tokens,quota,use_time,is_stream,status,error,created_at,log_type';
+  const rs = db.prepare(`SELECT ${COLS} FROM logs ${where} ORDER BY created_at DESC${lim}`).iterate(...v);
   try { yield* rs; } finally { rs.close?.(); }
 }
-function exportSummary(db, { userId, since = 0 } = {}) {
+function exportSummary(db, { userId, since = 0, until = 0 } = {}) {
   const cond = []; const v = [];
   if (userId) { cond.push('user_id=?'); v.push(userId); }
   cond.push('created_at>=?'); v.push(since);
+  if (until) { cond.push('created_at<=?'); v.push(until); }
   return db.prepare(`
     SELECT user_id, username, token_id, token_name, model_name,
            COUNT(*) AS req_count,
@@ -746,7 +771,7 @@ function listDownline(db, userId, { maxDepth = 5, since = 0 } = {}) {
   const out = [];
   const walk = (pid, depth) => {
     if (depth > maxDepth) return;
-    const kids = db.prepare('SELECT id,username,display_name,agent_level,agent_name,quota,used_quota,request_count,status,created_at FROM users WHERE inviter_id=? ORDER BY id').all(pid);
+    const kids = db.prepare('SELECT id,username,display_name,agent_level,agent_name, CASE WHEN role>=100 THEN agent_channel_id ELSE 0 END AS agent_channel_id, quota,used_quota,request_count,status,created_at FROM users WHERE inviter_id=? ORDER BY id').all(pid);
     for (const k of kids) {
       const agg = db.prepare(`SELECT COUNT(*) c, COALESCE(SUM(quota),0) q FROM logs WHERE user_id=? AND request_id NOT LIKE 'invite:%'${since ? ' AND created_at>=?' : ''}`)
         .get(...(since ? [k.id, since] : [k.id]));
@@ -867,6 +892,7 @@ function subtreeOf(db, userId, maxDepth = 5) {
     const node = {
       id: u.id, username: u.username, agent_level: u.agent_level, agent_name: u.agent_name,
       quota: u.quota, used_quota: u.used_quota, request_count: u.request_count, status: u.status,
+      agent_channel_id: u.role >= 100 ? (u.agent_channel_id || 0) : 0,
       depth, children: [],
     };
     if (depth < maxDepth) {
@@ -916,11 +942,11 @@ function countLogs(db, userId) {
 module.exports = {
   open, migrate, seedChannels,
   hashPassword, verifyPassword,
-  getUserByName, getUserById, isAdmin, createUser, publicUser, setDisplayName, setUsername, bulkCreateUsers,
+  getUserByName, getUserById, isAdmin, createUser, publicUser, publicUserPublic, setDisplayName, setUsername, bulkCreateUsers,
   setPassword: setPasswordReal, touchLogin, addUserUsage, addUserQuota, transferQuota, userDashboard,
   createSession, getSession, deleteSession,
   createToken, getToken, getTokenByPlain, listTokens, updateToken, deleteToken, touchToken, addTokenUsage,
-  listChannels, listChannelsRaw, getChannel, channelsForModel, addChannelUsage,
+  listChannels, listChannelsRaw, getChannel, publicChannelView, channelsForModel, addChannelUsage,
   addChannel, updateChannel, deleteChannel, touchChannel,
   publicModelCatalog, pricingCatalog, maskKey,
   insertLog, listLogs, logStatsByModel, exportLogs, exportLogsIter, exportSummary,

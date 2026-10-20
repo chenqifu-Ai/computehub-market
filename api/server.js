@@ -395,13 +395,38 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { success: true, data: store.logStatsByModel(db, u.id) });
     }
     // 导出使用日志（xlsx 双 sheet：明细 + 按模型汇总）
+    // 按月导出: /api/log/export?user=all&since=2026-09&until=2026-10  （管理员，until 为开区间下月首日）
     if (pathname === '/api/log/export') {
       const u = requireUser(req, res); if (!u) return;
-      const all = query.get('all') === '1' && store.isAdmin(u);
-      const userId = all ? null : u.id;
-      const days = Math.min(parseInt(query.get('days') || '0', 10), 3650);
-      const since = days > 0 ? Date.now() - days * 86400000 : 0;
-      return exportUsageXlsx(res, { userId, since, all });
+      const isAdmin = store.isAdmin(u);
+      const all = query.get('all') === '1' && isAdmin;
+      let userId = all ? null : u.id;
+      // 管理员 ?user=<id|name> 指定用户导出
+      const userArg = query.get('user');
+      if (isAdmin && userArg && userArg !== 'all' && userArg !== 'me') {
+        const t = store.getUserByName(db, userArg) || (parseInt(userArg, 10) > 0 ? store.getUserById(db, parseInt(userArg, 10)) : null);
+        if (!t) return json(res, 404, { success: false, message: '用户不存在: ' + userArg });
+        userId = t.id;
+      }
+      // 时间窗: 优先 since/until（支持 YYYY-MM-DD 或 YYYY-MM），否则 days，都没有=全量
+      let since = 0, until = 0;
+      const sStr = query.get('since'), uStr = query.get('until');
+      const parseDay = (s) => {
+        const m = String(s).match(/^(\d{4})-(\d{2})(?:-(\d{2}))?/);
+        if (!m) return NaN;
+        return Date.UTC(+m[1], +m[2] - 1, m[3] ? +m[3] : 1);
+      };
+      if (sStr || uStr) {
+        const s = sStr ? parseDay(sStr) : 0, e2 = uStr ? parseDay(uStr) : 0;
+        if (isNaN(s) || isNaN(e2) || (s && e2 && s > e2)) return json(res, 400, { success: false, message: 'since/until 格式错误，支持 YYYY-MM-DD 或 YYYY-MM' });
+        since = s || 0;
+        until = e2 ? e2 - 1 : 0; // store 用 created_at<=until，转成闭区间
+      } else {
+        const days = Math.min(parseInt(query.get('days') || '0', 10), 3650);
+        if (days > 0) since = Date.now() - days * 86400000;
+      }
+      const limit = Math.min(parseInt(query.get('limit') || '0', 10) || 500000, 2000000); // 明细行数硬上限，防全站冻结/OOM
+      return exportUsageXlsx(res, { userId, since, until, all, admin: isAdmin, limit });
     }
 
     // 结算清单导出（xlsx，管理员：全部或指定用户；普通用户：自己）
@@ -885,10 +910,10 @@ function typeLabel(l) {
   return l.quota < 0 ? '返利' : '消费';
 }
 
-function exportUsageXlsx(res, { userId, since, all }) {
+function exportUsageXlsx(res, { userId, since, until = 0, all, admin = false, limit = 500000 }) {
   const xlsx = require('./lib/xlsx');
   const t0 = Date.now();
-  const summary = store.exportSummary(db, { userId, since });
+  const summary = store.exportSummary(db, { userId, since, until });
 
 
   const sum = [
@@ -907,7 +932,10 @@ function exportUsageXlsx(res, { userId, since, all }) {
 
   const header = ['时间', '类型', '用户', '用户ID', '令牌名称', '模型', '输入token数', '缓存读token数', '未命中token数', '命中率', '输出token数', '花费金额', '用时(秒)', '流式'];
   function* dataRows() {
-    for (const l of store.exportLogsIter(db, { userId, since })) {
+    let n = 0;
+    for (const l of store.exportLogsIter(db, { userId, since, until, limit, wide: admin })) {
+      if (n >= limit) break;   // 双保险：生成器层再截一次
+      n++;
       const ca = l.cached_tokens || 0;
       yield [
         fmtTs(l.created_at),
@@ -1003,7 +1031,10 @@ function exportSettleXlsx(res, { target, since, until = 0, limit = 500000 }) {
 
   if (target !== 'all') {
     const u = users[0];
-    const logs = store.exportLogs(db, { userId: u.id, since, until, limit });
+    // 单用户：流式分页迭代 + 行数上限（防 .all() 百万行炸内存冻结全站）
+    const cap = Math.min(Math.max(limit || 500000, 1), 2000000);
+    const logs = [];
+    for (const l of store.exportLogsIter(db, { userId: u.id, since, until, limit: cap, wide: true })) logs.push(l);
     const agg = aggOf(u.id);
     const rc = rcOf(u.id);
     const first = logs.length ? logs[logs.length-1].created_at : u.created_at;  // exportLogs 为 DESC
