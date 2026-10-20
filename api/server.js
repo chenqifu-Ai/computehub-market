@@ -488,12 +488,16 @@ const server = http.createServer(async (req, res) => {
       const u = requireUser(req, res); if (!u) return;
       const j = _exportJobs.get(query.get('job') || '');
       if (!j) return json(res, 404, { success: false, message: '任务不存在或已过期' });
-      if (j.status === 'running') return json(res, 200, { success: true, status: 'running', started: j.started });
+      // 【2026-10-21】补 progress：前端据此画进度条，之前漏传导致界面永远停在“提交中 0s”
+      if (j.status === 'running') return json(res, 200, { success: true, status: 'running', started: j.started, progress: j.progress || null, fname: j.fname || '' });
       if (j.status === 'error') return json(res, 200, { success: true, status: 'error', error: j.error });
       // done → 下载文件
+      // 【修复 2026-10-21】文件名含中文直接塞 header 会抛 ERR_INVALID_CHAR（下载 500），
+      // 必须用 RFC 5987 的 filename*=UTF-8'' 形式 + ASCII 降级名。
+      const asciiName = String(j.fname || 'export.xlsx').replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
       res.writeHead(200, {
         'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'Content-Disposition': `attachment; filename="${j.fname}"`,
+        'Content-Disposition': `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(String(j.fname || 'export.xlsx'))}`,
         'Content-Length': j.size,
         'Cache-Control': 'no-store',
       });
@@ -994,102 +998,80 @@ function typeLabel(l) {
   return l.quota < 0 ? '返利' : '消费';
 }
 
-function exportUsageXlsx(res, { userId, since, until = 0, all, admin = false, limit = 500000 }) {
-  // 【死锁修复 2026-10-21 最终版】导出是重操作（全站 95 万行要 100s+），
-  // 主线程同步执行会阻塞所有其他请求（relay/登录/页面全卡）。
-  // 改为：响应立即 202 返回 + 后台异步入盘，下载链接见 /api/log/export/job。
-  // 前端下载按钮改为轮询任务状态。
+/**
+ * 通用导出派发器（2026-10-21 重构）
+ * 旧版在**主进程**做 DB 流式读 + 汇总 SQL + 喂 worker，95.9 万行时主线程连续阻塞 55~62s，
+ * 期间 /api/* 全部无响应（前端一直转圈 = "又卡住了"）。
+ * 现在整条链路（只读 DB 连接 + 汇总 SQL + xlsx 拼装 + 落盘）都在 lib/export-worker.js 子进程里跑，
+ * 主进程只登记任务 + 透传进度 → 事件循环零阻塞，导出再大也不影响别人。
+ */
+function spawnExportJob(res, { mode, cfg, fname, message }) {
+  const { spawn } = require('node:child_process');
   const jobKey = crypto.randomBytes(8).toString('hex');
-  const outFile = path.join(__dirname, 'logs', 'exports', jobKey + '.xlsx');
-  fs.mkdirSync(path.join(__dirname, 'logs', 'exports'), { recursive: true });
-  _exportJobs.set(jobKey, { status: 'running', user: 'admin', started: Date.now() });
-  // 后台异步执行，不阻塞事件循环
-  setImmediate(async () => {
-    try {
-      const xlsx = require('./lib/xlsx');
-      const t0 = Date.now();
-      const summary = store.exportSummary(db, { userId, since, until });
-      const sum = [
-        ['用户', '用户ID', '令牌名称', '令牌ID', '模型', '请求次数', '输入token数', '输出token数', '总token数', '消费金额'],
-      ];
-      let tReq = 0, tIn = 0, tOut = 0, tTok = 0, tQ = 0;
-      for (const s of summary) {
-        sum.push([s.username, String(s.user_id), s.token_name || '-', String(s.token_id || ''), s.model_name, s.req_count, s.prompt_tokens, s.completion_tokens, s.total_tokens, fmtYuan(s.quota)]);
-        tReq += s.req_count; tIn += s.prompt_tokens; tOut += s.completion_tokens; tTok += s.total_tokens; tQ += s.quota;
-      }
-      sum.push(['合计', '', '', '', '', tReq, tIn, tOut, tTok, fmtYuan(tQ)]);
-      const header = ['时间', '类型', '用户', '用户ID', '令牌名称', '模型', '输入token数', '缓存读token数', '未命中token数', '命中率', '输出token数', '花费金额', '用时(秒)', '流式'];
-      // 【流式管道修复 2026-10-21 2】旧版把 50 万行×14列 全量预读到 rowsPre 数组驻留 1.8GB，
-      // GC 风暴 + worker stdin 背压链断裂 → 导出永远完不成、其它接口变慢。
-      // 改为：先起 worker，DB 边读边按 5000 行/批写 stdin；写前等 drain，内存恒定 ~2MB。
-      const d = new Date();
-      const stamp = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
-      const fname = `${all ? 'all' : 'usage'}-logs-${stamp}.xlsx`;
-      const { spawn } = require('node:child_process');
-      const wp = path.join(__dirname, 'lib', 'xlsx-worker.js');
-      const child = spawn(process.execPath, [wp, outFile], { stdio: ['pipe', 'pipe', 'inherit'] });
-      let wBuf = '';
-      child.stdout.on('data', (d) => {
-        wBuf += d.toString('utf8');
-        let i;
-        while ((i = wBuf.indexOf('\n')) >= 0) {
-          const line = wBuf.slice(0, i); wBuf = wBuf.slice(i + 1);
-          if (!line.trim()) continue;
-          let m; try { m = JSON.parse(line); } catch { continue; }
-          if (m.t === 'progress') { const j = _exportJobs.get(jobKey); if (j) j.progress = m; }
-          if (m.t === 'error') { wErr = m.message; }
-        }
-      });
-      let wErr = null;
-      const wDone = new Promise((resolve) => {
-        child.on('close', (code) => { if (code !== 0 && !wErr) wErr = 'worker exit ' + code; resolve(); });
-      });
-      child.stdin.write(JSON.stringify({ t: 'init', header, chunkSize: 50000, prefix: all ? '全部明细' : '使用日志', summarySheets: [{ name: '按模型汇总', rows: sum, colWidths: [14, 9, 16, 9, 24, 10, 13, 13, 13, 13], freezeHeader: true }] }) + '\n');
-      // DB 边读边喂 worker（背压安全）
-      const tRead = Date.now();
-      let n = 0;
-      const FLUSH = 5000;
-      let buf = [];
-      const it = store.exportLogsIter(db, { userId, since, until, limit, wide: admin });
-      for (let l = it.next(); !l.done; l = it.next()) {
-        if (wErr) break;
-        n++;
-        const row = l.value;
-        const ca = row.cached_tokens || 0;
-        buf.push([fmtTs(row.created_at), typeLabel(row), row.username, String(row.user_id), row.token_name || '', row.model_name || '', row.prompt_tokens, ca, Math.max(0, (row.prompt_tokens || 0) - ca), row.prompt_tokens ? Math.round(ca / row.prompt_tokens * 100) + '%' : '', row.completion_tokens, fmtYuan(row.quota), Math.round(row.use_time || 0), row.is_stream ? '是' : '否']);
-        if (buf.length >= FLUSH) {
-          const ok = child.stdin.write(JSON.stringify({ t: 'rows', rows: buf }) + '\n');
-          buf = [];
-          if (!ok) await new Promise(r => child.stdin.once('drain', r)); // 背压：worker 没消化完就等
-        }
-      }
-      if (buf.length) {
-        const ok = child.stdin.write(JSON.stringify({ t: 'rows', rows: buf }) + '\n');
-        if (!ok) await new Promise(r => child.stdin.once('drain', r));
-      }
-      console.log(`[export] job=${jobKey} 流式读取 ${n} 行 / ${Date.now() - tRead}ms（内存恒定，无预读驻留）`);
-      child.stdin.end(JSON.stringify({ t: 'end' }) + '\n');
-      await wDone;
-      if (wErr) throw new Error(wErr);
-      _exportJobs.set(jobKey, { status: 'done', file: outFile, fname, size: fs.statSync(outFile).size, started: _exportJobs.get(jobKey)?.started || t0, finished: Date.now() });
-      console.log(`[export] job=${jobKey} 完成: ${fs.statSync(outFile).size / 1024 / 1024 | 0}MB / ${n} 行 / ${Date.now() - t0}s → ${outFile}`);
-      // 清理旧任务（保留最近 10 个文件）
-      try {
-        const files = fs.readdirSync(path.dirname(outFile)).filter(f => f.endsWith('.xlsx')).map(f => ({ f, m: fs.statSync(path.join(path.dirname(outFile), f)).mtimeMs })).sort((a, b) => b.m - a.m);
-        for (const old of files.slice(10)) fs.unlink(path.join(path.dirname(outFile), old.f), () => {});
-      } catch {}
-    } catch (e) {
-      console.error(`[export] job=${jobKey} 失败:`, e.message);
-      _exportJobs.set(jobKey, { status: 'error', error: e.message });
+  const outDir = path.join(__dirname, 'logs', 'exports');
+  fs.mkdirSync(outDir, { recursive: true });
+  const outFile = path.join(outDir, jobKey + '.xlsx');
+  _exportJobs.set(jobKey, { status: 'running', started: Date.now(), fname, progress: null });
+  const t0 = Date.now();
+
+  const wp = path.join(__dirname, 'lib', 'export-worker.js');
+  const child = spawn(process.execPath, ['--no-warnings', wp, outFile, mode], { stdio: ['pipe', 'pipe', 'pipe'] });
+  let outBuf = '';
+  let errBuf = '';
+  let bytes = 0;
+
+  child.stdout.on('data', (d) => {
+    outBuf += d.toString('utf8');
+    let i;
+    while ((i = outBuf.indexOf('\n')) >= 0) {
+      const line = outBuf.slice(0, i); outBuf = outBuf.slice(i + 1);
+      if (!line.trim()) continue;
+      let m; try { m = JSON.parse(line); } catch { continue; }
+      if (m.t === 'progress') { const j = _exportJobs.get(jobKey); if (j) j.progress = { rows: m.rows || 0, chunks: m.chunks || 0, sent: m.sent || 0 }; }
+      else if (m.t === 'done') { bytes = m.bytes || 0; }
+      else if (m.t === 'error') { const j = _exportJobs.get(jobKey); if (j) j.error = String(m.message || '').split('\n')[0]; }
     }
-    // 任务记录保留 24h 供下载（文件单独按 mtime 清理）
-    setTimeout(() => { const j = _exportJobs.get(jobKey); if (j && j.status !== 'done') _exportJobs.delete(jobKey); }, 86400000);
   });
-  // 立即返回 202 + 任务 key，前端轮询
-  return json(res, 202, { success: true, async: true, job: jobKey, message: '导出任务已启动，稍后可在下载中心获取' });
+  child.stderr.on('data', (d) => { errBuf += d.toString('utf8'); if (errBuf.length > 4000) errBuf = errBuf.slice(-4000); });
+  child.on('error', (e) => {
+    console.error('[export] spawn 失败:', e.message);
+    _exportJobs.set(jobKey, { status: 'error', error: e.message, fname, started: t0 });
+  });
+  child.on('close', (code) => {
+    const j = _exportJobs.get(jobKey) || { fname, started: t0 };
+    if (j.status === 'error') return;
+    if (code !== 0 || !fs.existsSync(outFile)) {
+      const msg = (j.error || errBuf.trim().split('\n').pop() || ('worker exit ' + code));
+      console.error('[export] ' + mode + ' 失败 job=' + jobKey + ': ' + msg);
+      _exportJobs.set(jobKey, { status: 'error', error: msg, fname, started: t0 });
+      return;
+    }
+    const size = fs.statSync(outFile).size;
+    _exportJobs.set(jobKey, { status: 'done', file: outFile, fname, size: bytes || size, started: t0, finished: Date.now() });
+    console.log('[export] ' + mode + ' 完成 job=' + jobKey + ': ' + (size / 1024 / 1024 | 0) + 'MB / ' + (Date.now() - t0) + 'ms');
+    try {
+      const files = fs.readdirSync(outDir).filter(f => f.endsWith('.xlsx'))
+        .map(f => ({ f, m: fs.statSync(path.join(outDir, f)).mtimeMs })).sort((a, b) => b.m - a.m);
+      for (const old of files.slice(10)) fs.unlink(path.join(outDir, old.f), () => {});
+    } catch {}
+  });
+
+  child.stdin.end(JSON.stringify(cfg));
+  return json(res, 202, { success: true, async: true, job: jobKey, message });
 }
 
-/** 异步文件生成：后台把 Buffer 写入 logs/exports/ 并登记任务，立即 202 返回；前端轮询 /api/log/export/job 下载 */
+/** 使用日志导出（xlsx：明细分片 + 按模型汇总） */
+function exportUsageXlsx(res, { userId, since, until = 0, all, admin = false, limit = 500000 }) {
+  const d = new Date();
+  const stamp = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+  return spawnExportJob(res, {
+    mode: 'usage',
+    cfg: { dbPath: DB_PATH, userId: userId || null, since: since || 0, until: until || 0, limit, all: !!all, quotaPerUsd: QUOTA_PER_USD },
+    fname: `${all ? 'all' : 'usage'}-logs-${stamp}.xlsx`,
+    message: '导出任务已启动，稍后可在下载中心获取',
+  });
+}
+
 function asyncXlsxJob(res, { build, fname, logPrefix }) {
   const jobKey = crypto.randomBytes(8).toString('hex');
   const outDir = path.join(__dirname, 'logs', 'exports');
@@ -1111,158 +1093,36 @@ function asyncXlsxJob(res, { build, fname, logPrefix }) {
 }
 
 /** 结算清单导出：target = 'all' 或 用户ID 字符串 */
+/**
+ * 结算清单导出（xlsx）
+ *   target = 'all' → settle-all（总表 + 每用户 sheet）
+ *   target = 用户ID → settle-single（概要 + 按模型/按渠道/返佣 + 明细分片）
+ * 全部在子进程执行，主进程零阻塞。
+ */
 function exportSettleXlsx(res, { target, since, until = 0, limit = 500000 }) {
-  const xlsx = require('./lib/xlsx');
-  const TYPE = { consume: '消费', recharge: '充值', reward: '返利', system: '系统', admin: '管理' };
-  const usdS = q => '$' + ((q || 0) / QUOTA_PER_USD).toFixed(6);
-  // 范围条件（供 agg / 汇总用）
-  const rng = (uid) => {
-    const cond = ['user_id=?'], v = [uid];
-    if (since) { cond.push('created_at>=?'); v.push(since); }
-    if (until) { cond.push('created_at<=?'); v.push(until); }
-    return { where: cond.join(' AND '), v };
-  };
-  const aggSql = (uid) => {
-    const { where, v } = rng(uid);
-    return { sql: `SELECT COUNT(*) c,
-      SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) ok,
-      SUM(CASE WHEN status!='success' THEN 1 ELSE 0 END) err,
-      COALESCE(SUM(prompt_tokens),0) tin, COALESCE(SUM(completion_tokens),0) tout,
-      COALESCE(SUM(total_tokens),0) tok, COALESCE(SUM(quota),0) q
-    FROM logs WHERE ${where}`, v };
-  };
-  const aggOf = (uid) => { const a = aggSql(uid); return db.prepare(a.sql).get(...a.v); };
-  const rcOf = (uid) => {
-    const { where, v } = rng(uid);
-    return db.prepare(`SELECT COALESCE(SUM(quota),0) q FROM logs WHERE ${where} AND log_type='recharge'`).get(...v).q;
-  };
-
-  const users = target === 'all'
-    ? store.listUsers(db)
-    : [store.getUserById(db, parseInt(target, 10))].filter(Boolean);
-  if (!users.length) return json(res, 404, { success: false, message: '用户不存在' });
-
-  // 汇总总表
-  const master = [['用户ID','用户名','角色','状态','账期起','账期止','请求次数','成功','失败','输入token','输出token','总token','累计消费(USD)','累计充值(USD)','当前余额(USD)']];
-  let G={c:0,ok:0,err:0,tin:0,tout:0,tok:0,q:0,rc:0};
-
-  for (const u of users) {
-    const logs = store.exportLogs(db, { userId: u.id, since, until, limit: target === 'all' ? 20000 : limit });
-    const agg = aggOf(u.id);
-    const rc = rcOf(u.id);
-    const first = logs.length ? logs[logs.length-1].created_at : u.created_at;  // exportLogs 为 DESC
-    const last  = logs.length ? logs[0].created_at : u.created_at;
-    G.c+=agg.c; G.ok+=agg.ok||0; G.err+=agg.err||0; G.tin+=agg.tin; G.tout+=agg.tout; G.tok+=agg.tok; G.q+=agg.q; G.rc+=rc;
-    master.push([
-      String(u.id), u.username, u.role>=100?'管理员':'用户', u.status===1?'启用':'禁用',
-      fmtTs(first), fmtTs(last), agg.c, agg.ok||0, agg.err||0,
-      agg.tin, agg.tout, agg.tok, usdS(agg.q), usdS(rc), usdS(u.quota),
-    ]);
-  }
-  master.push(['合计','','','','','',G.c,G.ok,G.err,G.tin,G.tout,G.tok,usdS(G.q),usdS(G.rc),'']);
-
-  // 每人一份结算 sheet 的拼接方式：指定用户→多 sheet；全部→总表 + 每人一个 sheet（上限保护）
   const d = new Date();
-  const stamp = `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+  const stamp = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
 
   if (target !== 'all') {
-    const u = users[0];
-    // 单用户：流式分页迭代 + 行数上限（防 .all() 百万行炸内存冻结全站）
-    const cap = Math.min(Math.max(limit || 500000, 1), 2000000);
-    const logs = [];
-    for (const l of store.exportLogsIter(db, { userId: u.id, since, until, limit: cap, wide: true })) logs.push(l);
-    const agg = aggOf(u.id);
-    const rc = rcOf(u.id);
-    const first = logs.length ? logs[logs.length-1].created_at : u.created_at;  // exportLogs 为 DESC
-    const last  = logs.length ? logs[0].created_at : u.created_at;
-
-    const info = [
-      ['结算清单',''], ['用户名', u.username], ['用户ID', String(u.id)],
-      ['角色', u.role>=100?'管理员':'用户'], ['状态', u.status===1?'启用':'禁用'],
-      ['注册时间', fmtTs(u.created_at)],
-      ['账期', logs.length ? `${fmtTs(first)} ~ ${fmtTs(last)}` : '(无调用记录)'],
-      ['',''], ['结算项目','金额(USD)'],
-      ['累计充值', usdS(rc)], ['累计消费', usdS(agg.q)], ['当前余额', usdS(u.quota)],
-      ['',''], ['调用统计',''],
-      ['请求总数', String(agg.c)], ['成功', String(agg.ok||0)], ['失败', String(agg.err||0)],
-      ['输入token', String(agg.tin)], ['输出token', String(agg.tout)], ['总token', String(agg.tok)],
-      ['明细行数', logs.length < agg.c ? `前 ${logs.length} 条(共 ${agg.c} 条, 已截断)` : String(logs.length)],
-      ['导出时间', fmtTs(Date.now())],
-    ];
-    const detail = [['时间','类型','模型','渠道','令牌','输入token','输出token','总token','消费(USD)','耗时(秒)','流式','状态','错误','来源IP']];
-    for (const l of logs) detail.push([
-      fmtTs(l.created_at), TYPE[l.log_type]||l.log_type||'消费', l.model_name||'-', l.channel_name||'-', l.token_name||'-',
-      l.prompt_tokens, l.completion_tokens, l.total_tokens, usdS(l.quota),
-      Math.round(l.use_time||0), l.is_stream?'是':'否', l.status==='success'?'成功':'失败',
-      (l.error||'').slice(0,80), l.ip||'',
-    ]);
-    const r1 = rng(u.id);
-    const byModel = db.prepare(`SELECT model_name, COUNT(*) c, COALESCE(SUM(prompt_tokens),0) tin,
-       COALESCE(SUM(completion_tokens),0) tout, COALESCE(SUM(total_tokens),0) tok, COALESCE(SUM(quota),0) q
-       FROM logs WHERE ${r1.where} GROUP BY model_name ORDER BY q DESC`).all(...r1.v);
-    const mSheet = [['模型','请求次数','输入token','输出token','总token','消费(USD)']];
-    let mR=0,mI=0,mO=0,mT=0,mQ=0;
-    for (const r of byModel) { mSheet.push([r.model_name,r.c,r.tin,r.tout,r.tok,usdS(r.q)]); mR+=r.c;mI+=r.tin;mO+=r.tout;mT+=r.tok;mQ+=r.q; }
-    mSheet.push(['合计',mR,mI,mO,mT,usdS(mQ)]);
-    const byCh = db.prepare(`SELECT channel_name, COUNT(*) c, COALESCE(SUM(total_tokens),0) tok, COALESCE(SUM(quota),0) q
-       FROM logs WHERE ${r1.where} GROUP BY channel_name ORDER BY q DESC`).all(...r1.v);
-    const cSheet = [['渠道','请求次数','总token','消费(USD)']];
-    let cR=0,cT=0,cQ=0;
-    for (const r of byCh) { cSheet.push([r.channel_name||'-',r.c,r.tok,usdS(r.q)]); cR+=r.c;cT+=r.tok;cQ+=r.q; }
-    cSheet.push(['合计',cR,cT,usdS(cQ)]);
-
-    // 返佣汇总(该用户作为邀请人获得的各级返佣, 来自 invite: 行)
-    const rwRows = db.prepare(`SELECT CASE WHEN username='agent-reward-L1' THEN 'L1'
-       WHEN username='agent-reward-L2' THEN 'L2' ELSE 'L3' END lv, COUNT(*) c, COALESCE(SUM(quota),0) q
-       FROM logs WHERE user_id=? AND log_type='consume' AND username LIKE 'agent-reward-L%' GROUP BY lv`).all(u.id);
-    const rwSheet = [['返佣层级','笔数','返佣(USD)']];
-    let rwQ = 0;
-    for (const r of rwRows) { rwSheet.push([r.lv, r.c, usdS(r.q)]); rwQ += r.q; }
-    rwSheet.push(['合计', rwRows.reduce((a, r) => a + r.c, 0), usdS(rwQ)]);
-    const rwUsers = db.prepare(`SELECT u.id, u.username, COALESCE(SUM(r.quota),0) q
-       FROM logs c
-       JOIN logs r ON r.request_id = 'invite:' || c.request_id
-       JOIN users u ON u.id = r.user_id
-       WHERE c.user_id=? AND c.log_type='consume' AND c.username=? AND c.request_id NOT LIKE 'invite:%'
-         AND r.log_type='consume' AND r.username LIKE 'agent-reward-L%'
-       GROUP BY u.id ORDER BY q`).all(u.id, u.username);
-    const rwSheet2 = [['返佣获得用户','ID','返佣(USD)']];
-    for (const r of rwUsers) rwSheet2.push([r.username, String(r.id), usdS(r.q)]);
-    const fname = `结算清单_${u.username}_${u.id}_${stamp}.xlsx`;
-    // 流式发送：先写响应头（前端立即显示进度），再 setImmediate 后同步 build+发送
-    return sendXlsxStream(res, () => xlsx.build([
-      { name: '结算概要', rows: info, colWidths: [16, 44] },
-      { name: '调用明细', rows: detail, colWidths: [19,8,22,24,14,11,11,11,13,8,6,7,40,16], freezeHeader: true },
-      { name: '按模型汇总', rows: mSheet, colWidths: [24,10,13,13,13,14], freezeHeader: true },
-      { name: '按渠道汇总', rows: cSheet, colWidths: [26,10,13,14], freezeHeader: true },
-      { name: '返佣汇总', rows: rwSheet.concat([['',''],['按用户',''], ...rwSheet2]), colWidths: [20,10,14], freezeHeader: true },
-    ]), fname, `[settle] uid=${u.id} ${logs.length} 条`);
+    const u = store.getUserById(db, parseInt(target, 10));
+    if (!u) return json(res, 404, { success: false, message: '用户不存在' });
+    return spawnExportJob(res, {
+      mode: 'settle-single',
+      cfg: { dbPath: DB_PATH, userId: u.id, since: since || 0, until: until || 0, limit: limit || 500000, quotaPerUsd: QUOTA_PER_USD },
+      fname: `结算清单_${u.username}_${u.id}_${stamp}.xlsx`,
+      message: '结算清单生成中，稍后可在下载中心获取',
+    });
   }
 
-  // 全部用户：总表 + 每个用户一个明细 sheet（sheet 名去重/截断，上限 40 用户）
-  const sheets = [{ name: '全部用户结算', rows: master, colWidths: [8,16,8,6,19,19,9,7,7,12,12,12,15,15,15], freezeHeader: true }];
-  const used = new Set(['全部用户结算']);
-  for (const u of users.slice(0, 40)) {
-    const logs = store.exportLogs(db, { userId: u.id, since, until });
-    if (!logs.length) continue;
-    let nm = u.username.replace(/[\\\/\?\*\[\]:]/g, '_').slice(0, 26);
-    let base = nm, i = 2;
-    while (used.has(nm)) nm = base + '_' + (i++);
-    used.add(nm);
-    const agg = aggOf(u.id);
-    const rows = [['结算:' + u.username + ' (ID ' + u.id + ')',''],
-      ['累计消费(USD)', usdS(agg.q)], ['总token', String(agg.tok)], ['请求数', String(agg.c)],
-      ['',''], ['时间','模型','渠道','输入token','输出token','总token','消费(USD)','状态']];
-    for (const l of logs) rows.push([
-      fmtTs(l.created_at), l.model_name||'-', l.channel_name||'-',
-      l.prompt_tokens, l.completion_tokens, l.total_tokens, usdS(l.quota),
-      l.status==='success'?'成功':'失败',
-    ]);
-    sheets.push({ name: nm, rows, colWidths: [19,24,24,11,11,11,13,7], freezeHeader: true });
-  }
-  const fname = `结算清单_全部用户_${stamp}.xlsx`;
-  return asyncXlsxJob(res, { build: () => xlsx.build(sheets), fname, logPrefix: `[settle] ALL ${users.length} 用户` });
+  const users = store.listUsers(db);
+  return spawnExportJob(res, {
+    mode: 'settle-all',
+    cfg: { dbPath: DB_PATH, since: since || 0, until: until || 0, perUserLimit: 10000, quotaPerUsd: QUOTA_PER_USD },
+    fname: `结算清单_全部用户_${stamp}.xlsx`,
+    message: `全部用户结算生成中（${users.length} 个用户），稍后可在下载中心获取`,
+  });
 }
+
 function _settleStamp() { const d = new Date(); return `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`; }
 
 /** 代理结算导出：每个代理一行（团队人数/团队消费/各级返佣）+ 每代理一个明细 sheet */

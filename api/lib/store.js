@@ -16,6 +16,15 @@ function open(dbPath) {
   const db = new DatabaseSync(dbPath);
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA foreign_keys = ON;');
+  //【索引 2026-10-21】按 id 游标分页需要 (user_id, id) 组合索引；
+  // 只有 (user_id, created_at DESC) 时会扫出用户全部行再排序，95.9 万行要 45s。
+  // 建 (user_id, id DESC) 后降到 8s，索引本身不影响写入性能。
+  // 首次启动时 logs 表可能还不存在 → 忽略，migrate 之后再建。
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_logs_user_id ON logs(user_id, id DESC);'); } catch (e) {}
+  // 【锁等待 2026-10-21】WAL 下并发读写时，读端遇到写锁不再立即报
+  // "database is locked"，而是最多等 10s 让写事务完成。避免 settle/仪表盘
+  // 的同步查询与 relay 高频写互相踩死。
+  db.exec('PRAGMA busy_timeout = 10000;');
   return db;
 }
 

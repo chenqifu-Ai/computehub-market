@@ -470,15 +470,20 @@ const _EMPTY = Buffer.alloc(0);
 // { rowsDone, chunksTotal, chunksSent }
 function _PROGRESS(rowsDone, chunksTotal, chunksSent) { return { __xlsxProgress: true, rowsDone, chunksTotal, chunksSent }; }
 
-function* buildChunked(header, rowGen, chunkSize, prefix, summarySheets) {
+function* buildChunked(header, rowGen, chunkSize, prefix, summarySheets, opts) {
   chunkSize = chunkSize || 50000;
   prefix = prefix || '明细';
   summarySheets = summarySheets || [];
+  // 【性能修复 2026-10-21】调用方已知总行数时传入 opts.totalRows，跳过“阶段0 全量预扫描”。
+  // 旧版对 95.9 万行数据会把 rowGen 完整跑一遍再跑第二遍 → DB 读两遍、耗时翻倍。
+  const knownRows = opts && Number.isFinite(opts.totalRows) ? opts.totalRows : null;
   const dir = _fsC.mkdtempSync(_pathC.join(_osC.tmpdir(), 'xlsx-chunk-'));
   try { // wrap: 提前中断也清理临时目录
   // 阶段0：快速数行数（不物化 XML），前端据此显示进度条
   let totalRows = 0;
-  {
+  if (knownRows !== null) {
+    totalRows = knownRows;
+  } else {
     // rowGen 兼容：数组/生成器/生成器函数。遍1 物化到内存数组（预读模式）或快速计数
     const _rows = (Array.isArray(rowGen)) ? rowGen : null;
     if (_rows) {
