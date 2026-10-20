@@ -89,21 +89,36 @@ function requireUser(req, res) {
 
 // ============ 路由 ============
 const server = http.createServer(async (req, res) => {
-  // 【诊断 2026-10-21】事件循环延迟采样（每 10s 一次），用于定位"导出时其它接口卡"问题
+  // 【诊断 2026-10-21】事件循环延迟采样（setInterval 偏差法，正确）+ 周期性快照
+  // 原理：setInterval(100ms) 每 100ms 触发一次，若事件循环被阻塞 N ms，
+  // 实际间隔 = 100 + N，偏差 = 实际间隔 - 100 就是卡顿时长。
   if (!global.__elDiag) {
-    global.__elDiag = { maxLag: 0, maxLagAt: 0, activeReqs: 0, sampleCount: 0, lastSample: Date.now() };
-    const check = () => {
+    global.__elDiag = { maxLag: 0, maxLagAt: 0, activeReqs: 0, sampleCount: 0, lastSample: Date.now(), lagHistory: [], _lastTick: Date.now() };
+    const TICK = 100;
+    const tick = () => {
       const d = global.__elDiag;
-      const start = process.hrtime.bigint();
-      setTimeout(() => {
-        const lagMs = Number(process.hrtime.bigint() - start) / 1e6;
-        d.sampleCount++;
+      const now = Date.now();
+      const lagMs = Math.max(0, now - d._lastTick - TICK); // 实际间隔 - 期望间隔 = 卡顿
+      d._lastTick = now;
+      d.sampleCount++;
+      if (lagMs > 20) { // 只记录 >20ms 的卡顿（过滤正常抖动）
+        d.lagHistory.push({ t: new Date().toISOString().slice(11, 19), lag: Math.round(lagMs) });
+        if (d.lagHistory.length > 200) d.lagHistory.shift();
         if (lagMs > d.maxLag) { d.maxLag = lagMs; d.maxLagAt = new Date().toISOString(); }
-        d.lastSample = Date.now();
-      }, 10000);
+      }
+      d.lastSample = now;
+      if (lagMs > 3000) console.error(`[diag] ⚠️ 事件循环卡顿 ${Math.round(lagMs)}ms @ ${new Date().toISOString().slice(11,19)}`);
     };
-    check();
-    setInterval(check, 10000).unref();
+    const _iv = setInterval(tick, TICK);
+    _iv.unref?.();
+    // 每 60s 输出快照到日志（含最近 lag 趋势 + 内存 + 活跃请求 + 导出job）
+    setInterval(() => {
+      const d = global.__elDiag;
+      const recent = d.lagHistory.slice(-6).map(x => `${x.t}:${x.lag}`).join(' ');
+      const jobs = [..._exportJobs.entries()].filter(([, j]) => j.status === 'running').length;
+      const rss = Math.round(process.memoryUsage().rss / 1048576);
+      console.log(`[diag] snapshot lag_max=${Math.round(d.maxLag)}ms active=${d.activeReqs} mem=${rss}MB running_jobs=${jobs} recent=[${recent}]`);
+    }, 60000).unref();
     server.on('request', () => { global.__elDiag.activeReqs++; });
     server.on('request', (req, res) => {
       const done = () => { if (global.__elDiag) global.__elDiag.activeReqs = Math.max(0, global.__elDiag.activeReqs - 1); };
@@ -138,6 +153,7 @@ const server = http.createServer(async (req, res) => {
         event_loop_samples: d.sampleCount || 0,
         active_requests: d.activeReqs || 0,
         export_jobs: [..._exportJobs.entries()].map(([k, j]) => ({ job: k, status: j.status, progress: j.progress || null })),
+        lag_history: (d.lagHistory || []).slice(-30),
         memory_mb: Math.round(process.memoryUsage().rss / 1048576),
         time: new Date().toISOString(),
       });
@@ -1212,15 +1228,15 @@ function exportSettleXlsx(res, { target, since, until = 0, limit = 500000 }) {
        GROUP BY u.id ORDER BY q`).all(u.id, u.username);
     const rwSheet2 = [['返佣获得用户','ID','返佣(USD)']];
     for (const r of rwUsers) rwSheet2.push([r.username, String(r.id), usdS(r.q)]);
-    const buf = xlsx.build([
+    const fname = `结算清单_${u.username}_${u.id}_${stamp}.xlsx`;
+    // 流式发送：先写响应头（前端立即显示进度），再 setImmediate 后同步 build+发送
+    return sendXlsxStream(res, () => xlsx.build([
       { name: '结算概要', rows: info, colWidths: [16, 44] },
       { name: '调用明细', rows: detail, colWidths: [19,8,22,24,14,11,11,11,13,8,6,7,40,16], freezeHeader: true },
       { name: '按模型汇总', rows: mSheet, colWidths: [24,10,13,13,13,14], freezeHeader: true },
       { name: '按渠道汇总', rows: cSheet, colWidths: [26,10,13,14], freezeHeader: true },
       { name: '返佣汇总', rows: rwSheet.concat([['',''],['按用户',''], ...rwSheet2]), colWidths: [20,10,14], freezeHeader: true },
-    ]);
-    const fname = `结算清单_${u.username}_${u.id}_${stamp}.xlsx`;
-    return sendXlsx(res, buf, fname, `[settle] uid=${u.id} ${logs.length} 条`);
+    ]), fname, `[settle] uid=${u.id} ${logs.length} 条`);
   }
 
   // 全部用户：总表 + 每个用户一个明细 sheet（sheet 名去重/截断，上限 40 用户）
@@ -1326,6 +1342,33 @@ function sendXlsx(res, buf, fname, logMsg) {
   });
   res.end(buf);
   console.log(logMsg);
+}
+
+/**
+ * 流式发送 xlsx：先写响应头（让前端 fetch 立刻拿到响应、显示进度），
+ * 再用 setImmediate 让出事件循环后同步 build + 发送。
+ * 用于单用户结算等中小数据量导出——比 asyncXlsxJob 简单，前端体验一致。
+ */
+function sendXlsxStream(res, buildFn, fname, logMsg) {
+  res.writeHead(200, {
+    'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'Content-Disposition': `attachment; filename="${encodeURIComponent(fname)}"; filename*=UTF-8''${encodeURIComponent(fname)}`,
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*',
+  });
+  res.write(''); // 立即 flush 响应头，前端 fetch 可开始读 body 显示进度
+  setImmediate(() => {
+    try {
+      const t0 = Date.now();
+      const buf = buildFn();
+      res.end(buf);
+      console.log(logMsg + (logMsg ? ' ' : '') + `(${buf.length / 1024 | 0}KB / ${Date.now() - t0}ms)`);
+    } catch (e) {
+      // 头已发无法改状态码，只能断连
+      console.error('[xlsx-stream] 生成失败:', e.message);
+      try { res.destroy(); } catch {}
+    }
+  });
 }
 
 // 探测上游 /models，返回 { ok, models, count, error }

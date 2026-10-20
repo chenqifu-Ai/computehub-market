@@ -585,7 +585,17 @@ async function downloadAuthed(url, tip) {
   const bar = $("dlBar");
   const txt = $("dlText");
   const show = (t) => { if (txt) txt.textContent = t; if (box) box.classList.remove('hidden'); };
-  const hide = () => { if (box) box.classList.add('hidden'); };
+  const hide = () => { if (box) box.classList.add('hidden'); if (_paintTimer) { clearInterval(_paintTimer); _paintTimer = null; } };
+  const t0 = performance.now();
+  // 立即显示进度条（不等 fetch 返回响应头），避免"正在导出"一闪而过
+  show((tip || '正在导出…') + ' 准备中… 已用 0s');
+  if (bar) bar.style.width = '3%';
+  let _paintTimer = null;
+  // 准备阶段每 500ms 刷一次已用时间（fetch 还没拿到头时用不了 paint）
+  _paintTimer = setInterval(() => {
+    const el = (performance.now() - t0) / 1000;
+    if (txt) txt.textContent = (tip || '正在导出…') + ` 准备中… 已用 ${el.toFixed(0)}s（数据量大请耐心等待，请勿关闭页面）`;
+  }, 500);
   try {
     const r = await fetch(url, { headers: SESSION ? { Authorization: SCHEME + SESSION } : {} });
     if (!r.ok) {
@@ -602,7 +612,8 @@ async function downloadAuthed(url, tip) {
     let got = 0;
     let pRows = 0, pCTotal = 0, pCSent = 0;
     const paint = () => {
-      const elapsed = (performance.now() / 1000).toFixed(0);
+      if (_paintTimer) { clearInterval(_paintTimer); _paintTimer = null; } // 进入流式阶段，停掉准备阶段定时器
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(0);
       let line, pct;
       if (pCTotal > 0) {
         // 服务端已知总片数：发送阶段精确，生成阶段显示片数
@@ -626,7 +637,7 @@ async function downloadAuthed(url, tip) {
       hide();
       return saveBlob(blob, fname);
     }
-    show('正在生成文件…');
+    show('正在生成文件… 已用 0s（数据量大请耐心等待，请勿关闭页面）');
     const reader = r.body.getReader();
     const chunks = [];
     let totalBytes = 0;

@@ -112,7 +112,9 @@ function migrate(db) {
     created_at        INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_logs_user ON logs(user_id, created_at DESC);
-
+  -- 【性能 2026-10-21】返佣 JOIN 用 r.request_id='invite:'||c.request_id 连接，
+  -- 无索引时全表 SCAN 194万行 → 事件循环卡 266s。加索引后走 SEARCH（O(1)）。
+  CREATE INDEX IF NOT EXISTS idx_logs_request_id ON logs(request_id);
   CREATE TABLE IF NOT EXISTS redemptions (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     code          TEXT UNIQUE NOT NULL,
