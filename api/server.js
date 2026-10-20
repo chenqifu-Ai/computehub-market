@@ -1002,8 +1002,11 @@ function typeLabel(l) {
  * 通用导出派发器（2026-10-21 重构）
  * 旧版在**主进程**做 DB 流式读 + 汇总 SQL + 喂 worker，95.9 万行时主线程连续阻塞 55~62s，
  * 期间 /api/* 全部无响应（前端一直转圈 = "又卡住了"）。
- * 现在整条链路（只读 DB 连接 + 汇总 SQL + xlsx 拼装 + 落盘）都在 lib/export-worker.js 子进程里跑，
+ * 现在整条链路（只读 DB 连接 + 汇总 SQL + 多线程 xlsx 拼装 + 落盘）都在子进程里跑，
  * 主进程只登记任务 + 透传进度 → 事件循环零阻塞，导出再大也不影响别人。
+ *
+ *   mode=settle-single / usage  →  lib/export-multi.js（4 线程并行，96 万行 ~27s）
+ *   mode=settle-all             →  lib/export-worker.js（汇总为主，单进程足够）
  */
 function spawnExportJob(res, { mode, cfg, fname, message }) {
   const { spawn } = require('node:child_process');
@@ -1014,7 +1017,8 @@ function spawnExportJob(res, { mode, cfg, fname, message }) {
   _exportJobs.set(jobKey, { status: 'running', started: Date.now(), fname, progress: null });
   const t0 = Date.now();
 
-  const wp = path.join(__dirname, 'lib', 'export-worker.js');
+  const script = (mode === 'settle-all') ? 'export-worker.js' : 'export-multi.js';
+  const wp = path.join(__dirname, 'lib', script);
   const child = spawn(process.execPath, ['--no-warnings', wp, outFile, mode], { stdio: ['pipe', 'pipe', 'pipe'] });
   let outBuf = '';
   let errBuf = '';
