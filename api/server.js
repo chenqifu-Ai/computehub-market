@@ -89,6 +89,28 @@ function requireUser(req, res) {
 
 // ============ 路由 ============
 const server = http.createServer(async (req, res) => {
+  // 【诊断 2026-10-21】事件循环延迟采样（每 10s 一次），用于定位"导出时其它接口卡"问题
+  if (!global.__elDiag) {
+    global.__elDiag = { maxLag: 0, maxLagAt: 0, activeReqs: 0, sampleCount: 0, lastSample: Date.now() };
+    const check = () => {
+      const d = global.__elDiag;
+      const start = process.hrtime.bigint();
+      setTimeout(() => {
+        const lagMs = Number(process.hrtime.bigint() - start) / 1e6;
+        d.sampleCount++;
+        if (lagMs > d.maxLag) { d.maxLag = lagMs; d.maxLagAt = new Date().toISOString(); }
+        d.lastSample = Date.now();
+      }, 10000);
+    };
+    check();
+    setInterval(check, 10000).unref();
+    server.on('request', () => { global.__elDiag.activeReqs++; });
+    server.on('request', (req, res) => {
+      const done = () => { if (global.__elDiag) global.__elDiag.activeReqs = Math.max(0, global.__elDiag.activeReqs - 1); };
+      res.on('finish', done);
+      res.on('close', done);
+    });
+  }
   let pathname, query;
   try {
     const u = new URL(req.url, 'http://x');
@@ -104,6 +126,21 @@ const server = http.createServer(async (req, res) => {
         'Access-Control-Allow-Headers': 'Content-Type,Authorization,New-Api-User',
       });
       return res.end();
+    }
+
+    // ---------- 诊断端点（无需登录） ----------
+    if (pathname === '/api/diag' && req.method === 'GET') {
+      const d = global.__elDiag || {};
+      return json(res, 200, {
+        uptime_sec: Math.round(process.uptime()),
+        event_loop_max_lag_ms: Math.round(d.maxLag || 0),
+        event_loop_max_lag_at: d.maxLagAt || null,
+        event_loop_samples: d.sampleCount || 0,
+        active_requests: d.activeReqs || 0,
+        export_jobs: [..._exportJobs.entries()].map(([k, j]) => ({ job: k, status: j.status, progress: j.progress || null })),
+        memory_mb: Math.round(process.memoryUsage().rss / 1048576),
+        time: new Date().toISOString(),
+      });
     }
 
     // ---------- OpenAI 兼容中继（核心） ----------
@@ -966,27 +1003,12 @@ function exportUsageXlsx(res, { userId, since, until = 0, all, admin = false, li
       }
       sum.push(['合计', '', '', '', '', tReq, tIn, tOut, tTok, fmtYuan(tQ)]);
       const header = ['时间', '类型', '用户', '用户ID', '令牌名称', '模型', '输入token数', '缓存读token数', '未命中token数', '命中率', '输出token数', '花费金额', '用时(秒)', '流式'];
-      const _tRead = Date.now();
-      // 【分批预读】每 2 万行暂停一拍，让事件循环处理 HTTP；同时释放 DB 读锁间隙
-      const rowsPre = [];
-      {
-        let n = 0;
-        const it = store.exportLogsIter(db, { userId, since, until, limit, wide: admin });
-        for (let l = it.next(); !l.done; l = it.next()) {
-          if (n >= limit) break;
-          n++;
-          const row = l.value;
-          const ca = row.cached_tokens || 0;
-          rowsPre.push([fmtTs(row.created_at), typeLabel(row), row.username, String(row.user_id), row.token_name || '', row.model_name || '', row.prompt_tokens, ca, Math.max(0, (row.prompt_tokens || 0) - ca), row.prompt_tokens ? Math.round(ca / row.prompt_tokens * 100) + '%' : '', row.completion_tokens, fmtYuan(row.quota), Math.round(row.use_time || 0), row.is_stream ? '是' : '否']);
-          if (n % 20000 === 0) await new Promise(r => setImmediate(r));
-        }
-      }
-      console.log(`[export] job=${jobKey} 预读 ${rowsPre.length} 行 / ${Date.now() - _tRead}ms（DB读锁已释放）`);
+      // 【流式管道修复 2026-10-21 2】旧版把 50 万行×14列 全量预读到 rowsPre 数组驻留 1.8GB，
+      // GC 风暴 + worker stdin 背压链断裂 → 导出永远完不成、其它接口变慢。
+      // 改为：先起 worker，DB 边读边按 5000 行/批写 stdin；写前等 drain，内存恒定 ~2MB。
       const d = new Date();
       const stamp = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
       const fname = `${all ? 'all' : 'usage'}-logs-${stamp}.xlsx`;
-      // 【CPU 密集任务隔离到子进程】XML 拼装+crc32+deflate 不卡主进程事件循环
-      // worker 协议见 lib/xlsx-worker.js；行数据分批(5000行/批)通过 stdin 传入
       const { spawn } = require('node:child_process');
       const wp = path.join(__dirname, 'lib', 'xlsx-worker.js');
       const child = spawn(process.execPath, [wp, outFile], { stdio: ['pipe', 'pipe', 'inherit'] });
@@ -998,7 +1020,7 @@ function exportUsageXlsx(res, { userId, since, until = 0, all, admin = false, li
           const line = wBuf.slice(0, i); wBuf = wBuf.slice(i + 1);
           if (!line.trim()) continue;
           let m; try { m = JSON.parse(line); } catch { continue; }
-          if (m.t === 'progress') { _exportJobs.get(jobKey).progress = m; }
+          if (m.t === 'progress') { const j = _exportJobs.get(jobKey); if (j) j.progress = m; }
           if (m.t === 'error') { wErr = m.message; }
         }
       });
@@ -1007,18 +1029,34 @@ function exportUsageXlsx(res, { userId, since, until = 0, all, admin = false, li
         child.on('close', (code) => { if (code !== 0 && !wErr) wErr = 'worker exit ' + code; resolve(); });
       });
       child.stdin.write(JSON.stringify({ t: 'init', header, chunkSize: 50000, prefix: all ? '全部明细' : '使用日志', summarySheets: [{ name: '按模型汇总', rows: sum, colWidths: [14, 9, 16, 9, 24, 10, 13, 13, 13, 13], freezeHeader: true }] }) + '\n');
-      const BATCH = 5000;
-      for (let i = 0; i < rowsPre.length; i += BATCH) {
-        child.stdin.write(JSON.stringify({ t: 'rows', rows: rowsPre.slice(i, i + BATCH) }) + '\n');
-        if (!child.stdin.writable) { wErr = 'worker stdin broken'; break; }
-        if (i % 50000 === 0 && i > 0) await new Promise(r => setImmediate(r)); // 发送间隙让出事件循环
+      // DB 边读边喂 worker（背压安全）
+      const tRead = Date.now();
+      let n = 0;
+      const FLUSH = 5000;
+      let buf = [];
+      const it = store.exportLogsIter(db, { userId, since, until, limit, wide: admin });
+      for (let l = it.next(); !l.done; l = it.next()) {
+        if (wErr) break;
+        n++;
+        const row = l.value;
+        const ca = row.cached_tokens || 0;
+        buf.push([fmtTs(row.created_at), typeLabel(row), row.username, String(row.user_id), row.token_name || '', row.model_name || '', row.prompt_tokens, ca, Math.max(0, (row.prompt_tokens || 0) - ca), row.prompt_tokens ? Math.round(ca / row.prompt_tokens * 100) + '%' : '', row.completion_tokens, fmtYuan(row.quota), Math.round(row.use_time || 0), row.is_stream ? '是' : '否']);
+        if (buf.length >= FLUSH) {
+          const ok = child.stdin.write(JSON.stringify({ t: 'rows', rows: buf }) + '\n');
+          buf = [];
+          if (!ok) await new Promise(r => child.stdin.once('drain', r)); // 背压：worker 没消化完就等
+        }
       }
-      rowsPre.length = 0; // 及时释放父进程内存
+      if (buf.length) {
+        const ok = child.stdin.write(JSON.stringify({ t: 'rows', rows: buf }) + '\n');
+        if (!ok) await new Promise(r => child.stdin.once('drain', r));
+      }
+      console.log(`[export] job=${jobKey} 流式读取 ${n} 行 / ${Date.now() - tRead}ms（内存恒定，无预读驻留）`);
       child.stdin.end(JSON.stringify({ t: 'end' }) + '\n');
       await wDone;
       if (wErr) throw new Error(wErr);
       _exportJobs.set(jobKey, { status: 'done', file: outFile, fname, size: fs.statSync(outFile).size, started: _exportJobs.get(jobKey)?.started || t0, finished: Date.now() });
-      console.log(`[export] job=${jobKey} 完成: ${fs.statSync(outFile).size / 1024 / 1024 | 0}MB / ${rowsPre.length} 行 / ${Date.now() - t0}s → ${outFile}`);
+      console.log(`[export] job=${jobKey} 完成: ${fs.statSync(outFile).size / 1024 / 1024 | 0}MB / ${n} 行 / ${Date.now() - t0}s → ${outFile}`);
       // 清理旧任务（保留最近 10 个文件）
       try {
         const files = fs.readdirSync(path.dirname(outFile)).filter(f => f.endsWith('.xlsx')).map(f => ({ f, m: fs.statSync(path.join(path.dirname(outFile), f)).mtimeMs })).sort((a, b) => b.m - a.m);
