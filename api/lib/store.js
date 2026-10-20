@@ -615,8 +615,37 @@ function* exportLogsIter(db, { userId, since = 0, until = 0, limit = 0, wide = f
   const COLS = wide
     ? 'id,user_id,username,token_id,token_name,channel_name,model_name,prompt_tokens,completion_tokens,total_tokens,quota,use_time,is_stream,status,error,ip,created_at,log_type'
     : 'id,user_id,username,token_id,token_name,model_name,prompt_tokens,completion_tokens,total_tokens,quota,use_time,is_stream,status,error,created_at,log_type';
-  const rs = db.prepare(`SELECT ${COLS} FROM logs ${where} ORDER BY created_at DESC${lim}`).iterate(...v);
-  try { yield* rs; } finally { rs.close?.(); }
+  // 【关键修复 2026-10-21】node:sqlite 的 .iterate() 生成器若长时间挂起（如 await 让出事件循环
+  // 期间），底层读语句保持打开 = 持续持有读锁/快照，settle 的写事务会 database is locked，
+  // 写失败后语句保持 open → 读端永远拿不到快照更新 → 主线程 CPU 100% 死循环卡死全进程。
+  // 修法：按 id 游标分页，每批取完立即 close，语句从不跨 await 存活。
+  // id 主键自增与 created_at 单调一致，id DESC ≈ created_at DESC。
+  const PAGE = 50000;
+  // 【关键修复 2026-10-21】node:sqlite 的 .iterate() 生成器若长时间挂起（如 await 让出事件循环
+  // 期间），底层读语句保持打开 = 持续持有读锁/快照，settle 的写事务会 database is locked，
+  // 写失败后语句保持 open → 读端永远拿不到快照更新 → 主线程 CPU 100% 死循环卡死全进程。
+  // 修法：按 id 游标分页，每批取完立即 close，语句从不跨 await 存活。
+  // 注意：node:sqlite 单参数调用会当作数组展开，多参数必须用 spread（...v）。
+  // 消费方可能提前 break（生成器挂起在页中间），所以按整页边界停 + 尾页 SQL LIMIT 精确截断。
+  const LIM = parseInt(limit, 10) || 0;
+  const FULL_PAGES = LIM ? Math.floor(LIM / PAGE) : Infinity;
+  const REMAINDER = LIM ? LIM % PAGE : 0;
+  let full = 0;
+  const cur = db.prepare(`SELECT ${COLS} FROM logs ${where ? where + ' AND' : 'WHERE'} id < ? ORDER BY id DESC LIMIT ${PAGE}`);
+  let lastId = db.prepare('SELECT MAX(id) m FROM logs').get().m;
+  if (lastId == null) return;
+  while (full < FULL_PAGES) {
+    const page = cur.all(...v, lastId);
+    if (!page.length) break;
+    full++;
+    for (const row of page) yield row;
+    lastId = page[page.length - 1].id;
+    if (page.length < PAGE) break;
+  }
+  if (REMAINDER > 0 && full === FULL_PAGES) {
+    const tail = db.prepare(`SELECT ${COLS} FROM logs ${where ? where + ' AND' : 'WHERE'} id < ? ORDER BY id DESC LIMIT ${REMAINDER}`);
+    for (const row of tail.all(...v, lastId)) yield row;
+  }
 }
 function exportSummary(db, { userId, since = 0, until = 0 } = {}) {
   const cond = []; const v = [];
