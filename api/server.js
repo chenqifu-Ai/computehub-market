@@ -463,19 +463,35 @@ const server = http.createServer(async (req, res) => {
         if (!t) return json(res, 404, { success: false, message: '用户不存在: ' + userArg });
         userId = t.id;
       }
-      // 时间窗: 优先 since/until（支持 YYYY-MM-DD 或 YYYY-MM），否则 days，都没有=全量
+      // 时间窗: 优先 from/until（毫秒时间戳，与 /api/settle/export 统一），
+      // 再退 since（YYYY-MM-DD / YYYY-MM），最后 days，都没有=全量。
+      // 【2026-10-21】旧版只认 since，前端/其它调用方传 from（毫秒）直接被忽略 → 永远导全量。
       let since = 0, until = 0;
-      const sStr = query.get('since'), uStr = query.get('until');
       const parseDay = (s) => {
         const m = String(s).match(/^(\d{4})-(\d{2})(?:-(\d{2}))?/);
         if (!m) return NaN;
         return Date.UTC(+m[1], +m[2] - 1, m[3] ? +m[3] : 1);
       };
-      if (sStr || uStr) {
-        const s = sStr ? parseDay(sStr) : 0, e2 = uStr ? parseDay(uStr) : 0;
-        if (isNaN(s) || isNaN(e2) || (s && e2 && s > e2)) return json(res, 400, { success: false, message: 'since/until 格式错误，支持 YYYY-MM-DD 或 YYYY-MM' });
-        since = s || 0;
-        until = e2 ? e2 - 1 : 0; // store 用 created_at<=until，转成闭区间
+      // 同一个参数名兼容两种写法：纯数字 = 毫秒时间戳；含 '-' = YYYY-MM-DD / YYYY-MM
+      const asMs = (v) => {
+        if (v == null || v === '') return null;
+        const str = String(v).trim();
+        if (/^\d{10,}$/.test(str)) return parseInt(str, 10);   // 毫秒
+        if (str.includes('-')) {                               // 日期
+          const d = parseDay(str);
+          return isNaN(d) ? NaN : d;
+        }
+        return null;
+      };
+      const fromV = asMs(query.get('from')), sinceV = asMs(query.get('since'));
+      const untilV = asMs(query.get('until'));
+      if (fromV != null || sinceV != null || untilV != null) {
+        const bad = [fromV, sinceV, untilV].some(v => v != null && Number.isNaN(v));
+        if (bad) return json(res, 400, { success: false, message: 'from/since/until 格式错误，支持毫秒时间戳或 YYYY-MM-DD / YYYY-MM' });
+        since = fromV != null ? fromV : (sinceV != null ? sinceV : 0);
+        until = untilV != null ? untilV : 0;
+        // 日期形式的 until 是「当天 0 点」，需要 -1ms 变闭区间；毫秒形式由调用方自己给准确值
+        if (until && String(query.get('until')).includes('-')) until = until - 1;
       } else {
         const days = Math.min(parseInt(query.get('days') || '0', 10), 3650);
         if (days > 0) since = Date.now() - days * 86400000;
@@ -1116,6 +1132,12 @@ function exportSettleXlsx(res, { target, since, until = 0, limit = 500000 }) {
   const d = new Date();
   const stamp = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
 
+  // 范围描述（写进提示语，避免"以为导了今天其实导了全量"这种误判）
+  const rangeDesc = (since && until) ? `${fmtTs(since)} ~ ${fmtTs(until)}`
+    : since ? `${fmtTs(since)} 起`
+    : until ? `截止 ${fmtTs(until)}`
+    : '全部历史';
+
   if (target !== 'all') {
     const u = store.getUserById(db, parseInt(target, 10));
     if (!u) return json(res, 404, { success: false, message: '用户不存在' });
@@ -1123,7 +1145,7 @@ function exportSettleXlsx(res, { target, since, until = 0, limit = 500000 }) {
       mode: 'settle-single',
       cfg: { dbPath: DB_PATH, userId: u.id, since: since || 0, until: until || 0, limit: limit || 500000, quotaPerUsd: QUOTA_PER_USD },
       fname: `结算清单_${u.username}_${u.id}_${stamp}.xlsx`,
-      message: '结算清单生成中，稍后可在下载中心获取',
+      message: `结算清单生成中（范围：${rangeDesc}）`,
     });
   }
 
@@ -1132,7 +1154,7 @@ function exportSettleXlsx(res, { target, since, until = 0, limit = 500000 }) {
     mode: 'settle-all',
     cfg: { dbPath: DB_PATH, since: since || 0, until: until || 0, perUserLimit: 10000, quotaPerUsd: QUOTA_PER_USD },
     fname: `结算清单_全部用户_${stamp}.xlsx`,
-    message: `全部用户结算生成中（${users.length} 个用户），稍后可在下载中心获取`,
+    message: `全部用户结算生成中（${users.length} 个用户，范围：${rangeDesc}）`,
   });
 }
 

@@ -552,8 +552,11 @@ $('btnExportLogs').onclick = () => {
 
 // 服务端生成 xlsx（双 sheet：明细 + 按模型汇总）
 function downloadXlsx(all) {
+  const url = `/api/log/export?${all ? 'all=1&' : ''}limit=2000000`;
+  return downloadXlsxJob(url);
+}
+function downloadXlsxJob(url) {
   // 异步导出：提交任务 → 轮询状态 → 完成后下载文件
-  const url = `/api/log/export${all ? '?all=1' : ''}&limit=2000000`;
   api(url, { method: 'GET' }).then(j => {
     if (!j.success) return toast(j.message || '导出失败', 'err');
     const job = j.job;
@@ -667,8 +670,64 @@ function saveBlob(blob, fname) {
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
   toast('已导出：' + fname);
 }
-$('btnExportXlsx').onclick = () => downloadXlsx(false);
-if ($('btnExportAll')) $('btnExportAll').onclick = () => downloadXlsx(true);
+// 【修复 2026-10-21】之前这两个按钮直接调 downloadXlsx(全量)，没有时间段选择，
+// 一点就是 96 万行。现在和结算导出一样先弹时间范围。
+function askUsageRange(all) {
+  openModal(`
+    <h3>📜 导出使用日志 Excel</h3>
+    <p class="muted">范围：<b>${all ? '全站所有用户' : '我自己'}</b></p>
+    <label>快捷时间段</label>
+    <div style="display:flex;gap:6px;flex-wrap:wrap" id="uQuick">
+      <button type="button" class="btn-ghost sm uq" data-days="1">今天</button>
+      <button type="button" class="btn-ghost sm uq" data-days="7">近7天</button>
+      <button type="button" class="btn-ghost sm uq" data-days="30">近30天</button>
+      <button type="button" class="btn-ghost sm uq" data-days="0">全部</button>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:8px">
+      <label style="margin:0">自定义天数</label>
+      <input id="uDays" type="number" min="0" value="7" style="width:110px" placeholder="0=全部">
+      <span class="muted" id="uDaysHint">当前：近 7 天</span>
+    </div>
+    <label>或：起始日期</label>
+    <input id="uFrom" type="date">
+    <label>结束日期</label>
+    <input id="uTo" type="date">
+    <p class="muted" style="margin-top:8px">留空 + 0 = 导出全部历史（数据量大，会明显变慢）。</p>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn-primary" onclick="doUsageExport(${all ? 'true' : 'false'})">导出</button>
+    </div>`);
+  const inp = $('uDays'), hint = $('uDaysHint');
+  const sync = () => {
+    const d = parseInt(inp.value || '0', 10) || 0;
+    if (hint) hint.textContent = d > 0 ? `当前：近 ${d} 天` : '当前：全部历史';
+    document.querySelectorAll('#uQuick .uq').forEach(b => b.classList.toggle('active', parseInt(b.dataset.days, 10) === d));
+  };
+  document.querySelectorAll('#uQuick .uq').forEach(btn => {
+    btn.onclick = () => { inp.value = btn.dataset.days; sync(); };
+  });
+  inp.oninput = sync;
+  sync();
+}
+function doUsageExport(all) {
+  const from = ($('uFrom') && $('uFrom').value) || '';
+  const to = ($('uTo') && $('uTo').value) || '';
+  const days = parseInt(($('uDays') && $('uDays').value) || '0', 10) || 0;
+  closeModal();
+  let url = `/api/log/export?${all ? 'all=1&' : ''}limit=2000000`;
+  if (from || to) {
+    if (from) url += '&from=' + new Date(from + 'T00:00:00').getTime();
+    if (to) { const e = new Date(to + 'T00:00:00'); e.setDate(e.getDate() + 1); url += '&until=' + (e.getTime() - 1); }
+  } else if (days === 1) {
+    const d0 = new Date(); d0.setHours(0, 0, 0, 0);
+    url += '&from=' + d0.getTime();
+  } else if (days > 0) {
+    url += '&days=' + days;
+  }
+  downloadXlsxJob(url);
+}
+$('btnExportXlsx').onclick = () => askUsageRange(false);
+if ($('btnExportAll')) $('btnExportAll').onclick = () => askUsageRange(true);
 
 // 结算清单下载：先弹「时间段选择」弹窗（不再直接导全部）
 function downloadSettle(user) {
@@ -676,36 +735,72 @@ function downloadSettle(user) {
     <h3>📊 导出结算清单</h3>
     <p class="muted">范围：<b>${user === 'all' ? '全部用户' : user === 'me' ? '我自己' : ('用户 #' + user)}</b></p>
     <label>快捷时间段</label>
-    <div style="display:flex;gap:6px;flex-wrap:wrap">
-      <button class="btn-ghost sm" onclick="$('stDays').value=1">今天</button>
-      <button class="btn-ghost sm" onclick="$('stDays').value=7">近7天</button>
-      <button class="btn-ghost sm" onclick="$('stDays').value=30">近30天</button>
-      <button class="btn-ghost sm" onclick="$('stDays').value=0">全部</button>
+    <div style="display:flex;gap:6px;flex-wrap:wrap" id="stQuick">
+      <button type="button" class="btn-ghost sm stq" data-days="1">今天</button>
+      <button type="button" class="btn-ghost sm stq" data-days="7">近7天</button>
+      <button type="button" class="btn-ghost sm stq" data-days="30">近30天</button>
+      <button type="button" class="btn-ghost sm stq" data-days="0">全部</button>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:8px">
+      <label style="margin:0">自定义天数</label>
+      <input id="stDays" type="number" min="0" value="0" style="width:110px" placeholder="0=全部">
+      <span class="muted" id="stDaysHint">当前：全部历史</span>
     </div>
     <label>或：起始日期</label>
     <input id="stFrom" type="date">
     <label>结束日期</label>
     <input id="stTo" type="date">
-    <p class="muted" style="margin-top:8px">填了起止日期则以日期为准；否则用快捷天数。留空 + 全部 = 导出全部历史。</p>
+    <p class="muted" style="margin-top:8px">填了起止日期则以日期为准；否则用快捷天数 / 自定义天数。留空 + 0 = 导出全部历史。</p>
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closeModal()">取消</button>
       <button class="btn-primary" onclick="doSettleExport('${user}')">导出</button>
     </div>`);
+  // 【修复 2026-10-21】快捷按钮之前写 $('stDays').value，但弹窗里根本没有这个元素，
+  // 点击直接抛 TypeError 被静默吞掉 → doSettleExport 读到 undefined → days=0 → 永远导全量。
+  // 现在：真实 input#stDays + 按钮写值后同步高亮。
+  const daysInput = $('stDays');
+  const hint = $('stDaysHint');
+  const syncHint = () => {
+    const d = parseInt(daysInput.value || '0', 10) || 0;
+    if (hint) hint.textContent = d > 0 ? `当前：近 ${d} 天` : '当前：全部历史';
+    document.querySelectorAll('#stQuick .stq').forEach(b => {
+      b.classList.toggle('active', parseInt(b.dataset.days, 10) === d);
+    });
+  };
+  document.querySelectorAll('#stQuick .stq').forEach(btn => {
+    btn.onclick = () => { daysInput.value = btn.dataset.days; syncHint(); };
+  });
+  daysInput.oninput = syncHint;
+  syncHint();
 }
 function doSettleExport(user) {
   let qs = '/api/settle/export?user=' + encodeURIComponent(user) + '&limit=2000000';
   const from = ($('stFrom') && $('stFrom').value) || '';
   const to = ($('stTo') && $('stTo').value) || '';
+  const daysIn = $('stDays');
+  const days = daysIn ? (parseInt(daysIn.value || '0', 10) || 0) : 0;
   if (from || to) {
-    if (from) qs += '&from=' + encodeURIComponent(new Date(from + 'T00:00:00').getTime());
-    if (to) qs += '&until=' + encodeURIComponent(new Date(to + 'T23:59:59').getTime());
-  } else {
-    const days = parseInt(($('stDays') && $('stDays').value) || '0', 10);
-    if (days > 0) qs += '&days=' + days;
+    // 自定义日期优先：用浏览器本地 0 点 / 23:59:59.999，避免「今天」少算几小时
+    if (from) qs += '&from=' + new Date(from + 'T00:00:00').getTime();
+    if (to) {
+      const end = new Date(to + 'T00:00:00');
+      end.setDate(end.getDate() + 1);
+      qs += '&until=' + (end.getTime() - 1);
+    }
+  } else if (days === 1) {
+    // 「今天」= 本地当天 0 点至今（旧逻辑 days=1 是「最近 24 小时」，会把昨天下午也带上）
+    const d0 = new Date(); d0.setHours(0, 0, 0, 0);
+    qs += '&from=' + d0.getTime();
+  } else if (days > 0) {
+    qs += '&days=' + days;
   }
   closeModal();
   // 异步 job 模式：提交后轮询状态，完成自动下载（大数据量不卡页面）
-  settleJobExport(qs, '正在生成结算清单…');
+  const scopeTxt = (from || to) ? `${from || '最早'} ~ ${to || '现在'}`
+    : days === 1 ? '今天'
+    : days > 0 ? `近 ${days} 天`
+    : '全部历史';
+  settleJobExport(qs, '正在生成结算清单（' + scopeTxt + '）');
 }
 async function settleJobExport(qs, tip) {
   const box = $("dlProgress"); const bar = $("dlBar"); const txt = $("dlText");
@@ -1554,11 +1649,16 @@ if ($('btnSettleAgents')) $('btnSettleAgents').onclick = () => {
     <h3>📊 导出全部代理结算</h3>
     <p class="muted">每个代理的团队结算总表 + 明细 sheet。</p>
     <label>快捷时间段</label>
-    <div style="display:flex;gap:6px;flex-wrap:wrap">
-      <button class="btn-ghost sm" onclick="$('agDays').value=1">今天</button>
-      <button class="btn-ghost sm" onclick="$('agDays').value=7">近7天</button>
-      <button class="btn-ghost sm" onclick="$('agDays').value=30">近30天</button>
-      <button class="btn-ghost sm" onclick="$('agDays').value=0">全部</button>
+    <div style="display:flex;gap:6px;flex-wrap:wrap" id="agQuick">
+      <button type="button" class="btn-ghost sm agq" data-days="1">今天</button>
+      <button type="button" class="btn-ghost sm agq" data-days="7">近7天</button>
+      <button type="button" class="btn-ghost sm agq" data-days="30">近30天</button>
+      <button type="button" class="btn-ghost sm agq" data-days="0">全部</button>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:8px">
+      <label style="margin:0">自定义天数</label>
+      <input id="agDays" type="number" min="0" value="0" style="width:110px" placeholder="0=全部">
+      <span class="muted" id="agDaysHint">当前：全部历史</span>
     </div>
     <label>或：起始日期</label>
     <input id="agFrom" type="date">
@@ -1568,20 +1668,45 @@ if ($('btnSettleAgents')) $('btnSettleAgents').onclick = () => {
       <button class="btn-ghost" onclick="closeModal()">取消</button>
       <button class="btn-primary" onclick="doAgentSettleExport()">导出</button>
     </div>`);
+  // 同 downloadSettle 的修复：原先快捷按钮写 $('agDays') 但元素不存在 → 点击报错 → 永远全量
+  const agInput = $('agDays'), agHint = $('agDaysHint');
+  const agSync = () => {
+    const d = parseInt(agInput.value || '0', 10) || 0;
+    if (agHint) agHint.textContent = d > 0 ? `当前：近 ${d} 天` : '当前：全部历史';
+    document.querySelectorAll('#agQuick .agq').forEach(b => b.classList.toggle('active', parseInt(b.dataset.days, 10) === d));
+  };
+  document.querySelectorAll('#agQuick .agq').forEach(btn => {
+    btn.onclick = () => { agInput.value = btn.dataset.days; agSync(); };
+  });
+  agInput.oninput = agSync;
+  agSync();
 };
 function doAgentSettleExport() {
   let qs = '/api/admin/agent/settle';
   const from = ($('agFrom') && $('agFrom').value) || '';
   const to = ($('agTo') && $('agTo').value) || '';
+  const agIn = $('agDays');
+  const days = agIn ? (parseInt(agIn.value || '0', 10) || 0) : 0;
+  const addQ = (k, v) => { qs += (qs.includes('?') ? '&' : '?') + k + '=' + v; };
   if (from || to) {
-    if (from) qs += '?from=' + encodeURIComponent(new Date(from + 'T00:00:00').getTime());
-    if (to) qs += (qs.includes('?') ? '&' : '?') + 'until=' + encodeURIComponent(new Date(to + 'T23:59:59').getTime());
-  } else {
-    const days = parseInt(($('agDays') && $('agDays').value) || '0', 10);
-    if (days > 0) qs += '?days=' + days;
+    if (from) addQ('from', new Date(from + 'T00:00:00').getTime());
+    if (to) {
+      const end = new Date(to + 'T00:00:00');
+      end.setDate(end.getDate() + 1);
+      addQ('until', end.getTime() - 1);
+    }
+  } else if (days === 1) {
+    const d0 = new Date(); d0.setHours(0, 0, 0, 0);
+    addQ('from', d0.getTime());
+  } else if (days > 0) {
+    addQ('days', days);
   }
+  const scopeTxt = (from || to) ? `${from || '最早'} ~ ${to || '现在'}`
+    : days === 1 ? '今天'
+    : days > 0 ? `近 ${days} 天`
+    : '全部历史';
   closeModal();
-  downloadAuthed(qs, '正在导出全部代理结算清单…');
+  downloadAuthed(qs, '正在导出全部代理结算清单（' + scopeTxt + '）…');
 }
 
 async function editAgent(id, name, level, aname, chId) {
