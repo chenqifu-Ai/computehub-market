@@ -588,8 +588,9 @@ function* buildChunked(header, rowGen, chunkSize, prefix, summarySheets, opts) {
   const cdBuf = Buffer.concat(cds);
   const eocd = Buffer.alloc(22);
   eocd.writeUInt32LE(0x06054b50, 0);
-  eocd.writeUInt16LE(totalSheets, 8);
-  eocd.writeUInt16LE(totalSheets, 10);
+  // 【致命修复 2026-10-21】条目数 = sheet 数 + 5 个静态文件，之前只写 totalSheets → Excel 报损坏
+  eocd.writeUInt16LE(totalSheets + 5, 8);
+  eocd.writeUInt16LE(totalSheets + 5, 10);
   eocd.writeUInt32LE(cdBuf.length, 12);
   eocd.writeUInt32LE(offset, 16);
   yield cdBuf;

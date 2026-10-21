@@ -161,8 +161,13 @@ function assemble(sheetNames, sheetBufs, out) {
   const cdBuf = Buffer.concat(cds);
   const eocd = Buffer.alloc(22);
   eocd.writeUInt32LE(0x06054b50, 0);
-  eocd.writeUInt16LE(n, 8);
-  eocd.writeUInt16LE(n, 10);
+  // 【致命修复 2026-10-21】EOCD 条目数必须是「中央目录实际条目数」= sheet 数 + 5 个静态文件
+  // （[Content_Types].xml / _rels/.rels / xl/workbook.xml / xl/_rels/workbook.xml.rels / xl/styles.xml）。
+  // 之前只写 n（sheet 数），少 5 个 → Excel/SheetJS 一律报"文件已损坏/Unsupported ZIP"
+  // 而 python zipfile 只按中央目录偏移读，容忍了这个错，所以 testzip() 全绿。
+  const entryCount = n + statics.length;
+  eocd.writeUInt16LE(entryCount, 8);
+  eocd.writeUInt16LE(entryCount, 10);
   eocd.writeUInt32LE(cdBuf.length, 12);
   eocd.writeUInt32LE(offset, 16);
   write(cdBuf);
