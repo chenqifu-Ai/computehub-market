@@ -18,8 +18,12 @@ const cfg = workerData;
 
 // ---- 列前缀预编译（比逐格拼字符串快 40%） ----
 const COL = ['A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P'];
-const NUM_P = COL.map(c => '<c r="' + c + '"><v>');
-const STR_P = COL.map(c => '<c r="' + c + '" t="inlineStr"><is><t xml:space="preserve">');
+// 【修复 2026-10-21】单元格引用必须带行号：r="A" 是非法 ref，Excel 打开直接报"文件已损坏"。
+// 改成按行号生成前缀（每行 14 次字符串拼接，开销可忽略）。
+const numP = (c, r) => '<c r="' + COL[c] + r + '"><v>';
+// 去掉每格 xml:space="preserve"（40MB/96万行 × 14 列 = 大量冗余字节，压缩后再省 ~20%）
+// 需要保留前导/尾随空格的字段极少，且业务数据本身不会带空格。
+const strP = (c, r) => '<c r="' + COL[c] + r + '" t="inlineStr"><is><t>';
 const XOPEN = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
   + '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>';
 const XCLOSE = '</sheetData></worksheet>';
@@ -59,44 +63,44 @@ function makeRowFormatter(mode, quotaPerUsd) {
   if (mode === 'settle-detail') {
     // 列: 时间 类型 模型 渠道 令牌 输入 输出 总token 消费 耗时 流式 状态 错误 来源IP
     const ts = makeTsCache();
-    return (l) => '<row>'
-      + STR_P[0] + esc(ts(l.created_at)) + '</t></is></c>'
-      + STR_P[1] + (l.log_type === 'consume' ? '消费' : esc(TYPE[l.log_type] || l.log_type || '消费')) + '</t></is></c>'
-      + STR_P[2] + esc(l.model_name || '-') + '</t></is></c>'
-      + STR_P[3] + esc(l.channel_name || '-') + '</t></is></c>'
-      + STR_P[4] + esc(l.token_name || '') + '</t></is></c>'
-      + NUM_P[5] + (l.prompt_tokens || 0) + '</v></c>'
-      + NUM_P[6] + (l.completion_tokens || 0) + '</v></c>'
-      + NUM_P[7] + (l.total_tokens || 0) + '</v></c>'
-      + STR_P[8] + esc(usd(l.quota)) + '</t></is></c>'
-      + NUM_P[9] + Math.round(l.use_time || 0) + '</v></c>'
-      + STR_P[10] + (l.is_stream ? '是' : '否') + '</t></is></c>'
-      + STR_P[11] + (l.status === 'success' ? '成功' : '失败') + '</t></is></c>'
-      + STR_P[12] + esc((l.error || '').slice(0, 80)) + '</t></is></c>'
-      + STR_P[13] + esc(l.ip || '') + '</t></is></c>'
+    return (l, r) => '<row r="' + r + '">'
+      + strP(0, r) + esc(ts(l.created_at)) + '</t></is></c>'
+      + strP(1, r) + (l.log_type === 'consume' ? '消费' : esc(TYPE[l.log_type] || l.log_type || '消费')) + '</t></is></c>'
+      + strP(2, r) + esc(l.model_name || '-') + '</t></is></c>'
+      + strP(3, r) + esc(l.channel_name || '-') + '</t></is></c>'
+      + strP(4, r) + esc(l.token_name || '') + '</t></is></c>'
+      + numP(5, r) + (l.prompt_tokens || 0) + '</v></c>'
+      + numP(6, r) + (l.completion_tokens || 0) + '</v></c>'
+      + numP(7, r) + (l.total_tokens || 0) + '</v></c>'
+      + strP(8, r) + esc(usd(l.quota)) + '</t></is></c>'
+      + numP(9, r) + Math.round(l.use_time || 0) + '</v></c>'
+      + strP(10, r) + (l.is_stream ? '是' : '否') + '</t></is></c>'
+      + strP(11, r) + (l.status === 'success' ? '成功' : '失败') + '</t></is></c>'
+      + strP(12, r) + esc((l.error || '').slice(0, 80)) + '</t></is></c>'
+      + strP(13, r) + esc(l.ip || '') + '</t></is></c>'
       + '</row>';
   }
 
   // usage-detail: 时间 类型 用户 用户ID 令牌 模型 输入 缓存读 未命中 命中率 输出 花费 耗时 流式
   const ts = makeTsCache();
-  return (l) => {
+  return (l, r) => {
     const ca = l.cached_tokens || 0;
     const hit = l.prompt_tokens ? Math.round(ca / l.prompt_tokens * 100) + '%' : '';
-    return '<row>'
-      + STR_P[0] + esc(ts(l.created_at)) + '</t></is></c>'
-      + STR_P[1] + (l.log_type === 'consume' ? '消费' : esc(TYPE[l.log_type] || l.log_type || '消费')) + '</t></is></c>'
-      + STR_P[2] + esc(l.username || '') + '</t></is></c>'
-      + NUM_P[3] + (l.user_id || 0) + '</v></c>'
-      + STR_P[4] + esc(l.token_name || '') + '</t></is></c>'
-      + STR_P[5] + esc(l.model_name || '') + '</t></is></c>'
-      + NUM_P[6] + (l.prompt_tokens || 0) + '</v></c>'
-      + NUM_P[7] + ca + '</v></c>'
-      + NUM_P[8] + Math.max(0, (l.prompt_tokens || 0) - ca) + '</v></c>'
-      + STR_P[9] + esc(hit) + '</t></is></c>'
-      + NUM_P[10] + (l.completion_tokens || 0) + '</v></c>'
-      + STR_P[11] + esc(yuan(l.quota)) + '</t></is></c>'
-      + NUM_P[12] + Math.round(l.use_time || 0) + '</v></c>'
-      + STR_P[13] + (l.is_stream ? '是' : '否') + '</t></is></c>'
+    return '<row r="' + r + '">'
+      + strP(0, r) + esc(ts(l.created_at)) + '</t></is></c>'
+      + strP(1, r) + (l.log_type === 'consume' ? '消费' : esc(TYPE[l.log_type] || l.log_type || '消费')) + '</t></is></c>'
+      + strP(2, r) + esc(l.username || '') + '</t></is></c>'
+      + numP(3, r) + (l.user_id || 0) + '</v></c>'
+      + strP(4, r) + esc(l.token_name || '') + '</t></is></c>'
+      + strP(5, r) + esc(l.model_name || '') + '</t></is></c>'
+      + numP(6, r) + (l.prompt_tokens || 0) + '</v></c>'
+      + numP(7, r) + ca + '</v></c>'
+      + numP(8, r) + Math.max(0, (l.prompt_tokens || 0) - ca) + '</v></c>'
+      + strP(9, r) + esc(hit) + '</t></is></c>'
+      + numP(10, r) + (l.completion_tokens || 0) + '</v></c>'
+      + strP(11, r) + esc(yuan(l.quota)) + '</t></is></c>'
+      + numP(12, r) + Math.round(l.use_time || 0) + '</v></c>'
+      + strP(13, r) + (l.is_stream ? '是' : '否') + '</t></is></c>'
       + '</row>';
   };
 }
@@ -119,7 +123,7 @@ function run() {
 
   const fmtRow = makeRowFormatter(cfg.mode, cfg.quotaPerUsd);
   const headerXml = '<row r="1">' + (cfg.header || []).map((v, c) =>
-    '<c r="' + COL[c] + '1" t="inlineStr"><is><t xml:space="preserve">' + esc(v) + '</t></is></c>').join('') + '</row>';
+    '<c r="' + COL[c] + '1" t="inlineStr"><is><t>' + esc(v) + '</t></is></c>').join('') + '</row>';
 
   const CHUNK = cfg.chunkSize || 50000;
   const BATCH = CHUNK;   // 每批正好一个 sheet，批边界 = flush 边界，不会漏行
@@ -148,7 +152,8 @@ function run() {
     const rows = stmt.all(cfg.hi, cfg.lo, ...fixed, cursor, lim);
     if (!rows.length) break;
     for (const l of rows) {
-      pending.push(fmtRow(l));
+      // 行号 = pendingRows + 2（第 1 行是表头）
+      pending.push(fmtRow(l, pendingRows + 2));
       pendingRows++;
       rowsDone++;
     }

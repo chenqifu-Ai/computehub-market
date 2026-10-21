@@ -28,6 +28,15 @@ function fmtTs(ms) {
 }
 function send(o) { process.stdout.write(JSON.stringify(o) + '\n'); }
 
+/** Excel sheet 名规则：≤31 字符，且禁止 \ / ? * [ ] : */
+function sanitizeSheetName(n) {
+  return String(n).replace(/[\\\/\?\*\[\]:]/g, '-').slice(0, 31) || 'Sheet';
+}
+/** 分片 sheet 名：总量>1 时带序号（用 - 而不是 /） */
+function sheetName(base, idx, total) {
+  return sanitizeSheetName(total > 1 ? base + idx + '-' + total : base);
+}
+
 const NEED_ESC = /[&<>"]/;
 function esc(v) {
   const s = String(v == null ? '' : v);
@@ -118,9 +127,19 @@ function assemble(sheetNames, sheetBufs, out) {
     + '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>';
   let wb = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>';
   let rels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">';
+  // sheet 名：清洗非法字符 + 去重（重名 Excel 同样会判损坏）
+  const seen = new Set();
+  const finalNames = [];
+  for (let i = 0; i < n; i++) {
+    let nm = sanitizeSheetName(sheetNames[i]);
+    let base = nm, k = 2;
+    while (seen.has(nm)) { nm = sanitizeSheetName(base.slice(0, 27) + '~' + (k++)); }
+    seen.add(nm);
+    finalNames.push(nm);
+  }
   for (let i = 0; i < n; i++) {
     ct += '<Override PartName="/xl/worksheets/sheet' + (i + 1) + '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>';
-    wb += '<sheet name="' + esc(sheetNames[i]) + '" sheetId="' + (i + 1) + '" r:id="rId' + (i + 1) + '"/>';
+    wb += '<sheet name="' + esc(finalNames[i]) + '" sheetId="' + (i + 1) + '" r:id="rId' + (i + 1) + '"/>';
     rels += '<Relationship Id="rId' + (i + 1) + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet' + (i + 1) + '.xml"/>';
   }
   ct += '</Types>';
@@ -333,8 +352,8 @@ function run() {
         const total = parts.length;
         parts.forEach((p, i) => {
           sumBufs.push({ data: fs.readFileSync(p.file), precomp: true, rawSize: p.rawSize, crc: p.crc });
-          if (total > 1) names.push('调用明细' + (i + 1) + '/' + total);
-          else names.push('调用明细');
+          // 【修复 2026-10-21】sheet 名禁用字符 \ / ? * [ ] : —— 原先用 "1/2" 导致 Excel 报文件损坏
+          names.push(sheetName(total > 1 ? '调用明细' : '调用明细', i + 1, total));
           fs.unlinkSync(p.file);
         });
         const bytes = assemble(names, sumBufs, outFile);
@@ -378,9 +397,10 @@ function run() {
         const bufs = [{ data: Buffer.from(sheetXml(sum), 'utf8') }];
         const names = ['按模型汇总'];
         const total = parts.length;
+        const baseName = cfg.all ? '全部明细' : '使用日志';
         parts.forEach((p, i) => {
           bufs.push({ data: fs.readFileSync(p.file), precomp: true, rawSize: p.rawSize, crc: p.crc });
-          names.push(total > 1 ? (cfg.all ? '全部明细' : '使用日志') + (i + 1) + '/' + total : (cfg.all ? '全部明细' : '使用日志'));
+          names.push(sheetName(baseName, i + 1, total));
           fs.unlinkSync(p.file);
         });
         const bytes = assemble(names, bufs, outFile);
