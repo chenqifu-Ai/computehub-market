@@ -156,12 +156,16 @@ function assemble(sheetNames, sheetBufs, out) {
 function runShards(cfg, { header, where, params, cap, mode, tmpDir, quotaPerUsd }) {
   return new Promise((resolve, reject) => {
     const db = new DatabaseSync(cfg.dbPath, { readOnly: true });
-    // cap 精确截断：按 id DESC 取第 cap 条记录的 id 作为下界（比事后裁剪 XML 简单可靠）
+    // cap 精确截断：先 COUNT，只有真的超限才去定位边界 id。
+    // 旧写法无条件 `ORDER BY id DESC LIMIT 1 OFFSET cap-1`：数据量远小于 cap 时
+    // 仍要扫一遍全索引找 OFFSET，白白多花 8~10s（“最近 7 天”场景就是 4 万行 vs cap 200 万）。
     let lowerBound = null;
     if (Number.isFinite(cap) && cap > 0) {
-      const cut = db.prepare(`SELECT id FROM logs WHERE ${where} ORDER BY id DESC LIMIT 1 OFFSET ?`).get(...params, cap - 1);
-      if (cut && cut.id) lowerBound = cut.id;
-      else lowerBound = 0;   // 行数不足 cap → 不设下界
+      const cnt = db.prepare(`SELECT COUNT(*) c FROM logs WHERE ${where}`).get(...params).c;
+      if (cnt > cap) {
+        const cut = db.prepare(`SELECT id FROM logs WHERE ${where} ORDER BY id DESC LIMIT 1 OFFSET ?`).get(...params, cap - 1);
+        if (cut && cut.id) lowerBound = cut.id;
+      }
     }
     const whereCap = lowerBound === null ? where : `(${where}) AND id >= ${Number(lowerBound)}`;
 
@@ -175,7 +179,13 @@ function runShards(cfg, { header, where, params, cap, mode, tmpDir, quotaPerUsd 
 
     let finished = 0;
     const collected = new Array(N);
+    const shardRows = new Array(N).fill(0);
+    const shardParts = new Array(N).fill(0);
     let totalRows = 0;
+    const totalRowsEst = span.b - span.a + 1 > 100000 ? null : null;   // 预留
+
+    // 先给前端一个“开始干活”的信号，避免开头空白
+    send({ t: 'progress', rows: 0, chunks: 0, sent: 0, shards: N });
 
     for (let i = 0; i < N; i++) {
       const lo = span.a + i * step;
@@ -188,12 +198,17 @@ function runShards(cfg, { header, where, params, cap, mode, tmpDir, quotaPerUsd 
       });
       collected[i] = { parts: [], rows: 0 };
       w.on('message', (m) => {
-        if (m.t === 'progress') { send({ t: 'progress', rows: m.rows, chunks: 0, sent: 0, shards: i + 1 }); }
-        else if (m.t === 'done') {
+        if (m.t === 'progress') {
+          const prev = shardRows[m.idx];
+          shardRows[m.idx] = m.rows;
+          shardParts[m.idx] = m.parts || 0;
+          totalRows += (m.rows - prev);
+          // 片数 = 各分片已生成的 sheet 数之和（前端进度条依靠它）
+          const partsDone = shardParts.reduce((a, b) => a + b, 0);
+          send({ t: 'progress', rows: totalRows, chunks: partsDone, sent: partsDone, shards: N });
+        } else if (m.t === 'done') {
           collected[m.idx].parts = m.parts;
           collected[m.idx].rows = m.rows;
-          totalRows += m.rows;
-          send({ t: 'progress', rows: totalRows, chunks: 0, sent: 0, shards: N });
         } else if (m.t === 'error') {
           reject(new Error('shard ' + m.idx + ': ' + m.message));
         }
@@ -228,8 +243,12 @@ function settleSummaries(db, u, since, until, Q) {
   const rc = db.prepare(`SELECT COALESCE(SUM(quota),0) q FROM logs WHERE ${where} AND log_type='recharge'`).get(...v).q;
   const span = db.prepare('SELECT MIN(created_at) f, MAX(created_at) l FROM logs WHERE user_id=?').get(u.id);
 
-  const dw = `user_id=? AND log_type='consume'`;
+  // 明细筛选：必须带上日期范围，否则「最近 7 天」会导出全量（踩过）
+  const dcond = [`user_id=?`, `log_type='consume'`];
   const dv = [u.id];
+  if (since) { dcond.push('created_at>=?'); dv.push(since); }
+  if (until) { dcond.push('created_at<=?'); dv.push(until); }
+  const dw = dcond.join(' AND ');
 
   const byModel = db.prepare(`SELECT model_name, COUNT(*) c, COALESCE(SUM(prompt_tokens),0) tin,
      COALESCE(SUM(completion_tokens),0) tout, COALESCE(SUM(total_tokens),0) tok, COALESCE(SUM(quota),0) q
@@ -280,10 +299,10 @@ function run() {
       if (mode === 'settle-single') {
         const u = db.prepare('SELECT * FROM users WHERE id=?').get(cfg.userId);
         if (!u) throw new Error('用户不存在: ' + cfg.userId);
-        const { agg, rc, span, dw, mSheet, cSheet, rwSheet, rwSheet2, usd } = settleSummaries(db, u, cfg.since, cfg.until, Q);
+        const { agg, rc, span, dw, dv, mSheet, cSheet, rwSheet, rwSheet2, usd } = settleSummaries(db, u, cfg.since, cfg.until, Q);
         const cap = cfg.limit || 500000;
 
-        const detailCount = db.prepare(`SELECT COUNT(*) c FROM logs WHERE ${dw}`).get(u.id).c;
+        const detailCount = db.prepare(`SELECT COUNT(*) c FROM logs WHERE ${dw}`).get(...dv).c;
         const info = [
           ['结算清单', ''], ['用户名', u.username], ['用户ID', String(u.id)],
           ['角色', u.role >= 100 ? '管理员' : '用户'], ['状态', u.status === 1 ? '启用' : '禁用'],
@@ -301,7 +320,7 @@ function run() {
 
         const header = ['时间', '类型', '模型', '渠道', '令牌', '输入token', '输出token', '总token', '消费(USD)', '耗时(秒)', '流式', '状态', '错误', '来源IP'];
         const parts = await runShards(cfg, {
-          header, where: dw, params: [u.id], cap, mode: 'settle-detail', tmpDir, quotaPerUsd: Q,
+          header, where: dw, params: dv, cap, mode: 'settle-detail', tmpDir, quotaPerUsd: Q,
         });
 
         const sumBufs = [

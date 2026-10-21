@@ -488,6 +488,15 @@ const server = http.createServer(async (req, res) => {
       const u = requireUser(req, res); if (!u) return;
       const j = _exportJobs.get(query.get('job') || '');
       if (!j) return json(res, 404, { success: false, message: '任务不存在或已过期' });
+      // 【2026-10-21】meta=1 只查状态不下载。前端轮询必须用这个，否则 done 时接口返回二进制，
+      // 前端 sr.json() 解析失败 → 一直卡在「正在生成… 已用 Ns」永不结束。
+      if (query.get('meta') === '1') {
+        return json(res, 200, {
+          success: true, status: j.status, started: j.started,
+          progress: j.progress || null, fname: j.fname || '',
+          size: j.size || 0, error: j.error || null,
+        });
+      }
       // 【2026-10-21】补 progress：前端据此画进度条，之前漏传导致界面永远停在“提交中 0s”
       if (j.status === 'running') return json(res, 200, { success: true, status: 'running', started: j.started, progress: j.progress || null, fname: j.fname || '' });
       if (j.status === 'error') return json(res, 200, { success: true, status: 'error', error: j.error });

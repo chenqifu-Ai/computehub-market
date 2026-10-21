@@ -139,7 +139,7 @@ function run() {
     outParts.push({ file, rawSize: raw.length, compSize: comp.length, crc: zlib.crc32(raw) >>> 0, rows: pendingRows });
     seq++;
     pending = []; pendingRows = 0;
-    parentPort.postMessage({ t: 'progress', idx: cfg.idx, rows: rowsDone });
+    parentPort.postMessage({ t: 'progress', idx: cfg.idx, rows: rowsDone, parts: seq });
   }
 
   let cursor = cfg.hi + 1;   // 半开区间上界（不含）

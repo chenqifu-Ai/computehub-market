@@ -560,7 +560,7 @@ function downloadXlsx(all) {
     toast('导出任务已启动，后台生成中（不影响页面操作）…');
     const timer = setInterval(async () => {
       try {
-        const r = await fetch(`/api/log/export/job?job=${job}`, { headers: { Authorization: SCHEME + SESSION } });
+        const r = await fetch(`/api/log/export/job?meta=1&job=${job}`, { headers: { Authorization: SCHEME + SESSION } });
         const ct = r.headers.get('content-type') || '';
         if (ct.includes('json')) {
           const s = await r.json();
@@ -693,7 +693,7 @@ function downloadSettle(user) {
     </div>`);
 }
 function doSettleExport(user) {
-  let qs = '/api/settle/export?user=' + encodeURIComponent(user);
+  let qs = '/api/settle/export?user=' + encodeURIComponent(user) + '&limit=2000000';
   const from = ($('stFrom') && $('stFrom').value) || '';
   const to = ($('stTo') && $('stTo').value) || '';
   if (from || to) {
@@ -704,7 +704,55 @@ function doSettleExport(user) {
     if (days > 0) qs += '&days=' + days;
   }
   closeModal();
-  downloadAuthed(qs, '正在导出结算清单…');
+  // 异步 job 模式：提交后轮询状态，完成自动下载（大数据量不卡页面）
+  settleJobExport(qs, '正在生成结算清单…');
+}
+async function settleJobExport(qs, tip) {
+  const box = $("dlProgress"); const bar = $("dlBar"); const txt = $("dlText");
+  const show = (t) => { if (txt) txt.textContent = t; if (box) box.classList.remove('hidden'); };
+  const hide = () => { if (box) box.classList.add('hidden'); };
+  const t0 = performance.now();
+  show(tip + ' 提交中… 已用 0s');
+  if (bar) bar.style.width = '5%';
+  try {
+    const r = await fetch(qs, { headers: SESSION ? { Authorization: SCHEME + SESSION } : {} });
+    const j = await r.json().catch(() => ({}));
+    if (!j.success || !j.job) { hide(); return toast(j.message || '导出失败', 'err'); }
+    const job = j.job;
+    // 轮询状态
+    // 【修复 2026-10-21】必须带 meta=1：不带时任务 done 后接口直接回文件二进制，
+    // sr.json() 解析失败 → sj 为空 → 落入 else 无限轮询，页面永远停在「已用 Ns」。
+    const tick = async () => {
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(0);
+      try {
+        const sr = await fetch(`/api/log/export/job?meta=1&job=${job}`, { headers: { Authorization: SCHEME + SESSION }, signal: AbortSignal.timeout(15000) });
+        const sj = await sr.json().catch(() => ({}));
+        if (sj.status === 'running') {
+          const p = sj.progress || {};
+          const rows = p.rows || 0, chunks = p.chunks || 0;
+          show(`正在生成结算清单… ${rows ? rows.toLocaleString() + ' 行' : '读取中'}${chunks ? ' / ' + chunks + ' 片' : ''} · 已用 ${elapsed}s（数据量大请耐心等待，请勿关闭页面）`);
+          if (bar) bar.style.width = Math.min(90, 5 + chunks * 4) + '%';
+          setTimeout(tick, 1500);
+        } else if (sj.status === 'error') {
+          hide(); toast('导出失败：' + (sj.error || '未知错误'), 'err');
+        } else if (sj.status === 'done') {
+          // 下载文件
+          show('生成完成，正在下载…');
+          if (bar) bar.style.width = '100%';
+          await downloadAuthed(`/api/log/export/job?job=${job}`, '结算清单');
+          setTimeout(hide, 1500);
+        } else {
+          setTimeout(tick, 1500);
+        }
+      } catch (e) {
+        // 单次请求超时/网络抖动不该中断轮询
+        let n = (tick._fails = (tick._fails || 0) + 1);
+        if (n > 20) { hide(); return toast('导出状态查询失败，请到下载中心查看', 'err'); }
+        setTimeout(tick, 2000);
+      }
+    };
+    setTimeout(tick, 1000);
+  } catch (e) { hide(); toast('导出失败：' + e.message, 'err'); }
 }
 if ($('btnSettleAll')) $('btnSettleAll').onclick = () => downloadSettle('all');
 if ($('btnSettleSelf')) $('btnSettleSelf').onclick = () => downloadSettle('me');
