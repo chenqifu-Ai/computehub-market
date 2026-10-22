@@ -11,6 +11,32 @@ let logPage = 1;
 const LOG_SIZE = 20;
 let allModels = [];
 
+// ---------- LOGO 自定义（2026-10-22 v5） ----------
+// settings.logo_data（dataURL）> 内置默认 /logo.svg
+// 应用：登录页大图 / 侧栏 / favicon。img dataURL 可直接喂 <img> 和 favicon link。
+const LOGO_TARGETS = () => [
+  document.querySelector('.auth-logo img'),
+  document.querySelector('.side-logo img'),
+];
+function applyLogo(dataUrl) {
+  const url = dataUrl || '/logo.svg';
+  for (const img of LOGO_TARGETS()) { if (img) img.src = url; }
+  // favicon
+  let link = document.querySelector('link[rel="icon"]');
+  if (!link) {
+    link = document.createElement('link');
+    link.rel = 'icon';
+    document.head.appendChild(link);
+  }
+  link.type = dataUrl ? (dataUrl.slice(5, dataUrl.indexOf(';')) || 'image/png') : 'image/svg+xml';
+  link.href = url;
+}
+async function loadLogo() {
+  try {
+    const j = await fetch('/api/logo').then(r => r.json()).catch(() => null);
+    applyLogo(j && j.success ? j.data : null);
+  } catch { applyLogo(null); }
+}
 // ---------- 工具 ----------
 function toast(msg, type) {
   const t = $('toast');
@@ -192,6 +218,7 @@ function enterApp() {
   document.querySelectorAll('.docBase').forEach(e => e.textContent = base);
   refreshBalance();
   loadAnnounce();
+  loadLogo();
   checkinState();
   goto('dashboard');
 }
@@ -1517,6 +1544,7 @@ async function loadSettings() {
     if ($('sR3')) $('sR3').value = s.agent_reward_l3 || 0;
     $('sAnnounce').value = s.announcement || '';
   }
+  loadSettingsLogoPreview();
   const st = await api('/api/admin/stats');
   if (st.success) {
     const d = st.data;
@@ -1561,13 +1589,52 @@ $('btnSaveSettings').onclick = async () => {
     agent_reward_l2: $('sR2') ? $('sR2').value : undefined, agent_reward_l3: $('sR3') ? $('sR3').value : undefined,
     announcement: $('sAnnounce').value.trim(),
   };
+  // LOGO：选了新图才带 logo_data；恢复默认模式带 logo_clear
+  if (__logoMode === 'set' && __logoData) b.logo_data = __logoData;
+  if (__logoMode === 'clear') b.logo_clear = 1;
   const j = await api('/api/settings', { method: 'POST', body: JSON.stringify(b) });
   if (!j.success) return toast(j.message, 'err');
   toast('✅ 设置已保存');
   $('sideSite').textContent = b.site_name || '算力商城';
   document.title = b.site_name || '算力商城';
   loadAnnounce();
+  // LOGO 立即全站生效
+  if (__logoMode === 'set' && __logoData) { applyLogo(__logoData); }
+  else if (__logoMode === 'clear') { applyLogo(null); }
+  __logoMode = 'none'; __logoData = null;
+  loadSettingsLogoPreview();
 };
+// LOGO 上传状态
+let __logoMode = 'none', __logoData = null;
+async function loadSettingsLogoPreview() {
+  const img = $('sLogoPreview');
+  if (!img) return;
+  try {
+    const j = await fetch('/api/logo').then(r => r.json()).catch(() => null);
+    img.src = (j && j.success && j.data) ? j.data : '/logo.svg';
+  } catch { img.src = '/logo.svg'; }
+}
+document.getElementById('sLogoFile').addEventListener('change', (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  if (f.size > 2 * 1024 * 1024) { toast('图片超过 2MB，请压缩后上传', 'err'); e.target.value = ''; return; }
+  const rd = new FileReader();
+  rd.onload = () => {
+    __logoMode = 'set';
+    __logoData = String(rd.result);
+    const prev = $('sLogoPreview');
+    if (prev) prev.src = __logoData;
+    toast('图片已就绪，点「保存设置」生效', 'ok');
+  };
+  rd.readAsDataURL(f);
+});
+document.getElementById('btnLogoClear').addEventListener('click', () => {
+  __logoMode = 'clear'; __logoData = null;
+  $('sLogoFile').value = '';
+  const prev = $('sLogoPreview');
+  if (prev) prev.src = '/logo.svg';
+  toast('已选择恢复默认，点「保存设置」生效', 'ok');
+});
 
 // ---------- 个人设置 ----------
 async function loadProfile() {

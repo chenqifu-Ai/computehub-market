@@ -402,6 +402,17 @@
           <div><label>三级返佣比例（0.02=2%）</label><input id="sR3" type="number" step="0.01"></div>
           <div><label>公告（留空不显示）</label><input id="sAnnounce"></div>
         </div>
+        <div style="margin-top:16px;padding:14px;border:1px dashed var(--border);border-radius:10px">
+          <div style="font-weight:600;font-size:13.5px;margin-bottom:10px">🎨 站点 LOGO</div>
+          <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+            <img id="sLogoPreview" src="/logo.svg" alt="LOGO 预览" style="width:56px;height:56px;border-radius:14px;object-fit:cover;border:1px solid var(--border)">
+            <div style="flex:1;min-width:220px">
+              <input type="file" id="sLogoFile" accept="image/png,image/jpeg,image/webp,image/svg+xml" style="font-size:12.5px">
+              <div class="muted" style="font-size:12px;margin-top:6px">支持 PNG/JPG/WebP/SVG，≤2MB。不.upload 则保持当前 LOGO（默认「创」字渐变章）。应用位置：浏览器标签 favicon · 登录页 · 侧栏。</div>
+            </div>
+            <button class="btn-ghost sm" id="btnLogoClear" style="align-self:flex-start">恢复默认</button>
+          </div>
+        </div>
         <button class="btn-primary" id="btnSaveSettings" style="margin-top:16px;max-width:220px">保存设置</button>
       </div>
       <div class="panel">

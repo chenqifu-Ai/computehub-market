@@ -861,7 +861,24 @@ const server = http.createServer(async (req, res) => {
       const u = requireUser(req, res); if (!u) return;
       if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
       const b = await readJson(req) || {};
-      return json(res, 200, { success: true, data: store.setSettings(db, b) });
+      // 【2026-10-22 v5】LOGO 自定义：logo_data = dataURL（png/jpg/webp/svg），logo_clear=1 恢复默认
+      if (b.logo_clear === 1) {
+        db.prepare("DELETE FROM settings WHERE key='logo_data'").run();
+      }
+      if (typeof b.logo_data === 'string') {
+        const d = b.logo_data;
+        const ok = d.startsWith('data:image/') && d.length >= 24 && d.length <= 3 * 1024 * 1024;
+        if (!ok) return json(res, 400, { success: false, message: 'logo_data 需为 data:image/* 且 ≤2MB' });
+        db.prepare("INSERT INTO settings (key,value) VALUES ('logo_data',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(d);
+      }
+      const out = store.setSettings(db, b);
+      delete out.logo_data; // 不在普通 settings 回显（体积大），单独给 logo 接口
+      return json(res, 200, { success: true, data: out });
+    }
+    // 【2026-10-22 v5】LOGO 数据接口：GET /api/logo → { data: dataURL|null }（公开；页面加载即刻渲染）
+    if (pathname === '/api/logo' && req.method === 'GET') {
+      const row = db.prepare("SELECT value FROM settings WHERE key='logo_data'").get();
+      return json(res, 200, { success: true, data: row ? row.value : null });
     }
     // 【2026-10-21】/api/admin/stats 已合并到下方主实现（含 ops 运营面板），此处删除重复路由
 
