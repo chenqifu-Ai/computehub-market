@@ -1127,20 +1127,36 @@ async function exportAccount(id, name, logCount) {
   const MAX_RETRY = 6;
   try {
     for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
-      // 重试时不重新发起“边生成边发”，改走 resume=1 模式从文件续传
-      const url = attempt === 0
-        ? `/api/admin/user/export?id=${id}&wait=1`
-        : `/api/admin/user/export?id=${id}&resume=1&offset=${got}`;
-      let r;
-      try {
-        r = await fetch(url, { headers: { Authorization: SCHEME + SESSION } });
-      } catch (e) {
-        if (attempt < MAX_RETRY && got > 0) {
-          setMigrateProgress(`⚠️ 网络中断，从 ${(got / 1048576).toFixed(1)}MB 断点续传（第 ${attempt} 次重试）…`);
-          await new Promise(res => setTimeout(res, 2000 * attempt));
-          continue;
+      // 【修复 10-22】首次也先探测是否有现成包：有 → 直接 resume，不再重新生成。
+      // 只有确认无包（404/no-file）才走 wait=1 生成。
+      let url;
+      if (attempt === 0 && !got) {
+        // 探测：probe=1 只查不生成。有包 → 直接 resume 拉取；无包 → wait=1 生成
+        let probe = await fetch(`/api/admin/user/export?id=${id}&probe=1`, { headers: { Authorization: SCHEME + SESSION } }).catch(() => null);
+        let hasFile = false;
+        let fileSize = 0;
+        if (probe && probe.ok) { try { const pj = await probe.json(); hasFile = !!pj.hasFile; fileSize = pj.size || 0; } catch {} }
+        if (hasFile) {
+          // 有现成包：直接拉取（服务器文件已存在，无需重新生成）
+          setMigrateProgress(`服务器已有现成包（${(fileSize / 1048576).toFixed(0)}MB），直接开始传输…`);
+          r = await fetch(`/api/admin/user/export?id=${id}&resume=1&offset=0`, { headers: { Authorization: SCHEME + SESSION } });
+          if (!r.ok) throw new Error('续传拉取失败 ' + r.status);
+        } else {
+          // 无包 → 正常生成
+          r = await fetch(`/api/admin/user/export?id=${id}&wait=1`, { headers: { Authorization: SCHEME + SESSION } });
         }
-        throw e;
+      } else {
+        url = `/api/admin/user/export?id=${id}&resume=1&offset=${got}`;
+        try {
+          r = await fetch(url, { headers: { Authorization: SCHEME + SESSION } });
+        } catch (e) {
+          if (attempt < MAX_RETRY && got > 0) {
+            setMigrateProgress(`⚠️ 网络中断，从 ${(got / 1048576).toFixed(1)}MB 断点续传（第 ${attempt} 次重试）…`);
+            await new Promise(res => setTimeout(res, 2000 * attempt));
+            continue;
+          }
+          throw e;
+        }
       }
       if (r.status === 416) { hideMigrateProgress(); toast('服务器文件已过期（保留 24 小时），请重新导出', 'err'); return; }
       if (!r.ok && r.status !== 206) { const j = await r.json().catch(() => ({})); throw new Error(j.message || r.status); }

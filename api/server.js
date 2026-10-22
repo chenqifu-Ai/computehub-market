@@ -938,6 +938,11 @@ const server = http.createServer(async (req, res) => {
       const disposition = `attachment; filename="account-migration-${target.id}.jsonl"; filename*=UTF-8''${encodeURIComponent(fname)}`;
 
       // ---- 续传分支：文件已存在 → 直接从 offset 发（不重新生成）----
+      // 【2026-10-22】probe=1 只探测是否有现成包（不触发重新生成）：有包 hasFile:true，无包 noFile:true
+      if (query.get('probe') === '1') {
+        if (fs.existsSync(migFile)) return json(res, 200, { success: true, hasFile: true, size: fs.statSync(migFile).size });
+        return json(res, 200, { success: true, noFile: true });
+      }
       const resumeOffset = parseInt(query.get('resume') === '1' ? (query.get('offset') || '0') : '-1', 10);
       if (resumeOffset >= 0 && fs.existsSync(migFile)) {
         const size = fs.statSync(migFile).size;
