@@ -958,12 +958,15 @@ const server = http.createServer(async (req, res) => {
           return res.end();
         }
         console.log(`[migrate] 续传帐号 ${target.username}(#${target.id}) bytes=${start}-${size}`);
+        const mTime = fs.statSync(migFile).mtime.toUTCString();
         res.writeHead(206, {
           'Content-Type': 'application/x-ndjson; charset=utf-8',
           'Content-Disposition': disposition,
           'Content-Range': `bytes ${start}-${size - 1}/${size}`,
           'Content-Length': size - start,
           'Accept-Ranges': 'bytes', 'X-Migrate-Total': String(size),
+          'ETag': `"m-${target.id}-${size}"`,
+          'Last-Modified': mTime,
           'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*',
         });
         const st = fs.createReadStream(migFile, { start });
@@ -1013,6 +1016,7 @@ const server = http.createServer(async (req, res) => {
             'Content-Type': 'application/x-ndjson; charset=utf-8',
             'Content-Disposition': disposition,
             'Content-Length': size, 'Accept-Ranges': 'bytes', 'X-Migrate-Total': String(size),
+            'ETag': `"m-${target.id}-${size}"`, 'Last-Modified': fs.statSync(migFile).mtime.toUTCString(),
             'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*',
           });
           const st = fs.createReadStream(migFile);
@@ -1028,6 +1032,7 @@ const server = http.createServer(async (req, res) => {
             'Content-Type': 'application/x-ndjson; charset=utf-8',
             'Content-Disposition': disposition,
             'Content-Length': size, 'Accept-Ranges': 'bytes', 'X-Migrate-Total': String(size),
+            'ETag': `"m-${target.id}-${size}"`, 'Last-Modified': fs.statSync(migFile).mtime.toUTCString(),
             'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*',
           });
           const st = fs.createReadStream(migFile);
@@ -1045,6 +1050,7 @@ const server = http.createServer(async (req, res) => {
           'Content-Type': 'application/x-ndjson; charset=utf-8',
           'Content-Disposition': disposition,
           'Content-Length': size, 'Accept-Ranges': 'bytes', 'X-Migrate-Total': String(size),
+          'ETag': `"m-${target.id}-${size}"`, 'Last-Modified': fs.statSync(migFile).mtime.toUTCString(),
           'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*',
         });
         const st = fs.createReadStream(migFile);
