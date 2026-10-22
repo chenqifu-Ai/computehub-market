@@ -996,9 +996,32 @@ const server = http.createServer(async (req, res) => {
         })();
       };
 
+      // wait=1&nostream=1：只生成落盘，返回 JSON {ok:true,size}（配合前端把下载交给浏览器原生下载器）
+      if (query.get('wait') === '1' && query.get('nostream') === '1') {
+        if (!fs.existsSync(migFile)) {
+          await new Promise((resolve) => finalize(() => resolve()));
+        }
+        const size = fs.statSync(migFile).size;
+        return json(res, 200, { success: true, ok: true, size });
+      }
       // 支持两种模式：wait=1（等生成完再发，配合前端直接流式下载）；默认（立即以流式发送边生成边发，兼容旧前端）
       if (query.get('wait') === '1') {
-        // 先响应 202 让前端轮询（用 X-Migrate-Job 标识）；实际上简化：同步等生成完（~20s），再发文件
+        // 【2026-10-22 铁律】文件已存在 → 无论哪个模式都不重新生成，直接发文件（防旧前端反复覆盖落盘包）
+        if (fs.existsSync(migFile)) {
+          const size = fs.statSync(migFile).size;
+          res.writeHead(200, {
+            'Content-Type': 'application/x-ndjson; charset=utf-8',
+            'Content-Disposition': disposition,
+            'Content-Length': size, 'Accept-Ranges': 'bytes', 'X-Migrate-Total': String(size),
+            'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*',
+          });
+          const st = fs.createReadStream(migFile);
+          st.on('error', () => { try { res.destroy(); } catch {} });
+          st.pipe(res);
+          res.on('close', () => {});
+          return;
+        }
+        // 文件不存在才生成
         finalize(() => {
           const size = fs.statSync(migFile).size;
           res.writeHead(200, {
@@ -1015,6 +1038,21 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       // 兼容旧前端：边生成边发（原逻辑），同时落盘
+      // 【2026-10-22】文件已存在 → 短路直发文件，不重新生成（防旧前端每次点击覆盖已落盘包）
+      if (fs.existsSync(migFile)) {
+        const size = fs.statSync(migFile).size;
+        res.writeHead(200, {
+          'Content-Type': 'application/x-ndjson; charset=utf-8',
+          'Content-Disposition': disposition,
+          'Content-Length': size, 'Accept-Ranges': 'bytes', 'X-Migrate-Total': String(size),
+          'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*',
+        });
+        const st = fs.createReadStream(migFile);
+        st.on('error', () => { try { res.destroy(); } catch {} });
+        st.pipe(res);
+        res.on('close', () => {});
+        return;
+      }
       res.writeHead(200, {
         'Content-Type': 'application/x-ndjson; charset=utf-8',
         'Content-Disposition': disposition,

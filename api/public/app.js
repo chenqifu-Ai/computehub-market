@@ -1109,94 +1109,43 @@ async function loadUsers() {
 // 一键导出单个帐号：流式下载 JSONL（令牌含明文 key / 全量日志 / 资金流水 / 签到 / 审计）
 async function exportAccount(id, name, logCount) {
   const lc = parseInt(logCount || 0, 10);
-  // 【2026-10-22】预估耗时：包 ~530B/行；生成 ~0.21s/万行(大帐号游批优化后 ~21s封顶210s)；传输 ECS→浏览器 ~6.1MB/s
+  // 【2026-10-22】预估耗时：包 ~530B/行；生成 ~21s/百万行封顶；传输 ECS→浏览器 ~6.1MB/s
   const estSizeMB = lc * 530 / 1048576;
   const estGenS = lc === 0 ? 0 : Math.min(210, Math.max(0.3, lc / 10000 * 0.21));
   const estDlS = estSizeMB / 6.1;
   const fmtT = s => s < 1 ? '<1s' : s < 60 ? Math.round(s) + 's' : Math.round(s / 6) / 10 + ' 分钟';
   const estMsg = lc === 0 ? '包几乎为空，秒下'
     : `包 ≈${estSizeMB.toFixed(0)}MB · 生成 ${fmtT(estGenS)} + 传输 ${fmtT(estDlS)} ≈ ${fmtT(estGenS + estDlS)}`;
-  const ok = confirm(`导出帐号 ${name}(#${id}) 的全部数据？\n\n包含：余额/角色/代理信息、API 令牌（含明文 key）、全部调用日志、资金流水、签到记录。\n\n文件为 .jsonl，导入到另一台实例后该帐号即可正常使用。\n\n⏱️ 预计：${estMsg}（中断自动从断点续传，无需重来）`);
+  const ok = confirm(`导出帐号 ${name}(#${id}) 的全部数据？\n\n包含：余额/角色/代理信息、API 令牌（含明文 key）、全部调用日志、资金流水、签到记录。\n\n文件为 .jsonl，导入到另一台实例后该帐号即可正常使用。\n\n⏱️ 预计：${estMsg}\n📥 走浏览器下载管理器：断线自动续传、后台下载不占内存，中断后重试同一链接即续传`);
   if (!ok) return;
-  // 【2026-10-22 断点续传版】中断自动从已收字节续传（最多 6 次）；服务端落盘保留 24h
-  showMigrateProgress(`正在导出 ${name} …（⏱️ ${estMsg}）`);
-  const parts = [];
-  let got = 0, total = 0, fname = 'account-migration-' + id + '.jsonl';
-  const dec = new TextDecoder();
-  const t0 = Date.now();
-  const MAX_RETRY = 6;
+  // 【2026-10-22 v3】大包改走浏览器原生下载器（fetch 流式读 412MB 会把手机/弱机浏览器内存撑爆而"导出失败"）。
+  // 原生下载器优势：内存零占用 + 系统级断点续传 + 后台运行接电话也不停。
+  // 流程：先 probe（有包=秒传；无包=先触发生成等完再下载）→ 用带 token 的 URL 建 <a download> 触发。
+  if (!SESSION) { toast('请先登录', 'err'); return; }
+  if (lc > 50000) showMigrateProgress(`正在准备 ${name} 的导出…（⏱️ ${estMsg}）`);
   try {
-    for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
-      // 【修复 10-22】首次也先探测是否有现成包：有 → 直接 resume，不再重新生成。
-      // 只有确认无包（404/no-file）才走 wait=1 生成。
-      let url;
-      if (attempt === 0 && !got) {
-        // 探测：probe=1 只查不生成。有包 → 直接 resume 拉取；无包 → wait=1 生成
-        let probe = await fetch(`/api/admin/user/export?id=${id}&probe=1`, { headers: { Authorization: SCHEME + SESSION } }).catch(() => null);
-        let hasFile = false;
-        let fileSize = 0;
-        if (probe && probe.ok) { try { const pj = await probe.json(); hasFile = !!pj.hasFile; fileSize = pj.size || 0; } catch {} }
-        if (hasFile) {
-          // 有现成包：直接拉取（服务器文件已存在，无需重新生成）
-          setMigrateProgress(`服务器已有现成包（${(fileSize / 1048576).toFixed(0)}MB），直接开始传输…`);
-          r = await fetch(`/api/admin/user/export?id=${id}&resume=1&offset=0`, { headers: { Authorization: SCHEME + SESSION } });
-          if (!r.ok) throw new Error('续传拉取失败 ' + r.status);
-        } else {
-          // 无包 → 正常生成
-          r = await fetch(`/api/admin/user/export?id=${id}&wait=1`, { headers: { Authorization: SCHEME + SESSION } });
-        }
-      } else {
-        url = `/api/admin/user/export?id=${id}&resume=1&offset=${got}`;
-        try {
-          r = await fetch(url, { headers: { Authorization: SCHEME + SESSION } });
-        } catch (e) {
-          if (attempt < MAX_RETRY && got > 0) {
-            setMigrateProgress(`⚠️ 网络中断，从 ${(got / 1048576).toFixed(1)}MB 断点续传（第 ${attempt} 次重试）…`);
-            await new Promise(res => setTimeout(res, 2000 * attempt));
-            continue;
-          }
-          throw e;
-        }
+    // 1) probe 是否有现成包
+    let hasFile = false, fileSize = 0;
+    try {
+      const pj = await (await api(`/api/admin/user/export?id=${id}&probe=1`));
+      hasFile = !!pj.hasFile; fileSize = pj.size || 0;
+    } catch {}
+    // 2) 无包 → 先 wait=1 生成落盘（不下载 body，只等服务器生成完）
+    if (!hasFile) {
+      if (lc > 50000) setMigrateProgress(`服务器无现成包，正在生成（⏱️ 生成约 ${fmtT(estGenS)}）…`);
+      const gr = await fetch(`/api/admin/user/export?id=${id}&wait=1&nostream=1`, { headers: { Authorization: SCHEME + SESSION } });
+      if (gr.ok) {
+        const gj = await gr.json().catch(() => null);
+        if (gj && gj.ok) { hasFile = true; fileSize = gj.size || 0; }
       }
-      if (r.status === 416) { hideMigrateProgress(); toast('服务器文件已过期（保留 24 小时），请重新导出', 'err'); return; }
-      if (!r.ok && r.status !== 206) { const j = await r.json().catch(() => ({})); throw new Error(j.message || r.status); }
-      const disp = r.headers.get('Content-Disposition') || '';
-      const m = disp.match(/filename\*=UTF-8''([^;]+)/);
-      if (m) { try { fname = decodeURIComponent(m[1]); } catch {} }
-      total = parseInt(r.headers.get('X-Migrate-Total') || '0', 10) || total;
-      if (r.status === 206) {
-        const cr = r.headers.get('Content-Range') || '';
-        const cm = cr.match(/\/(\d+)$/);
-        if (cm) total = parseInt(cm[1], 10);
-      }
-      if (!r.body) { const blob = await r.blob(); parts.push(blob); break; }
-      const reader = r.body.getReader();
-      let broken = false, lines = 0, chunk = '';
-      while (true) {
-        let rd;
-        try { rd = await reader.read(); } catch (e) { broken = true; break; }
-        const { done, value } = rd;
-        if (done) break;
-        parts.push(value);
-        got += value.length;
-        chunk += dec.decode(value, { stream: true });
-        let i; while ((i = chunk.indexOf('\n')) >= 0) { chunk = chunk.slice(i + 1); lines++; }
-        setMigrateProgress(`${name}：${(got / 1048576).toFixed(2)}MB${total ? ' / ' + (total / 1048576).toFixed(1) + 'MB' : ''} / 已用 ${((Date.now() - t0) / 1000).toFixed(0)}s（中断自动续传，请勿关页面太久）`);
-      }
-      try { reader.releaseLock(); } catch {}
-      if (!broken) break;
-      if (attempt >= MAX_RETRY) throw new Error('网络中断且重试 ' + MAX_RETRY + ' 次未成功（已收 ' + (got / 1048576).toFixed(1) + 'MB，刷新页面重新点继续）');
-      setMigrateProgress(`⚠️ 网络中断，正在从 ${(got / 1048576).toFixed(1)}MB 续传…`);
-      await new Promise(res => setTimeout(res, 2000 * (attempt + 1)));
     }
-    hideMigrateProgress();
-    const b2 = new Blob(parts, { type: 'application/x-ndjson' });
-    const url = URL.createObjectURL(b2);
+    // 3) 触发浏览器原生下载（token 走 URL 参数；服务器支持 Range → 断线自动续传）
     const a = document.createElement('a');
-    a.href = url; a.download = fname;
+    a.href = `/api/admin/user/export?id=${id}&resume=1&offset=0&token=${encodeURIComponent(SESSION)}`;
+    a.download = `帐号迁移_${name}_${id}.jsonl`;
     document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 30000);
-    toast(`✅ 已导出 ${fname}（${(b2.size / 1048576).toFixed(2)}MB）`, 'ok');
+    if (lc > 50000) { setTimeout(hideMigrateProgress, 3000); toast(`已交由浏览器下载：${name}（${(estSizeMB || fileSize / 1048576).toFixed(0)}MB）\n断线请重新点击「📦迁移」续传`, 'ok'); }
+    else toast(`已开始下载：${name}`, 'ok');
   } catch (e) {
     hideMigrateProgress();
     toast('导出失败：' + e.message, 'err');
