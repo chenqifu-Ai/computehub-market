@@ -25,6 +25,17 @@ const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'api.db');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 // 导出任务表（内存，重启即清空；文件保留在 logs/exports/）
 const _exportJobs = new Map();
+// 【2026-10-22】导出文件保存 24h 供断点续传（Range/If-Range），到期连文件带 job 记录一起清
+const EXPORT_FILE_TTL_MS = 24 * 3600 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, j] of _exportJobs) {
+    if (j.expireAt && now > j.expireAt) {
+      if (j.file) { fs.unlink(j.file, () => {}); }
+      _exportJobs.delete(k);
+    }
+  }
+}, 10 * 60 * 1000).unref();
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // 1 美元基准 quota（New-API 惯例 500000 = $1）
 const QUOTA_PER_USD = 500000;
@@ -520,16 +531,48 @@ const server = http.createServer(async (req, res) => {
       // 【修复 2026-10-21】文件名含中文直接塞 header 会抛 ERR_INVALID_CHAR（下载 500），
       // 必须用 RFC 5987 的 filename*=UTF-8'' 形式 + ASCII 降级名。
       const asciiName = String(j.fname || 'export.xlsx').replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+      const disposition = `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(String(j.fname || 'export.xlsx'))}`;
+      // 【2026-10-22】断点续传：支持 Range 请求（Accept-Ranges: bytes）。
+      // 浏览器/中断恢复可以请求 Range: bytes=N- 从断点继续，不必重新生成。
+      // 文件保留策略升级：从「下载完 1h 后删」改为「生成后 24h 内可断点续传，最后下载完 1h 后删」。
+      const rangeHdr = req.headers['range'];
+      if (rangeHdr) {
+        const m = String(rangeHdr).match(/^bytes=(\d+)-(\d*)$/);
+        if (m) {
+          const start = parseInt(m[1], 10);
+          const end = m[2] ? Math.min(parseInt(m[2], 10), j.size - 1) : j.size - 1;
+          if (start >= j.size || start > end) {
+            // 超范围：告知完整大小
+            res.writeHead(416, { 'Content-Range': `bytes */${j.size}`, 'Cache-Control': 'no-store' });
+            return res.end();
+          }
+          res.writeHead(206, {
+            'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'Content-Disposition': disposition,
+            'Content-Range': `bytes ${start}-${end}/${j.size}`,
+            'Content-Length': end - start + 1,
+            'Accept-Ranges': 'bytes',
+            'Cache-Control': 'no-store',
+          });
+          console.log(`[export] 续传 job=${query.get('job')} bytes=${start}-${end}/${j.size}`);
+          const st2 = fs.createReadStream(j.file, { start, end });
+          st2.on('error', (e) => { try { res.destroy(); } catch {} });
+          st2.pipe(res);
+          res.on('close', () => { setTimeout(() => { fs.unlink(j.file, () => {}); }, 3600000); });
+          return;
+        }
+      }
       res.writeHead(200, {
         'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'Content-Disposition': `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(String(j.fname || 'export.xlsx'))}`,
+        'Content-Disposition': disposition,
         'Content-Length': j.size,
+        'Accept-Ranges': 'bytes',
         'Cache-Control': 'no-store',
       });
       const st = fs.createReadStream(j.file);
       st.on('error', (e) => { if (!res.headersSent) json(res, 500, { success: false, message: e.message }); else res.destroy(); });
       st.pipe(res);
-      res.on('close', () => { // 下载完成/中断后延迟清理文件（任务记录保留 24h）
+      res.on('close', () => { // 下载完成/中断后延迟清理文件（文件保留 24h 供续传）
         setTimeout(() => { fs.unlink(j.file, () => {}); }, 3600000);
       });
       return;
@@ -1226,7 +1269,7 @@ function spawnExportJob(res, { mode, cfg, fname, message }) {
       return;
     }
     const size = fs.statSync(outFile).size;
-    _exportJobs.set(jobKey, { status: 'done', file: outFile, fname, size: bytes || size, started: t0, finished: Date.now() });
+    _exportJobs.set(jobKey, { status: 'done', file: outFile, fname, size: bytes || size, started: t0, finished: Date.now(), expireAt: Date.now() + EXPORT_FILE_TTL_MS });
     console.log('[export] ' + mode + ' 完成 job=' + jobKey + ': ' + (size / 1024 / 1024 | 0) + 'MB / ' + (Date.now() - t0) + 'ms');
     try {
       const files = fs.readdirSync(outDir).filter(f => f.endsWith('.xlsx'))
@@ -1261,7 +1304,7 @@ function asyncXlsxJob(res, { build, fname, logPrefix }) {
     try {
       const buf = build(); // 同步生成（重活，但此时导出 job 互斥概率低；settle 本身也秒级）
       fs.writeFileSync(outFile, buf);
-      _exportJobs.set(jobKey, { status: 'done', file: outFile, fname, size: buf.length, started: _exportJobs.get(jobKey).started, finished: Date.now() });
+      _exportJobs.set(jobKey, { status: 'done', file: outFile, fname, size: buf.length, started: _exportJobs.get(jobKey).started, finished: Date.now(), expireAt: Date.now() + EXPORT_FILE_TTL_MS });
       console.log(`${logPrefix} 完成: ${buf.length / 1024 / 1024 | 0}MB → ${outFile}`);
     } catch (e) {
       console.error(`${logPrefix} 失败:`, e.message);

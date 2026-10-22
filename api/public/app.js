@@ -582,82 +582,124 @@ function downloadXlsxJob(url) {
   }).catch(e => toast('导出提交失败：' + e.message, 'err'));
 }
 // 带鉴权下载：用 fetch 流式读（边下边显示进度，不全攒内存），文件名从 Content-Disposition 解析
+// 带鉴权下载（断点续传版 2026-10-22）：
+//  - fetch 流式读 + 进度条（不变）
+//  - 网络中断自动用 Range: bytes=N- 续传（服务端已支持 Accept-Ranges，文件保留 24h）
+//  - 最多自动重试 5 次，全部失败才报错
 async function downloadAuthed(url, tip) {
   toast(tip || '正在导出…');
   const box = $("dlProgress");
   const bar = $("dlBar");
   const txt = $("dlText");
   const show = (t) => { if (txt) txt.textContent = t; if (box) box.classList.remove('hidden'); };
-  const hide = () => { if (box) box.classList.add('hidden'); if (_paintTimer) { clearInterval(_paintTimer); _paintTimer = null; } };
+  const hide = () => { if (box) box.classList.add('hidden'); if (window.__dlPaintTimer) { clearInterval(window.__dlPaintTimer); window.__dlPaintTimer = null; } };
   const t0 = performance.now();
-  // 立即显示进度条（不等 fetch 返回响应头），避免"正在导出"一闪而过
   show((tip || '正在导出…') + ' 准备中… 已用 0s');
   if (bar) bar.style.width = '3%';
-  let _paintTimer = null;
-  // 准备阶段每 500ms 刷一次已用时间（fetch 还没拿到头时用不了 paint）
-  _paintTimer = setInterval(() => {
+  window.__dlPaintTimer = setInterval(() => {
     const el = (performance.now() - t0) / 1000;
     if (txt) txt.textContent = (tip || '正在导出…') + ` 准备中… 已用 ${el.toFixed(0)}s（数据量大请耐心等待，请勿关闭页面）`;
   }, 500);
+
+  const chunks = [];
+  let fname = 'export.xlsx';
+  let total = 0;
+  let got = 0;
+  let pRows = 0, pCTotal = 0, pCSent = 0;
+  let serverRanges = false;
+  const MAX_RETRY = 5;
+
+  const paint = (retrying) => {
+    if (window.__dlPaintTimer) { clearInterval(window.__dlPaintTimer); window.__dlPaintTimer = null; }
+    const elapsed = ((performance.now() - t0) / 1000).toFixed(0);
+    let line, pct;
+    if (retrying) {
+      line = `⚠️ 网络中断，正在从 ${(got / 1024 / 1024).toFixed(1)}MB 断点续传… 已用 ${elapsed}s`;
+      pct = total ? got / total : null;
+    } else if (pCTotal > 0) {
+      const sentPct = pCSent / pCTotal;
+      pct = 0.5 * sentPct;
+      line = pCSent > 0 ? '正在下载 ' + pCSent + '/' + pCTotal + ' 片 · ' + (got / 1024 / 1024).toFixed(1) + 'MB · 已用 ' + elapsed + 's'
+                        : '正在生成文件… ' + pRows + ' 行 / ' + pCTotal + ' 片 · 已用 ' + elapsed + 's';
+      if (total) pct = Math.max(pct, 0.5 + 0.5 * got / total);
+    } else if (total) {
+      pct = got / total;
+      line = '正在下载 ' + (got / 1024 / 1024).toFixed(1) + ' / ' + (total / 1024 / 1024).toFixed(1) + 'MB · 已用 ' + elapsed + 's';
+    } else {
+      pct = null;
+      line = '正在下载 ' + (got / 1024 / 1024).toFixed(1) + 'MB · 已用 ' + elapsed + 's（数据量大请耐心等待，请勿关闭页面）';
+    }
+    show(line);
+    if (bar) bar.style.width = (pct != null ? Math.min(99, pct * 100) : 6) + '%';
+  };
+
   try {
-    const r = await fetch(url, { headers: SESSION ? { Authorization: SCHEME + SESSION } : {} });
-    if (!r.ok) {
-      const e = await r.json().catch(() => ({}));
-      hide();
-      return toast('导出失败：' + (e.message || r.status), 'err');
-    }
-    const cd = r.headers.get('content-disposition') || '';
-    let fname = 'export.xlsx';
-    const m = cd.match(/filename\*=UTF-8''([^;]+)/i) || cd.match(/filename="?([^";]+)"?/i);
-    if (m) { try { fname = decodeURIComponent(m[1]); } catch { fname = m[1]; } }
-    // 进度来源：服务端 X-Xlsx-Progress 头（生成/发送阶段）+ 下载字节数
-    const total = Number(r.headers.get('content-length')) || 0;
-    let got = 0;
-    let pRows = 0, pCTotal = 0, pCSent = 0;
-    const paint = () => {
-      if (_paintTimer) { clearInterval(_paintTimer); _paintTimer = null; } // 进入流式阶段，停掉准备阶段定时器
-      const elapsed = ((performance.now() - t0) / 1000).toFixed(0);
-      let line, pct;
-      if (pCTotal > 0) {
-        // 服务端已知总片数：发送阶段精确，生成阶段显示片数
-        const sentPct = pCSent / pCTotal;
-        pct = 0.5 * sentPct; // 生成占 50%，发送占 50%（粗略，体验优先）
-        line = pCSent > 0 ? '正在下载 ' + (pCSent + 0) + '/' + pCTotal + ' 片 · ' + (got / 1024 / 1024).toFixed(1) + 'MB · 已用 ' + elapsed + 's'
-                          : '正在生成文件… ' + pRows + ' 行 / ' + pCTotal + ' 片 · 已用 ' + elapsed + 's';
-        if (total) pct = Math.max(pct, 0.5 + 0.5 * got / total);
-      } else if (total) {
-        pct = got / total;
-        line = '正在下载 ' + (got / 1024 / 1024).toFixed(1) + ' / ' + (total / 1024 / 1024).toFixed(1) + 'MB · 已用 ' + elapsed + 's';
-      } else {
-        pct = null;
-        line = '正在生成文件… ' + (got / 1024 / 1024).toFixed(1) + 'MB · 已用 ' + elapsed + 's（数据量大请耐心等待，请勿关闭页面）';
+    for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
+      const headers = SESSION ? { Authorization: SCHEME + SESSION } : {};
+      // 断点续传：已有部分数据且服务端支持 Range → 从断点继续拉
+      const resume = attempt > 0 && serverRanges && got > 0;
+      if (resume) headers['Range'] = 'bytes=' + got + '-';
+      let r;
+      try {
+        r = await fetch(url, { headers });
+      } catch (e) {
+        if (attempt < MAX_RETRY && (resume || serverRanges)) {
+          paint(true);
+          await new Promise(res => setTimeout(res, 2000 * (attempt + 1)));
+          continue;
+        }
+        throw e;
       }
-      show(line);
-      if (bar) bar.style.width = (pct != null ? Math.min(99, pct * 100) : 6) + '%';
-    };
-    if (!r.body) { // 老浏览器不支持流式读取，退回 blob
-      const blob = await r.blob();
-      hide();
-      return saveBlob(blob, fname);
+      if (!r.ok && r.status !== 206) {
+        if (r.status === 416) { hide(); toast('服务器文件已过期（保留 24 小时），请重新导出', 'err'); return; }
+        const e = await r.json().catch(() => ({}));
+        hide();
+        return toast('导出失败：' + (e.message || r.status), 'err');
+      }
+      if (resume && r.status !== 206) {
+        chunks.length = 0; got = 0; total = 0;
+      }
+      serverRanges = (r.headers.get('accept-ranges') || '').includes('bytes');
+      const cd = r.headers.get('content-disposition') || '';
+      const m = cd.match(/filename\*=UTF-8''([^;]+)/i) || cd.match(/filename="?([^";]+)"?/i);
+      if (m) { try { fname = decodeURIComponent(m[1]); } catch { fname = m[1]; } }
+      if (r.status === 200) {
+        if (attempt > 0 && !serverRanges) { chunks.length = 0; got = 0; }
+        total = Number(r.headers.get('content-length')) || total;
+      } else if (r.status === 206) {
+        const cr = r.headers.get('content-range') || '';
+        const cm = cr.match(/\/(\d+)$/);
+        if (cm) total = parseInt(cm[1], 10);
+      }
+      if (!r.body) {
+        const blob = await r.blob();
+        hide();
+        return saveBlob(blob, fname);
+      }
+      const reader = r.body.getReader();
+      let lastPaint = 0;
+      let broken = false;
+      while (true) {
+        let rd;
+        try { rd = await reader.read(); }
+        catch (e) { broken = true; break; }
+        const { done, value } = rd;
+        if (done) break;
+        chunks.push(value);
+        got += value.length;
+        const hp = r.headers.get('x-xlsx-progress');
+        if (hp) { try { const p = JSON.parse(hp); pRows = p.rowsDone || 0; pCTotal = p.chunksTotal || 0; pCSent = p.chunksSent || 0; } catch {} }
+        const now = Date.now();
+        if (now - lastPaint > 300) { lastPaint = now; paint(); }
+      }
+      try { reader.releaseLock(); } catch {}
+      if (!broken) break;
+      if (attempt >= MAX_RETRY) throw new Error('网络中断且重试 ' + MAX_RETRY + ' 次未成功（已收 ' + (got / 1024 / 1024).toFixed(1) + 'MB）');
+      paint(true);
+      await new Promise(res => setTimeout(res, 2000 * (attempt + 1)));
     }
-    show('正在生成文件… 已用 0s（数据量大请耐心等待，请勿关闭页面）');
-    const reader = r.body.getReader();
-    const chunks = [];
-    let totalBytes = 0;
-    let lastPaint = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      totalBytes += value.length;
-      got += value.length;
-      const hp = r.headers.get('x-xlsx-progress');
-      if (hp) { try { const p = JSON.parse(hp); pRows = p.rowsDone || 0; pCTotal = p.chunksTotal || 0; pCSent = p.chunksSent || 0; } catch {} }
-      const now = Date.now();
-      if (now - lastPaint > 300) { lastPaint = now; paint(); }
-    }
-    // 拼装（blob 内存占用不可避免，但下载过程有进度反馈；拼装仅几十ms）
     const blob = new Blob(chunks, { type: 'application/octet-stream' });
+    if (total && blob.size !== total) throw new Error('文件不完整（' + blob.size + '/' + total + ' 字节），请重试');
     hide();
     saveBlob(blob, fname);
   } catch (e) { hide(); toast('导出失败：' + e.message, 'err'); }
