@@ -811,11 +811,8 @@ const server = http.createServer(async (req, res) => {
       const b = await readJson(req) || {};
       return json(res, 200, { success: true, data: store.setSettings(db, b) });
     }
-    if (pathname === '/api/admin/stats') {
-      const u = requireUser(req, res); if (!u) return;
-      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
-      return json(res, 200, { success: true, data: { ...store.systemStats(db), health: health.snapshot(), site: store.getSettings(db) } });
-    }
+    // 【2026-10-21】/api/admin/stats 已合并到下方主实现（含 ops 运营面板），此处删除重复路由
+
 
     if (pathname === '/api/admin/user/list') {
       const u = requireUser(req, res); if (!u) return;
@@ -852,10 +849,163 @@ const server = http.createServer(async (req, res) => {
       console.log(`[admin] ${u.username} 更新用户 ${uid}${after.quota !== before.quota ? ' quota ' + before.quota + '->' + after.quota : ''}`);
       return json(res, 200, { success: true, data: r });
     }
+    // 【2026-10-21】删除用户（管理员）：二次确认 + 事务级联 + 审计快照
+    if (pathname === '/api/admin/user/delete' && req.method === 'POST') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      const b = await readJson(req) || {};
+      const uid = parseInt(b.id || 0, 10);
+      const target = store.getUserById(db, uid);
+      if (!target) return json(res, 404, { success: false, message: '用户不存在' });
+      if (target.id === u.id) return json(res, 400, { success: false, message: '不能删除自己的账号' });
+      if (target.role >= 100) return json(res, 400, { success: false, message: '管理员账号不允许删除（可先降级再删）' });
+      if (String(b.confirm || '').trim() !== target.username) {
+        return json(res, 400, { success: false, message: '二次确认失败：confirm 必须等于用户名「' + target.username + '」' });
+      }
+      const r = store.deleteUser(db, target, { opUser: u, ip: clientIp(req) });
+      if (!r.ok) return json(res, 500, { success: false, message: r.message });
+      console.log('[admin] ' + u.username + ' 删除用户 ' + uid + ' (' + target.username + ')');
+      return json(res, 200, { success: true, message: r.message, data: r.detail });
+    }
+    // 【2026-10-21】帐号数据迁移：一键导出单个帐号全部数据（JSONL，含 tokens 明文 key / 全量日志 / 资金流水 / 签到 / 审计）
+    // GET /api/admin/user/export?id=<uid>&log_limit=<可选上限>
+    // 流式响应：先 flush 头，再逐块写（大帐号日志几十万行也不占内存/不阻塞别人，logs 按 5 万行/批游标读取）
+    if (pathname === '/api/admin/user/export' && req.method === 'GET') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      const uid = parseInt(query.get('id') || '0', 10);
+      const target = uid ? store.getUserById(db, uid) : null;
+      if (!target) return json(res, 404, { success: false, message: '用户不存在' });
+      const logLimit = Math.min(parseInt(query.get('log_limit') || '0', 10) || 0, 2000000);
+      const d = new Date();
+      const stamp = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+      const fname = `帐号迁移_${target.username}_${target.id}_${stamp}.jsonl`;
+      res.writeHead(200, {
+        'Content-Type': 'application/x-ndjson; charset=utf-8',
+        'Content-Disposition': `attachment; filename="account-migration-${target.id}-${stamp}.jsonl"; filename*=UTF-8''${encodeURIComponent(fname)}`,
+        'Cache-Control': 'no-store',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.write(''); // 立即 flush 响应头，前端 fetch 可开始读 body 显示进度
+      const t0 = Date.now();
+      (async () => {
+        try {
+          let n = 0;
+          for await (const line of store.exportUserBundleStream(db, target.id, { logLimit, operator: u })) {
+            res.write(line + '\n');
+            n++;
+          }
+          const cnt = store.countLogs(db, target.id);
+          console.log(`[migrate] ${u.username} 导出帐号 ${target.username}(#${target.id}) ${n} 行 / logs=${cnt} / ${Date.now() - t0}ms`);
+          res.end();
+        } catch (e) {
+          console.error('[migrate] 导出失败:', e.message);
+          try { res.destroy(); } catch {}
+        }
+      })();
+      res.on('close', () => { /* 客户端断开：生成器随 res 写失败自然终止 */ });
+      return;
+    }
+    // 【2026-10-21】帐号数据迁移：导入导出包
+    // POST /api/admin/user/import  body: JSONL 文本（application/json 包一层 {"data": "..."} 或原始文本）
+    //   ?mode=new（默认，新建用户，重名自动 _2/_3）| merge&target_id=<uid>（合并到已有帐号）
+    // 密码：body.user.password 有值用之，否则随机生成并返回给管理员一次性展示。
+    if (pathname === '/api/admin/user/import' && req.method === 'POST') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      const buf = await readBody(req, 512 * 1024 * 1024);   // 导入包上限 512MB
+      let text = buf.toString('utf8');
+      // 兼容两种投递：纯 JSONL 文本，或 JSON 包装 {data: "..."} / {username,password} 附加字段
+      let extra = {};
+      const trimmed = text.trim();
+      if (trimmed.startsWith('{') && !trimmed.startsWith('{"type"')) {
+        try {
+          const wrapped = JSON.parse(trimmed);
+          if (typeof wrapped === 'object' && wrapped !== null && (typeof wrapped.data === 'string' || wrapped.data instanceof Array)) {
+            text = Array.isArray(wrapped.data) ? wrapped.data.join('\n') : wrapped.data;
+            extra = wrapped;
+          }
+        } catch { /* 不是 JSON 包装 → 当纯 JSONL 处理 */ }
+      }
+      const mode = query.get('mode') === 'merge' ? 'merge' : 'new';
+      const targetId = mode === 'merge' ? parseInt(query.get('target_id') || '0', 10) : 0;
+      if (mode === 'merge' && !targetId) return json(res, 400, { success: false, message: 'merge 模式需要 target_id' });
+      // 允许在导入时覆盖密码/用户名（新建模式下）
+      if (extra && extra.password) {
+        try {
+          const lines = text.split('\n');
+          for (let i = 0; i < lines.length; i++) {
+            const o = JSON.parse(lines[i]);
+            if (o && o.type === 'header') { o.user.password = String(extra.password); lines[i] = JSON.stringify(o); break; }
+          }
+          text = lines.join('\n');
+        } catch { /* 忽略：密码注入失败不影响导入 */ }
+      }
+      const t0 = Date.now();
+      const r = await store.importUserBundle(db, text, { mode, targetUserId: targetId, opUser: u });
+      if (!r.ok) return json(res, 400, { success: false, message: r.message });
+      console.log(`[migrate] ${u.username} ${mode === 'merge' ? '合并导入到 #' + targetId + ' ' + r.new_username : '导入新帐号 ' + r.new_username}(#${r.new_user_id}) tokens=${r.imported.tokens} logs=${r.imported.logs} ledger=${r.imported.ledger} ${Date.now() - t0}ms`);
+      return json(res, 200, {
+        success: true,
+        message: mode === 'merge'
+          ? `已合并到 ${r.new_username}(#${r.new_user_id})：+${r.imported.tokens} 令牌 / +${r.imported.logs} 日志 / +${r.imported.ledger} 流水`
+          : `已导入为新帐号 ${r.new_username}(#${r.new_user_id})：${r.imported.tokens} 令牌 / ${r.imported.logs} 日志 / ${r.imported.ledger} 流水`,
+        data: { user: store.publicUser(db, r.user), imported: r.imported, new_user_id: r.new_user_id, new_username: r.new_username, new_password: r.new_password },
+      });
+    }
     if (pathname === '/api/admin/stats') {
       const u = requireUser(req, res); if (!u) return;
       if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
-      return json(res, 200, { success: true, data: store.systemStats(db) });
+      // 【2026-10-21】运营面板增强：今日请求/错误/消费/Top错误模型/渠道余额快照
+      let ops = null;
+      try {
+        const dayStart = new Date(new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' }).slice(0, 10) + 'T00:00:00+08:00').getTime();
+        const one = (r) => r || { c: 0, q: 0 };
+        const tot = one(db.prepare("SELECT COUNT(*) c, COALESCE(SUM(quota),0) q FROM logs WHERE created_at>=? AND log_type='consume' AND request_id NOT LIKE 'invite:%'").get(dayStart));
+        const err = one(db.prepare("SELECT COUNT(*) c, 0 q FROM logs WHERE created_at>=? AND status!='success'").get(dayStart));
+        const users = one(db.prepare("SELECT COUNT(DISTINCT user_id) c, 0 q FROM logs WHERE created_at>=? AND log_type='consume' AND username NOT LIKE 'agent-reward%'").get(dayStart));
+        const topErr = db.prepare("SELECT model_name, COUNT(*) c, SUBSTR(COALESCE(group_concat(DISTINCT substr(error,1,80)),''),1,180) sample FROM logs WHERE created_at>=? AND status!='success' GROUP BY model_name ORDER BY c DESC LIMIT 3").all(dayStart);
+        const byHour = db.prepare("SELECT (created_at/3600000+8)*3600000%86400000/1000 h, COUNT(*) c, SUM(CASE WHEN status!='success' THEN 1 ELSE 0 END) e FROM logs WHERE created_at>=? AND log_type='consume' GROUP BY 1 ORDER BY 1").all(dayStart);
+        // 渠道上游余额（尽力而为：NewAPI 式 /dashboard/billing/subscription，失败静默）
+        const chs = store.listChannelsRaw(db).filter(c => c.status === 1);
+        const upstream = [];
+        for (const ch of chs.slice(0, 8)) {
+          if (!ch.api_key || !/^https?:/i.test(ch.base_url)) continue;
+          let bal = null;
+          try {
+            const ctl = new AbortController();
+            const tid = setTimeout(() => ctl.abort(), 4000);
+            const r2 = await fetch(ch.base_url.replace(/\/+$/, '') + '/dashboard/billing/subscription', { headers: { Authorization: 'Bearer ' + ch.api_key }, signal: ctl.signal });
+            clearTimeout(tid);
+            if (r2.ok) {
+              const j = await r2.json().catch(() => null);
+              const limit = Number(j && (j.hard_limit_usd ?? j.system_hard_limit_usd));
+              if (Number.isFinite(limit)) {
+                let used = null;
+                try {
+                  const ctl2 = new AbortController();
+                  const tid2 = setTimeout(() => ctl2.abort(), 4000);
+                  const r3 = await fetch(ch.base_url.replace(/\/+$/, '') + '/dashboard/billing/usage', { headers: { Authorization: 'Bearer ' + ch.api_key }, signal: ctl2.signal });
+                  clearTimeout(tid2);
+                  if (r3.ok) { const j3 = await r3.json().catch(() => null); const tu = Number(j3 && j3.total_usage); if (Number.isFinite(tu)) used = tu / 100; }
+                } catch {}
+                if (used == null) {
+                  const chRow = db.prepare('SELECT balance FROM channels WHERE id=?').get(ch.id);
+                  bal = { limit, used: chRow && chRow.balance ? chRow.balance : null };
+                } else bal = { limit, used };
+              }
+            }
+          } catch {}
+          upstream.push({ id: ch.id, name: ch.name, balance: bal });
+        }
+        ops = {
+          today: { requests: tot.c, errors: err.c, usd: tot.q / 500000, active_users: users.c },
+          error_rate: tot.c ? +(err.c / tot.c * 100).toFixed(2) : 0,
+          top_errors: topErr, by_hour: byHour,
+          upstream_balance: upstream,
+        };
+      } catch (e) { console.error('[admin/stats/ops]', e.message); }
+      return json(res, 200, { success: true, data: { ...store.systemStats(db), health: health.snapshot(), site: store.getSettings(db) }, ops });
     }
 
     if (pathname === '/api/health') return json(res, 200, { success: true, ts: Date.now(), site: store.getSetting(db, 'site_name') });

@@ -97,6 +97,7 @@
           <div><b id="sysModels">—</b><span>可用模型</span></div>
           <div><b id="sysRl">—</b><span>限流</span></div>
         </div>
+        <div id="opsPanel" class="admin-only" style="margin-top:12px"></div>
       </div>
       <div class="panel">
         <h3>按模型统计（Top 10）</h3>
@@ -349,6 +350,7 @@
             <button class="btn-ghost sm" onclick="expandAllTree('userTreeBox',true)">展开全部</button>
             <button class="btn-ghost sm" onclick="expandAllTree('userTreeBox',false)">收起全部</button>
             <button class="btn-ghost sm" id="btnBulkCreate">➕ 批量建用户</button>
+            <button class="btn-ghost sm" id="btnImportAccount">📥 导入帐号(迁移)</button>
             <button class="btn-ghost sm" id="btnSettleAll">📊 一键导出全部结算(Excel)</button>
             <button class="btn-ghost sm" id="btnExportAll">导出全站用量 Excel</button>
             <button class="btn-ghost sm" id="btnReloadUsers">刷新</button>

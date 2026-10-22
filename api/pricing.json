@@ -372,5 +372,45 @@
     "input": 0.5,
     "output": 1.5,
     "cached": 0.05
+  },
+  "doubao-seedance-2.0": {
+    "input": 0.5,
+    "output": 2.4,
+    "cached": 0.05
+  },
+  "doubao-seedance-2.5": {
+    "input": 0.6,
+    "output": 3.0,
+    "cached": 0.06
+  },
+  "wan3.0-video": {
+    "input": 0.5,
+    "output": 2.4,
+    "cached": 0.05
+  },
+  "doubao-seedream-4.0": {
+    "input": 0.5,
+    "output": 15.0,
+    "cached": 0.05
+  },
+  "doubao-seedream-4.5": {
+    "input": 0.6,
+    "output": 18.0,
+    "cached": 0.06
+  },
+  "doubao-seedream-5.0-lite": {
+    "input": 0.5,
+    "output": 12.0,
+    "cached": 0.05
+  },
+  "doubao-seedream-5.0-pro": {
+    "input": 0.8,
+    "output": 24.0,
+    "cached": 0.08
+  },
+  "豆包录音文件识别模型2.0": {
+    "input": 0.25,
+    "output": 0.05,
+    "cached": 0.01
   }
 }

@@ -1055,11 +1055,122 @@ async function loadUsers() {
       <td class="actions">
         <button class="btn-ghost sm" onclick="editUser(${u.id},'${esc(u.username)}',${u.status},${u.role},'${esc(u.remark || '')}')">管理</button>
         <button class="btn-ghost sm" onclick="downloadSettle(${u.id})">结算</button>
+        <button class="btn-ghost sm" title="导出该帐号全部数据（令牌/日志/流水/签到），用于迁移到其他实例" onclick="exportAccount(${u.id},'${esc(u.username)}')">📦迁移</button>
+        ${u.role >= 100 ? '' : `<button class="btn-ghost sm btn-danger" onclick="deleteUser(${u.id},'${esc(u.username)}')">删除</button>`}
       </td>
     </tr>`).join('');
   loadRedemptions();
   loadAudit();
 }
+
+// ---------- 帐号数据迁移 ----------
+// 一键导出单个帐号：流式下载 JSONL（令牌含明文 key / 全量日志 / 资金流水 / 签到 / 审计）
+async function exportAccount(id, name) {
+  const ok = confirm(`导出帐号 ${name}(#${id}) 的全部数据？\n\n包含：余额/角色/代理信息、API 令牌（含明文 key）、全部调用日志、资金流水、签到记录。\n\n文件为 .jsonl，导入到另一台实例后该帐号即可正常使用。`);
+  if (!ok) return;
+  showMigrateProgress('正在导出 ' + name + ' …');
+  try {
+    const r = await fetch(`/api/admin/user/export?id=${id}`, { headers: { Authorization: SCHEME + SESSION } });
+    if (!r.ok) { hideMigrateProgress(); const j = await r.json().catch(() => ({})); return toast('导出失败：' + (j.message || r.status), 'err'); }
+    const disp = r.headers.get('Content-Disposition') || '';
+    let fname = 'account-migration-' + id + '.jsonl';
+    const m = disp.match(/filename\*=UTF-8''([^;]+)/);
+    if (m) { try { fname = decodeURIComponent(m[1]); } catch {} }
+    // 流式读：单次请求，边下边刷进度；缓冲拼回 blob 触发下载（大帐号 ~几十MB，内存可承受）
+    const reader = r.body.getReader();
+    const parts = [];
+    let got = 0, lines = 0, chunk = '';
+    const dec = new TextDecoder();
+    const t0 = Date.now();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value);
+      got += value.length;
+      chunk += dec.decode(value, { stream: true });
+      let i; while ((i = chunk.indexOf('\n')) >= 0) { chunk = chunk.slice(i + 1); lines++; }
+      setMigrateProgress(`${name}：${(got / 1048576).toFixed(2)}MB / ${lines} 行 / 已用 ${((Date.now() - t0) / 1000).toFixed(0)}s（日志大的帐号请耐心，请勿关页面）`);
+    }
+    hideMigrateProgress();
+    const b2 = new Blob(parts, { type: 'application/x-ndjson' });
+    const url = URL.createObjectURL(b2);
+    const a = document.createElement('a');
+    a.href = url; a.download = fname;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    toast(`✅ 已导出 ${fname}（${(b2.size / 1048576).toFixed(2)}MB）`, 'ok');
+  } catch (e) {
+    hideMigrateProgress();
+    toast('导出失败：' + e.message, 'err');
+  }
+}
+
+// 导入帐号：上传 .jsonl（可另存新帐号，或合并到已有帐号）
+function openImportAccount() {
+  api('/api/admin/user/list').then(j => {
+    const users = j.success ? j.data : [];
+    const opts = users.map(u => `<option value="${u.id}">#${u.id} ${esc(u.username)}${u.agent_level ? ' (L' + u.agent_level + ')' : ''}${u.role >= 100 ? ' (管理员)' : ''}</option>`).join('');
+    openModal(`
+    <h3>📥 导入帐号（数据迁移）</h3>
+    <p class="muted">上传从其他实例导出的 <code>.jsonl</code> 帐号迁移文件。<br>
+      包含：用户主记录（余额/角色/代理）、API 令牌（key 保持可用）、全部日志、资金流水、签到、审计。</p>
+    <label>迁移文件（.jsonl）</label>
+    <input type="file" id="impFile" accept=".jsonl,.json,.txt">
+    <label>导入方式</label>
+    <select id="impMode" style="width:100%">
+      <option value="new">➕ 新建帐号（用户名冲突自动加后缀 _2/_3…）</option>
+      <option value="merge">🔀 合并到已有帐号（追加日志/流水/令牌，保留目标帐号现有数据）</option>
+    </select>
+    <div id="impTargetWrap" style="display:none">
+      <label>目标帐号</label>
+      <select id="impTarget" style="width:100%"><option value="">— 选择目标帐号 —</option>${opts}</select>
+    </div>
+    <label>密码（新建模式生效，留空 = 随机生成并显示一次）</label>
+    <input id="impPass" placeholder="留空随机">
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn-primary" id="impGo" onclick="doImportAccount()">导入</button>
+    </div>`);
+    $('impMode').onchange = () => { $('impTargetWrap').style.display = $('impMode').value === 'merge' ? '' : 'none'; };
+  });
+}
+async function doImportAccount() {
+  const f = $('impFile').files[0];
+  if (!f) return toast('请选择迁移文件', 'err');
+  const mode = $('impMode').value;
+  const targetId = parseInt($('impTarget').value || '0', 10);
+  if (mode === 'merge' && !targetId) return toast('请选择目标帐号', 'err');
+  const pw = $('impPass').value || '';
+  const btn = $('impGo'); btn.disabled = true; btn.textContent = '导入中…';
+  try {
+    const text = await f.text();
+    let qs = '?mode=' + mode;
+    if (mode === 'merge') qs += '&target_id=' + targetId;
+    const body = { data: text };
+    if (pw) body.password = pw;
+    const j = await api('/api/admin/user/import' + qs, { method: 'POST', body: JSON.stringify(body) });
+    if (!j.success) return toast(j.message || '导入失败', 'err');
+    let msg = j.message;
+    if (j.data && j.data.new_password) msg += `\n\n新帐号：${j.data.new_username}\n密码：${j.data.new_password}\n（请立刻告知用户并修改）`;
+    closeModal();
+    alert('✅ ' + msg);
+    loadUsers();
+  } catch (e) {
+    toast('导入失败：' + e.message, 'err');
+  } finally { btn.disabled = false; btn.textContent = '导入'; }
+}
+
+// 迁移进度浮层（导出大文件时显示）
+let __migEl = null;
+function showMigrateProgress(tip) {
+  hideMigrateProgress();
+  __migEl = document.createElement('div');
+  __migEl.style.cssText = 'position:fixed;left:50%;top:16px;transform:translateX(-50%);z-index:9999;background:#1f2937;color:#fff;padding:10px 18px;border-radius:8px;font-size:13px;box-shadow:0 6px 24px rgba(0,0,0,.3);max-width:80vw';
+  __migEl.textContent = tip;
+  document.body.appendChild(__migEl);
+}
+function setMigrateProgress(tip) { if (__migEl) __migEl.textContent = tip; }
+function hideMigrateProgress() { if (__migEl) { __migEl.remove(); __migEl = null; } }
 
 // ---------- 归属变更审计日志 ----------
 async function loadAudit() {
@@ -1088,6 +1199,7 @@ if ($('auditFilter')) $('auditFilter').oninput = () => { clearTimeout(window.__a
 $('btnReloadUsers').onclick = () => { loadUsers(); };
 $('btnViewTree').onclick = () => showUserTree();
 if ($('btnBulkCreate')) $('btnBulkCreate').onclick = openBulkCreate;
+if ($('btnImportAccount')) $('btnImportAccount').onclick = openImportAccount;
 function openBulkCreate() {
   api('/api/admin/user/list').then(j => {
     const users = j.success ? j.data : [];
@@ -1178,6 +1290,7 @@ async function loadUserTree() {
         <span class="tmeta">余额 ${fmtUsd(n.quota || 0)} | 已用 ${fmtUsd(n.used_quota || 0)}</span>
         <button class="btn-ghost sm" onclick="editUpline(${n.id},'${esc(n.username)}')">改上级</button>
         <button class="btn-ghost sm" onclick="editUser(${n.id},'${esc(n.username)}',${n.status || 1},${n.role || 1},'${esc(n.remark || '')}')">管理</button>
+        ${(n.role || 1) >= 100 || n.id === (ME && ME.id) ? '' : `<button class="btn-ghost sm btn-danger" onclick="deleteUser(${n.id},'${esc(n.username)}')">删除</button>`}
       </div>
       ${hasKids ? `<div class="tree-children">${kids.map(render).join('')}</div>` : ''}
     </div>`;
@@ -1224,6 +1337,15 @@ async function saveUpline(id) {
   toast('已更新上级');
   closeModal();
   loadUserTree();
+}
+async function deleteUser(id, name) {
+  const input = prompt(`⚠️ 删除用户「${name}」(ID ${id})\n\n将清除其令牌/会话/流水/签到记录，下级账号挂回平台。\n此操作不可恢复！\n\n请输入用户名以确认：`);
+  if (input === null) return;
+  if (input.trim() !== name) return toast('输入不一致，已取消', 'err');
+  const j = await api('/api/admin/user/delete', { method: 'POST', body: JSON.stringify({ id, confirm: name }) });
+  if (!j.success) return toast(j.message, 'err');
+  toast('✅ ' + (j.message || '已删除'));
+  loadUsers(); loadUserTree();
 }
 function editUser(id, name, status, role, remark) {
   openModal(`
@@ -1344,6 +1466,31 @@ async function loadSettings() {
       <div><b>${fmtUsd(d.log_quota)}</b><span>平台总流水</span></div>
       <div><b>${d.channels}</b><span>渠道数</span></div>`;
   }
+  // 【2026-10-21】运营面板：今日请求/错误率/上游余额/Top错误
+  const ops = st.success ? st.ops : null;
+  const el = $('opsPanel');
+  if (el && ops) {
+    const t = ops.today || {};
+    const rows = (ops.top_errors || []).map(r =>
+      `<tr><td class="mono">${esc(r.model_name)}</td><td>${r.c}</td><td class="mono" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc((r.sample||'').slice(0,90))}</td></tr>`).join('');
+    const ups = (ops.upstream_balance || []).map(u => {
+      const b = u.balance;
+      if (!b) return `<div><b>—</b><span>${esc(u.name)}</span></div>`;
+      const pct = (b.used != null && b.limit > 0) ? Math.min(100, Math.round(b.used / b.limit * 100)) : null;
+      const rem = (b.limit != null && b.used != null) ? (b.limit - b.used).toFixed(2) : '—';
+      return `<div><b>$${rem}${pct != null ? ` <small style="color:${pct > 85 ? '#ff7b72' : '#7ee787'}">${pct}%</small>` : ''}</b><span>${esc(u.name)}</span></div>`;
+    }).join('');
+    el.innerHTML = `
+      <div class="mini-row" style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:10px">
+        <div><b>${fmtMe(t.requests || 0)}</b><span>今日请求</span></div>
+        <div><b style="color:${ops.error_rate > 5 ? '#ff7b72' : '#7ee787'}">${ops.error_rate}%</b><span>错误率</span></div>
+        <div><b>${fmtUsd(Math.round((t.usd || 0) * 500000))}</b><span>今日消费</span></div>
+        <div><b>${t.active_users || 0}</b><span>活跃用户</span></div>
+      </div>
+      <div style="font-size:12.5px;color:var(--dim);margin-bottom:6px">上游余额（尽力探测）</div>
+      <div style="display:flex;gap:18px;flex-wrap:wrap">${ups || '<span class="muted">无数据</span>'}</div>
+      ${rows ? `<table class="tbl" style="margin-top:10px"><thead><tr><th>错误模型</th><th>次数</th><th>样例</th></tr></thead><tbody>${rows}</tbody></table>` : ''}`;
+  } else if (el) el.innerHTML = '<span class="muted">运营数据加载失败</span>';
 }
 $('btnSaveSettings').onclick = async () => {
   const b = {

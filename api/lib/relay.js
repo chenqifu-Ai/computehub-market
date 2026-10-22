@@ -16,9 +16,9 @@ const health = require('./health');
 
 let CTX = null; // { db, store, billing, QUOTA_PER_USD, clientIp, json }
 
-function status() {
+function status(chsOverride) {
   if (!CTX) return { ready: false };
-  const chs = CTX.store.listChannelsRaw(CTX.db);
+  const chs = chsOverride || CTX.store.listChannelsRaw(CTX.db);
   return {
     ready: true,
     site: CTX.store.getSetting(CTX.db, 'site_name'),
@@ -219,6 +219,18 @@ async function handle(ctx, req, res, pathname, query) {
       if (!up.ok) {
         const txt = await up.text().catch(() => '');
         lastErr = `上游 ${ch.name} 返回 ${up.status}: ${txt.slice(0, 200)}`;
+        // 【2026-10-21 修复】上游余额不足（403 预扣费失败）不是渠道故障：
+        // 切渠道只会撞到同一个上游账号 → 每次重试又失败一遍（曾 5min 一次烧出 147 条错误日志）。
+        // 正确动作：不记熔断、不切渠道，直接把 4xx 实况透传给调用方。
+        const m403 = lastErr.match(/403[\s\S]{0,200}(预扣费额度失败|余额不足|quota|insufficient)/i);
+        if (up.status === 403 && m403) {
+          ctx.store.insertLog(ctx.db, { ...logCtx, use_time: (Date.now() - started) / 1000, status: 'error', error: '上游余额不足（已停用重试）: ' + txt.slice(0, 160) });
+          if (!res.headersSent) {
+            return ctx.json(res, 502, { error: { message: `上游渠道「${ch.name}」余额不足，已通知管理员（请勿立即重试）`, type: 'upstream_quota', upstream_status: 403 } });
+          }
+          try { res.end(); } catch {}
+          return;
+        }
         health.onFailure(ch.id, lastErr);
         ctx.store.insertLog(ctx.db, { ...logCtx, use_time: (Date.now() - started) / 1000, status: 'error', error: lastErr });
         console.warn(`[relay] 渠道失败，尝试下一个: ${lastErr}`);

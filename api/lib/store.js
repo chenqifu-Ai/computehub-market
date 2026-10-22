@@ -710,6 +710,44 @@ function systemStats(db) {
   return { users: u.c, user_quota: u.q, user_used_quota: u.uq, requests: l.c, log_quota: l.q, tokens: l.t, channels: c.c };
 }
 
+/**
+ * 删除用户（2026-10-21）— 管理员专属，带审计快照 + 级联清理
+ * logs 保留（username 字段已冗余），user_id 置负防 join；tokens/sessions/ledger/checkins 删除。
+ * 下级 inviter_id 置 0 并写 agent_audit；删除前整用户快照写 agent_audit.agent_name。
+ */
+function deleteUser(db, target, { opUser, ip = '' } = {}) {
+  if (!target) return { ok: false, message: '用户不存在' };
+  if (target.role >= 100) return { ok: false, message: '管理员账号不允许删除（可先降级为普通用户再删）' };
+  const id = target.id;
+  const stat = (sql, ...v) => db.prepare(sql).get(...v);
+  const kids = stat('SELECT COUNT(*) c FROM users WHERE inviter_id=?', id).c;
+  const snap = JSON.stringify({
+    id, username: target.username, display_name: target.display_name,
+    quota: target.quota, used_quota: target.used_quota, request_count: target.request_count,
+    created_at: target.created_at, inviter_id: target.inviter_id || 0,
+    aff_code: target.aff_code, remark: target.remark, deleted_at: Date.now(),
+  });
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare('INSERT INTO agent_audit (target_user_id,target_name,old_inviter_id,old_inviter,new_inviter_id,new_inviter,action,level_before,level_after,agent_name,op_user_id,op_username,op_role,ip,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(id, target.username, target.inviter_id || 0, '—', 0, '平台', 'delete-user' + (kids ? '+detach-' + kids : ''), 0, 0, snap,
+        opUser ? opUser.id : 0, opUser ? opUser.username : 'system', '管理员', ip, Date.now());
+    if (kids > 0) db.prepare('UPDATE users SET inviter_id=0 WHERE inviter_id=?').run(id);
+    db.prepare('DELETE FROM tokens WHERE user_id=?').run(id);
+    db.prepare('DELETE FROM sessions WHERE user_id=?').run(id);
+    db.prepare('DELETE FROM wallet_ledger WHERE user_id=? OR ref_user_id=?').run(id, id);
+    db.prepare('DELETE FROM checkins WHERE user_id=?').run(id);
+    db.prepare('UPDATE logs SET user_id=-? WHERE user_id=?').run(id, id);
+    db.prepare('DELETE FROM users WHERE id=? AND role<100').run(id);
+    if (stat('SELECT COUNT(*) c FROM users WHERE id=?', id).c > 0) throw new Error('delete failed');
+    db.exec('COMMIT');
+    return { ok: true, message: '已删除 ' + target.username + '（ID ' + id + (kids ? '，' + kids + ' 个下级已挂到平台' : '') + '）', detail: { kids_detached: kids, snapshot: snap } };
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch {}
+    return { ok: false, message: '删除失败: ' + e.message };
+  }
+}
+
 // ---------- 兑换码 ----------
 async function createRedemptions(db, { count = 1, quota = 0, name = '', createdBy = 0 }) {
   const out = [];
@@ -979,6 +1017,251 @@ function countLogs(db, userId) {
   return db.prepare('SELECT COUNT(*) c FROM logs WHERE user_id=?').get(userId).c;
 }
 
+// ---------- 帐号数据导出/导入（数据迁移） ----------
+/**
+ * 导出单个帐号的全部数据（流式生成器，大帐号不爆内存）。
+ * 输出 JSONL：每行一个对象 {type, ...}，调用方逐行拼成文件。
+ * 包含：users 主记录 / tokens（含明文 key）/ logs（全量，含所有 log_type）
+ *       / wallet_ledger / checkins / agent_audit（该用户作为 target 的审计）。
+ * 不导出：密码哈希（安全）、sessions（登录态）、channels/pricing/settings（站点级）。
+ */
+async function* exportUserBundleStream(db, userId, { logLimit = 0, operator = null } = {}) {
+  const u = getUserById(db, userId);
+  if (!u) throw new Error('user not found: ' + userId);
+
+  // 1) 头部：元信息 + 主记录
+  yield JSON.stringify({
+    type: 'header', export_format: 1, exported_at: Date.now(),
+    exported_by: operator ? (operator.username || '') : '',
+    source_user_id: u.id, source_username: u.username,
+    user: {
+      username: u.username, display_name: u.display_name,
+      quota: u.quota, used_quota: u.used_quota, request_count: u.request_count,
+      group_name: u.group_name, role: u.role, status: u.status,
+      aff_code: u.aff_code, remark: u.remark,
+      inviter_id: u.inviter_id || 0, invite_reward: u.invite_reward || 0,
+      agent_level: u.agent_level || 0, agent_name: u.agent_name || '',
+      reward_l1: u.reward_l1 || 0, reward_l2: u.reward_l2 || 0, reward_l3: u.reward_l3 || 0,
+      agent_channel_id: u.agent_channel_id || 0,
+      created_at: u.created_at,
+    },
+  });
+
+  // 2) tokens（含明文 key，迁移后 API Key 仍可用）
+  const tokens = db.prepare('SELECT * FROM tokens WHERE user_id=? ORDER BY id ASC').all(u.id);
+  yield JSON.stringify({ type: 'tokens', data: tokens.map(t => ({
+    name: t.name, status: t.status, remain_quota: t.remain_quota, unlimited_quota: t.unlimited_quota,
+    used_quota: t.used_quota, model_limits: t.model_limits, allow_ips: t.allow_ips,
+    expired_time: t.expired_time, created_time: t.created_time, accessed_time: t.accessed_time,
+    key_plain: t.key_plain,
+  })) });
+
+  // 3) logs（流式分页，按 id 游标，语句不跨批存活 → 不占读锁，与 exportLogsIter 同款思路）
+  const totalLogs = db.prepare('SELECT COUNT(*) c FROM logs WHERE user_id=?').get(u.id).c;
+  yield JSON.stringify({ type: 'logs:meta', count: totalLogs });
+  const PAGE = 50000;
+  const LIM = parseInt(logLimit, 10) || 0;
+  // 游标从 MAX(id)+1 开始，使 id < (MAX+1) 包含 MAX(id) 本身
+  let lastId = (db.prepare('SELECT MAX(id) m FROM logs WHERE user_id=?').get(u.id).m || 0) + 1;
+  let exported = 0;
+  while (lastId != null && (LIM === 0 || exported < LIM)) {
+    const take = LIM ? Math.min(PAGE, LIM - exported) : PAGE;
+    const rows = db.prepare(`SELECT id,user_id,token_id,token_name,model_name,channel_id,channel_name,
+      prompt_tokens,completion_tokens,cached_tokens,total_tokens,quota,use_time,is_stream,ip,
+      request_id,status,error,created_at,log_type,source
+      FROM logs WHERE user_id=? AND id<? ORDER BY id DESC LIMIT ${take}`).all(u.id, lastId);
+    if (!rows.length) break;
+    yield JSON.stringify({ type: 'logs:chunk', data: rows });
+    exported += rows.length;
+    lastId = rows[rows.length - 1].id;
+    if (rows.length < take) break;
+  }
+
+  // 4) wallet_ledger
+  const ledger = db.prepare('SELECT * FROM wallet_ledger WHERE user_id=? ORDER BY id ASC').all(u.id);
+  yield JSON.stringify({ type: 'wallet_ledger', data: ledger.map(r => ({
+    delta: r.delta, balance_after: r.balance_after, kind: r.kind, detail: r.detail,
+    ref_user_id: r.ref_user_id, ref_username: r.ref_username,
+    op_user_id: r.op_user_id, op_username: r.op_username, op_role: r.op_role,
+    ip: r.ip, request_id: r.request_id, remark: r.remark, created_at: r.created_at,
+  })) });
+
+  // 5) checkins
+  const checkins = db.prepare('SELECT quota,created_at FROM checkins WHERE user_id=? ORDER BY id ASC').all(u.id);
+  yield JSON.stringify({ type: 'checkins', data: checkins });
+
+  // 6) agent_audit（该用户作为被操作对象）
+  const audit = db.prepare(`SELECT old_inviter_id,old_inviter,new_inviter_id,new_inviter,action,
+    level_before,level_after,agent_name,op_user_id,op_username,op_role,ip,created_at
+    FROM agent_audit WHERE target_user_id=? ORDER BY id ASC`).all(u.id);
+  yield JSON.stringify({ type: 'agent_audit', data: audit });
+
+  // 7) 尾部（完整性）
+  yield JSON.stringify({ type: 'footer', log_count: totalLogs, logs_exported: exported, done: true });
+}
+
+/**
+ * 导入帐号数据（exportUserBundleStream 生成的 JSONL）。
+ * 模式:
+ *   - new（默认）：创建新用户；用户名冲突自动加后缀 _2/_3…
+ *   - merge：合并到已有 targetUserId（追加 logs/ledger/checkins/audit，追加新 token）
+ * 密码: user.password 有值则用，否则随机 16 位（返回给管理员一次性展示）。
+ * 幂等: token 按 key_hash 去重；logs 按 (user_id,created_at,model_name,prompt/completion,log_type) 去重；
+ *       ledger 按 (user_id,request_id,kind) 去重；checkins 按 (user_id,当日) 去重。
+ */
+async function importUserBundle(db, text, { mode = 'new', targetUserId = 0, opUser = null } = {}) {
+  const lines = String(text || '').split('\n').map(l => l.trim()).filter(Boolean);
+  const sections = { tokens: [], 'logs:chunks': [], wallet_ledger: [], checkins: [], agent_audit: [] };
+  let header = null;
+  for (const line of lines) {
+    let o; try { o = JSON.parse(line); } catch { continue; }
+    if (!o || !o.type) continue;
+    if (o.type === 'header') { header = o; continue; }
+    if (o.type === 'tokens') sections.tokens = o.data || [];
+    else if (o.type === 'logs:chunk') sections['logs:chunks'].push(o.data || []);
+    else if (o.type === 'wallet_ledger') sections.wallet_ledger = o.data || [];
+    else if (o.type === 'checkins') sections.checkins = o.data || [];
+    else if (o.type === 'agent_audit') sections.agent_audit = o.data || [];
+  }
+  if (!header || !header.user) return { ok: false, message: '导入文件缺少 header/user 字段（格式不对）' };
+  const u = header.user;
+  const imported = { tokens: 0, logs: 0, ledger: 0, checkins: 0, audit: 0 };
+
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    let newUserId, newUsername = String(u.username || '').trim();
+    let newPassword = null;
+
+    if (mode === 'merge' && targetUserId > 0) {
+      const existing = getUserById(db, targetUserId);
+      if (!existing) throw new Error('目标用户不存在: ' + targetUserId);
+      newUserId = existing.id; newUsername = existing.username;
+    } else {
+      if (!/^[a-zA-Z0-9_\u4e00-\u9fa5]{2,32}$/.test(newUsername)) throw new Error('用户名不合法: ' + newUsername);
+      let guard = 0;
+      while (getUserByName(db, newUsername)) {
+        if (guard >= 100) throw new Error('用户名 ' + newUsername + ' 及后缀均已占用');
+        newUsername = String(u.username) + '_' + (guard + 2);
+        if (newUsername.length > 32) newUsername = newUsername.slice(0, 32);
+        guard++;
+      }
+      newPassword = String(u.password || '').trim() || crypto.randomBytes(12).toString('base64url').slice(0, 16);
+      const created = await createUser(db, newUsername, newPassword, {
+        display_name: u.display_name || newUsername,
+        quota: parseInt(u.quota || 0, 10),
+        group_name: u.group_name || 'default',
+        role: parseInt(u.role || 1, 10),
+        inviter_id: parseInt(u.inviter_id || 0, 10),
+        agent_level: parseInt(u.agent_level || 0, 10),
+        agent_name: String(u.agent_name || ''),
+      });
+      newUserId = created.id;
+      db.prepare(`UPDATE users SET status=?, aff_code=?, remark=?, invite_reward=?,
+        reward_l1=?, reward_l2=?, reward_l3=?, agent_channel_id=?, created_at=? WHERE id=?`).run(
+        parseInt(u.status || 1, 10), String(u.aff_code || ''), String(u.remark || ''),
+        parseInt(u.invite_reward || 0, 10),
+        parseInt(u.reward_l1 || 0, 10), parseInt(u.reward_l2 || 0, 10), parseInt(u.reward_l3 || 0, 10),
+        parseInt(u.agent_channel_id || 0, 10), parseInt(u.created_at || Date.now(), 10), newUserId);
+    }
+
+    // tokens（明文 key → 重算 hash）
+    // 去重策略：同库迁移时源用户还持有同一个 key（key_hash 全局 UNIQUE），
+    // 直接把源的那条 reassign 给新用户；跨实例导入则正常 INSERT。目标用户已持有同 key 才跳过。
+    for (const t of sections.tokens) {
+      const plain = String(t.key_plain || '').trim();
+      if (!plain) continue;
+      const kh = hashKey(plain);
+      const existing = db.prepare('SELECT * FROM tokens WHERE key_hash=?').get(kh);
+      if (existing) {
+        if (existing.user_id === newUserId) continue;             // 目标已有同 key → 跳过
+        db.prepare('UPDATE tokens SET user_id=? WHERE id=?').run(newUserId, existing.id);  // 源用户的 key 移过来
+      } else {
+        db.prepare(`INSERT INTO tokens (user_id,name,key_plain,key_hash,status,remain_quota,unlimited_quota,used_quota,model_limits,allow_ips,expired_time,created_time,accessed_time)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+          newUserId, String(t.name || 'default'), plain, kh,
+          parseInt(t.status || 1, 10), parseInt(t.remain_quota || 0, 10), t.unlimited_quota ? 1 : 0,
+          parseInt(t.used_quota || 0, 10), String(t.model_limits || ''), String(t.allow_ips || ''),
+          parseInt(t.expired_time ?? -1, 10), parseInt(t.created_time || Date.now(), 10), parseInt(t.accessed_time || 0, 10));
+      }
+      imported.tokens++;
+    }
+
+    // logs（按 logExists 去重，merge 模式下重导不重复）
+    const insLog = db.prepare(`INSERT INTO logs (user_id,username,token_id,token_name,model_name,channel_id,channel_name,
+      prompt_tokens,completion_tokens,cached_tokens,total_tokens,quota,use_time,is_stream,ip,request_id,status,error,created_at,log_type,source)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    for (const chunk of sections['logs:chunks']) {
+      for (const r of chunk) {
+        if (!r || r._skip) continue;
+        if (logExists(db, { user_id: newUserId, created_at: r.created_at, model_name: r.model_name, prompt_tokens: r.prompt_tokens, completion_tokens: r.completion_tokens, log_type: r.log_type })) continue;
+        insLog.run(newUserId, newUsername, parseInt(r.token_id || 0, 10), String(r.token_name || ''),
+          String(r.model_name || ''), parseInt(r.channel_id || 0, 10), String(r.channel_name || ''),
+          parseInt(r.prompt_tokens || 0, 10), parseInt(r.completion_tokens || 0, 10), parseInt(r.cached_tokens || 0, 10),
+          parseInt(r.total_tokens || 0, 10), parseInt(r.quota || 0, 10), Number(r.use_time || 0),
+          r.is_stream ? 1 : 0, String(r.ip || ''), String(r.request_id || ''),
+          String(r.status || 'success'), String(r.error || ''), parseInt(r.created_at || Date.now(), 10),
+          String(r.log_type || 'consume'), String(r.source || ''));
+        imported.logs++;
+      }
+    }
+
+    // wallet_ledger（按 request_id+kind+created_at 去重）
+    const insLedger = db.prepare(`INSERT INTO wallet_ledger (user_id,username,delta,balance_after,kind,detail,ref_user_id,ref_username,op_user_id,op_username,op_role,ip,request_id,remark,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    for (const r of sections.wallet_ledger) {
+      if (r.request_id && db.prepare('SELECT id FROM wallet_ledger WHERE user_id=? AND request_id=? AND kind=?').get(newUserId, r.request_id, r.kind || '')) continue;
+      insLedger.run(newUserId, newUsername, parseInt(r.delta || 0, 10), parseInt(r.balance_after || 0, 10),
+        String(r.kind || ''), String(r.detail || ''), parseInt(r.ref_user_id || 0, 10), String(r.ref_username || ''),
+        parseInt(r.op_user_id || 0, 10), String(r.op_username || ''), String(r.op_role || ''),
+        String(r.ip || ''), String(r.request_id || ''), String(r.remark || ''), parseInt(r.created_at || Date.now(), 10));
+      imported.ledger++;
+    }
+
+    // checkins（按 user+当日 去重，避免破坏"每日签到"约束）
+    for (const r of sections.checkins) {
+      const ts = parseInt(r.created_at || Date.now(), 10);
+      const dayStart = new Date(ts); dayStart.setHours(0, 0, 0, 0);
+      if (db.prepare('SELECT id FROM checkins WHERE user_id=? AND created_at>=?').get(newUserId, dayStart.getTime())) continue;
+      db.prepare('INSERT INTO checkins (user_id,quota,created_at) VALUES (?,?,?)')
+        .run(newUserId, parseInt(r.quota || 0, 10), ts);
+      imported.checkins++;
+    }
+
+    // agent_audit
+    for (const r of sections.agent_audit) {
+      db.prepare(`INSERT INTO agent_audit (target_user_id,target_name,old_inviter_id,old_inviter,new_inviter_id,new_inviter,action,level_before,level_after,agent_name,op_user_id,op_username,op_role,ip,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        newUserId, newUsername, parseInt(r.old_inviter_id || 0, 10), String(r.old_inviter || ''),
+        parseInt(r.new_inviter_id || 0, 10), String(r.new_inviter || ''),
+        String(r.action || 'import'), parseInt(r.level_before || 0, 10), parseInt(r.level_after || 0, 10),
+        String(r.agent_name || ''), parseInt(r.op_user_id || 0, 10), String(r.op_username || ''), String(r.op_role || ''),
+        String(r.ip || ''), parseInt(r.created_at || Date.now(), 10));
+      imported.audit++;
+    }
+
+    // 重算 used_quota / request_count（以 logs 为准）
+    recomputeUserStats(db, newUserId);
+    db.exec('COMMIT');
+
+    const finalUser = getUserById(db, newUserId);
+    // 审计留痕：谁导入了谁
+    addAgentAudit(db, {
+      target_user_id: newUserId, target_name: newUsername,
+      old_inviter_id: finalUser.inviter_id || 0, old_inviter: '—',
+      new_inviter_id: finalUser.inviter_id || 0, new_inviter: '—',
+      action: mode === 'merge' ? 'import-merge' : 'import',
+      level_before: finalUser.agent_level || 0, level_after: finalUser.agent_level || 0,
+      agent_name: '迁移自 ' + (header.source_username || '?') + ' #' + (header.source_user_id || '?'),
+      op_user_id: opUser ? opUser.id : 0, op_username: opUser ? opUser.username : 'system',
+      op_role: opUser ? (isAdmin(opUser) ? '管理员' : '代理') : '管理员', ip: '',
+    });
+    return { ok: true, user: finalUser, imported, new_user_id: newUserId, new_username: newUsername, new_password: newPassword };
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch {}
+    return { ok: false, message: '导入失败: ' + e.message };
+  }
+}
+
 module.exports = {
   open, migrate, seedChannels,
   hashPassword, verifyPassword,
@@ -991,12 +1274,13 @@ module.exports = {
   publicModelCatalog, pricingCatalog, maskKey,
   insertLog, listLogs, logStatsByModel, exportLogs, exportLogsIter, exportSummary,
   logExists, recomputeUserStats, countLogs,
-  listUsers, adminUpdateUser, systemStats, userByAff,
+  listUsers, adminUpdateUser, systemStats, userByAff, deleteUser,
   createRedemptions, getRedemption, redeemCode, listRedemptions, setRedemptionStatus, deleteRedemption,
   DEFAULT_SETTINGS, getSettings, getSetting, setSettings,
   getInviter, listInvitees, setInviter, inviteStats, addInviteReward,
   getUpline, listDownline, teamStats, setInviterSafe, setAgentInfo, agentChannelForUser, addAgentReward, subtreeOf,
   addAgentAudit, listAgentAudit, addLedger, listLedger, ledgerStats,
   doCheckin, checkinStatus,
+  exportUserBundleStream, importUserBundle,
   hashKey, newTokenKey,
 };
