@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>算力商城 · API 平台</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- ============ 登录 / 注册 ============ -->
+<div id="authView" class="auth-wrap hidden">
+  <div class="auth-card">
+    <div class="auth-logo">⚡</div>
+    <h1 id="authTitle">算力商城 API</h1>
+    <p class="auth-sub">AI 模型聚合网关 · 一站式调用</p>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="login">登录</button>
+      <button class="tab" data-tab="register">注册</button>
+    </div>
+
+    <form id="authForm" class="auth-form">
+      <label>用户名</label>
+      <input type="text" id="authUser" placeholder="请输入用户名" autocomplete="username" maxlength="32">
+      <label>密码</label>
+      <input type="password" id="authPass" placeholder="至少 6 位" autocomplete="current-password" maxlength="64">
+      <div id="affWrap" class="hidden">
+        <label>邀请码（选填）</label>
+        <input type="text" id="authAff" placeholder="填写可获额外奖励">
+      </div>
+      <div id="authMsg" class="auth-msg"></div>
+      <button type="submit" id="authSubmit" class="btn-primary">登录</button>
+    </form>
+    <p class="auth-notice" id="authNotice"></p>
+  </div>
+</div>
+
+<!-- ============ 控制台 ============ -->
+<div id="appView" class="hidden">
+  <aside class="side">
+    <div class="side-logo"><span>⚡</span> <b id="sideSite">算力商城</b></div>
+    <nav class="side-nav">
+      <a data-page="dashboard" class="active">📊 仪表盘</a>
+      <a data-page="tokens">🔑 令牌管理</a>
+      <a data-page="models">🧩 模型目录</a>
+      <a data-page="logs">📜 使用日志</a>
+      <a data-page="topup">💰 充值兑换</a>
+      <a data-page="ledger">📒 资金流水</a>
+      <a data-page="invite">🎁 邀请返利</a>
+      <a data-page="team">🌳 代理团队</a>
+      <a data-page="profile">👤 个人设置</a>
+      <a data-page="agenttree" class="admin-only">🏢 代理管理</a>
+      <a data-page="channels" class="admin-only">🔌 渠道管理</a>
+      <a data-page="users" class="admin-only">👥 用户管理</a>
+      <a data-page="settings" class="admin-only">⚙️ 系统设置</a>
+      <a data-page="docs">📖 接入文档</a>
+    </nav>
+    <div class="side-foot">
+      <div id="sideUser" class="side-user"></div>
+      <button id="btnSwitch" class="btn-ghost sm">🔄 切换身份</button>
+      <button id="btnLogout" class="btn-ghost sm">退出</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="top">
+      <h2 id="pageTitle">仪表盘</h2>
+      <div class="top-right">
+        <button id="btnCheckin" class="btn-ghost sm">📅 签到</button>
+        <span class="pill" id="balancePill">余额 —</span>
+      </div>
+    </header>
+
+    <div id="announce" class="announce hidden"></div>
+
+    <!-- 仪表盘 -->
+    <section class="page" id="page-dashboard">
+      <div class="stat-row">
+        <div class="stat-card"><b id="dBalance">—</b><span>剩余余额</span></div>
+        <div class="stat-card"><b id="dUsed">—</b><span>累计消费</span></div>
+        <div class="stat-card"><b id="dReqs">—</b><span>累计请求</span></div>
+        <div class="stat-card"><b id="dToday">—</b><span>今日请求</span></div>
+      </div>
+      <div class="panel">
+        <h3>今日用量</h3>
+        <div class="mini-row">
+          <div><b id="tReq">—</b><span>请求数</span></div>
+          <div><b id="tTok">—</b><span>Tokens</span></div>
+          <div><b id="tCost">—</b><span>消费</span></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>系统状态</h3>
+        <div class="mini-row">
+          <div><b id="sysCh">—</b><span>渠道 / 健康</span></div>
+          <div><b id="sysModels">—</b><span>可用模型</span></div>
+          <div><b id="sysRl">—</b><span>限流</span></div>
+        </div>
+        <div id="opsPanel" class="admin-only" style="margin-top:12px"></div>
+      </div>
+      <div class="panel">
+        <h3>按模型统计（Top 10）</h3>
+        <table class="tbl">
+          <thead><tr><th>模型</th><th>请求</th><th>输入 tok</th><th>输出 tok</th><th>消费</th></tr></thead>
+          <tbody id="dModelStats"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 令牌 -->
+    <section class="page hidden" id="page-tokens">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>我的令牌</h3>
+          <button class="btn-primary sm" id="btnNewToken">+ 新建令牌</button>
+        </div>
+        <table class="tbl">
+          <thead><tr><th>名称</th><th>状态</th><th>额度</th><th>已用</th><th>模型限制</th><th>Key</th><th>最近使用</th><th>操作</th></tr></thead>
+          <tbody id="tokenBody"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 模型目录 -->
+    <section class="page hidden" id="page-models">
+      <div id="pricingAlert" class="alert-banner hidden"></div>
+      <div class="panel">
+        <div class="panel-head">
+          <h3>可用模型 <span class="badge" id="modelCount">-</span></h3>
+          <input type="text" id="modelSearch" class="search" placeholder="搜索模型…">
+        </div>
+        <table class="tbl">
+          <thead><tr><th>模型名</th><th>渠道数</th><th>输入 $/1M</th><th>补全 $/1M</th><th>缓存 $/1M</th><th>定价</th><th class="admin-only">操作</th></tr></thead>
+          <tbody id="modelBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+        </table>
+        <p class="muted" style="margin:8px 0 0;font-size:12px" id="unpricedNote"></p>
+      </div>
+      <div class="panel admin-only">
+        <div class="panel-head">
+          <h3>💰 定价管理</h3>
+          <div class="head-actions">
+            <button class="btn-ghost sm" id="btnNewPrice">+ 新增/修改定价</button>
+            <button class="btn-ghost sm" id="btnAllPrices">查看全部价格表</button>
+          </div>
+        </div>
+        <p class="muted" style="margin:0;font-size:12px">
+          价格单位 <b>USD / 1M tokens</b>；未定价的模型走默认价
+          <span id="defaultPrice" class="mono"></span>。改价立即生效，<b>无需重启</b>。
+        </p>
+      </div>
+    </section>
+
+    <!-- 日志 -->
+    <section class="page hidden" id="page-logs">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>使用日志</h3>
+          <div class="head-actions">
+            <span class="muted" id="logTotal"></span>
+            <button class="btn-ghost sm" id="btnExportXlsx">导出 Excel</button>
+            <button class="btn-ghost sm" id="btnExportLogs">导出 CSV</button>
+            <button class="btn-ghost sm" id="btnSettleSelf">📋 我的结算清单</button>
+          </div>
+        </div>
+        <table class="tbl">
+          <thead id="logHead"><tr><th>时间</th><th>模型</th><th>令牌</th><th>输入</th><th>缓存读</th><th>未命中</th><th>命中率</th><th>输出</th><th>耗时</th><th>消费</th><th>状态</th></tr></thead>
+          <tbody id="logBody"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
+        </table>
+        <div class="pager"><button class="btn-ghost sm" id="logPrev">上一页</button><span id="logPage" class="muted"></span><button class="btn-ghost sm" id="logNext">下一页</button></div>
+      </div>
+    </section>
+
+    <!-- 充值兑换 -->
+    <section class="page hidden" id="page-topup">
+      <div class="grid2">
+        <div class="panel">
+          <h3>💳 兑换码充值</h3>
+          <p class="muted">输入兑换码即可为账户充值。</p>
+          <label>兑换码</label>
+          <input id="topupCode" placeholder="例如 A1B2C3D4E5F6" style="text-transform:uppercase">
+          <button class="btn-primary" id="btnTopup" style="margin-top:14px">立即兑换</button>
+        </div>
+        <div class="panel">
+          <h3>📅 每日签到</h3>
+          <p class="muted">每日签到可领取额度奖励。</p>
+          <div class="big-num" id="checkinQuota">—</div>
+          <button class="btn-primary" id="btnCheckin2">签到领额度</button>
+          <div class="muted" id="checkinState" style="margin-top:10px"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>当前余额</h3>
+        <div class="mini-row">
+          <div><b id="tpBalance">—</b><span>剩余</span></div>
+          <div><b id="tpUsed">—</b><span>累计消费</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 邀请返利 -->
+    <section class="page hidden" id="page-invite">
+      <div class="panel">
+        <h3>🎁 我的邀请</h3>
+        <p class="muted">分享你的邀请链接，好友注册后，TA 每次消费你都能获得返利。</p>
+        <div class="invite-box">
+          <div class="invite-code" id="inviteCode">—</div>
+          <button class="btn-ghost sm" id="btnCopyInvite">复制链接</button>
+        </div>
+        <div class="mini-row" style="margin-top:16px">
+          <div><b id="invCount">—</b><span>已邀请人数</span></div>
+          <div><b id="invReward">—</b><span>累计返利</span></div>
+          <div><b id="invRate">—</b><span>返利比例</span></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>邀请记录</h3>
+        <table class="tbl">
+          <thead><tr><th>用户</th><th>注册时间</th></tr></thead>
+          <tbody id="inviteBody"><tr><td colspan="2" class="empty">还没有邀请记录</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 资金流水 -->
+    <section class="page hidden" id="page-ledger">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>📒 资金流水 <span class="badge" id="ledgerCount">-</span></h3>
+          <div class="head-actions">
+            <input id="ledgerFilter" class="sm-input" placeholder="用户ID（管理员筛）" style="width:130px">
+            <select id="ledgerKind" class="sm-input">
+              <option value="">全部类型</option>
+              <option value="recharge">充值</option>
+              <option value="transfer_in">划入</option>
+              <option value="transfer_out">划出</option>
+              <option value="redeem">兑换码</option>
+              <option value="checkin">签到</option>
+              <option value="reward">返佣</option>
+              <option value="consume">消费</option>
+              <option value="opening">期初余额</option>
+              <option value="adjust">调整</option>
+            </select>
+            <button class="btn-ghost sm" id="btnReloadLedger">刷新</button>
+          </div>
+        </div>
+        <div class="mini-row" id="ledgerStats" style="margin-bottom:12px"></div>
+        <table class="tbl">
+          <thead><tr><th>时间</th><th>用户</th><th>类型</th><th>变动</th><th>变动后余额</th><th>说明</th><th>操作人</th><th>来源IP</th></tr></thead>
+          <tbody id="ledgerBody"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 代理团队 -->
+    <section class="page hidden" id="page-team">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>🌳 我的代理团队</h3>
+          <div class="head-actions">
+            <button class="btn-ghost sm" id="btnSettleMyTeam">📊 我的结算清单</button>
+          </div>
+        </div>
+        <p class="muted">你的下级消费时，你按级别获得返佣：<b>一级 <span id="tmR1">—</span> · 二级 <span id="tmR2">—</span> · 三级 <span id="tmR3">—</span></b>。</p>
+        <div class="mini-row">
+          <div><b id="tmDirect">—</b><span>直属下级</span></div>
+          <div><b id="tmTotal">—</b><span>团队总人数</span></div>
+          <div><b id="tmReward">—</b><span>累计返佣</span></div>
+          <div><b id="tmL1">—</b><span>一级返佣</span></div>
+          <div><b id="tmL2">—</b><span>二级返佣</span></div>
+          <div><b id="tmL3">—</b><span>三级返佣</span></div>
+        </div>
+        <p class="muted" id="tmUpline" style="margin-top:14px"></p>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h3>下级成员 <span class="badge" id="tmBadge">-</span></h3>
+          <div class="head-actions">
+            <button class="btn-ghost sm" id="btnTmTree">🌳 树状</button>
+            <button class="btn-ghost sm" id="btnTmList">📋 列表</button>
+            <button class="btn-ghost sm" onclick="expandAllTree('teamTreeBox',true)">展开全部</button>
+            <button class="btn-ghost sm" onclick="expandAllTree('teamTreeBox',false)">收起全部</button>
+          </div>
+        </div>
+        <div id="teamTreeBox" class="tree-box"></div>
+        <table class="tbl" id="teamTable">
+          <thead><tr><th>ID</th><th>用户名</th><th>层级</th><th>代理等级</th><th>余额</th><th>已用</th><th>请求</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="teamBody"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 代理管理（管理员） -->
+    <section class="page hidden" id="page-agenttree">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>🏢 全平台代理层级树</h3>
+          <div class="head-actions">
+            <button class="btn-ghost sm" id="btnSettleAgents">📊 导出全部代理结算</button>
+            <button class="btn-ghost sm" onclick="expandAllTree('treeBox',true)">展开全部</button>
+            <button class="btn-ghost sm" onclick="expandAllTree('treeBox',false)">收起全部</button>
+            <button class="btn-ghost sm" id="btnReloadTree">刷新</button>
+          </div>
+        </div>
+        <p class="muted">按邀请关系构成的层级树。管理员可调整上级关系与代理等级（不能成环）。</p>
+        <div id="treeBox" class="tree-box"><div class="empty">加载中…</div></div>
+      </div>
+      <div class="panel">
+        <h3>层级与返佣比例</h3>
+        <div class="mini-row">
+          <div><b id="cfgR1">—</b><span>一级返佣率</span></div>
+          <div><b id="cfgR2">—</b><span>二级返佣率</span></div>
+          <div><b id="cfgR3">—</b><span>三级返佣率</span></div>
+        </div>
+        <p class="muted" style="margin-top:12px">可在「系统设置」页修改返佣比例。</p>
+      </div>
+    </section>
+
+    <!-- 渠道 -->
+    <section class="page hidden" id="page-channels">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>上游渠道</h3>
+          <button class="btn-primary sm" id="btnNewChannel">+ 新建渠道</button>
+        </div>
+        <table class="tbl">
+          <thead><tr><th>ID</th><th>名称</th><th>上游地址</th><th>Key</th><th>模型数</th><th>优先级</th><th>状态</th><th>健康</th><th>操作</th></tr></thead>
+          <tbody id="channelBody"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h3>探测上游模型</h3></div>
+        <div class="probe-box">
+          <input id="probeUrl" placeholder="https://api.example.com/v1">
+          <input id="probeKey" placeholder="sk-...（可留空）">
+          <button class="btn-primary sm" id="btnProbeGo">探测</button>
+        </div>
+        <div id="probeResult" class="muted"></div>
+      </div>
+    </section>
+
+    <!-- 用户管理 -->
+    <section class="page hidden" id="page-users">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>用户管理 <span class="badge" id="userCount">-</span></h3>
+          <div class="head-actions">
+            <button class="btn-ghost sm" id="btnViewTree">🌳 层级树</button>
+            <button class="btn-ghost sm" id="btnViewList">📋 列表</button>
+            <button class="btn-ghost sm" onclick="expandAllTree('userTreeBox',true)">展开全部</button>
+            <button class="btn-ghost sm" onclick="expandAllTree('userTreeBox',false)">收起全部</button>
+            <button class="btn-ghost sm" id="btnBulkCreate">➕ 批量建用户</button>
+            <button class="btn-ghost sm" id="btnSettleAll">📊 一键导出全部结算(Excel)</button>
+            <button class="btn-ghost sm" id="btnExportAll">导出全站用量 Excel</button>
+            <button class="btn-ghost sm" id="btnReloadUsers">刷新</button>
+          </div>
+        </div>
+        <div id="userTreeBox" class="tree-box hidden"><div class="empty">加载中…</div></div>
+        <table class="tbl" id="userTable">
+          <thead><tr><th>ID</th><th>用户名</th><th>角色</th><th>状态</th><th>余额</th><th>已用</th><th>请求</th><th>邀请</th><th>操作</th></tr></thead>
+          <tbody id="userBody"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h3>兑换码管理 <span class="badge" id="redeemCount">-</span></h3>
+          <button class="btn-primary sm" id="btnGenRedeem">+ 生成兑换码</button>
+        </div>
+        <table class="tbl">
+          <thead><tr><th>ID</th><th>兑换码</th><th>额度</th><th>备注</th><th>状态</th><th>使用者</th><th>操作</th></tr></thead>
+          <tbody id="redeemBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h3>📋 归属变更审计日志 <span class="badge" id="auditCount">-</span></h3>
+          <div class="head-actions">
+            <input id="auditFilter" class="sm-input" placeholder="按被调整用户筛选" style="width:160px">
+            <button class="btn-ghost sm" id="btnReloadAudit">刷新</button>
+          </div>
+        </div>
+        <table class="tbl">
+          <thead><tr><th>时间</th><th>操作人</th><th>角色</th><th>被调整用户</th><th>原上级</th><th>新上级</th><th>等级变化</th><th>动作</th><th>来源IP</th></tr></thead>
+          <tbody id="auditBody"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 设置 -->
+    <section class="page hidden" id="page-settings">
+      <div class="panel">
+        <h3>⚙️ 系统设置</h3>
+        <div class="form-grid">
+          <div><label>站点名称</label><input id="sSiteName"></div>
+          <div><label>注册赠送（quota，500000=$1）</label><input id="sSignup" type="number"></div>
+          <div><label>签到赠送（quota）</label><input id="sCheckin" type="number"></div>
+          <div><label>每令牌每分钟限流（0=不限）</label><input id="sRate" type="number"></div>
+          <div><label>邀请返利比例（0.1=10%）</label><input id="sInvite" type="number" step="0.01"></div>
+          <div><label>二级返佣比例（0.05=5%）</label><input id="sR2" type="number" step="0.01"></div>
+          <div><label>三级返佣比例（0.02=2%）</label><input id="sR3" type="number" step="0.01"></div>
+          <div><label>公告（留空不显示）</label><input id="sAnnounce"></div>
+        </div>
+        <button class="btn-primary" id="btnSaveSettings" style="margin-top:16px;max-width:220px">保存设置</button>
+      </div>
+      <div class="panel">
+        <h3>📊 全站统计</h3>
+        <div class="mini-row" id="sysStats"></div>
+      </div>
+    </section>
+
+    <!-- 个人设置 -->
+    <section class="page hidden" id="page-profile">
+      <div class="grid2">
+        <div class="panel">
+          <h3>👤 账号信息</h3>
+          <div class="kv">
+            <div><span>用户名</span><b id="pfUser">—</b></div>
+            <div><span>用户 ID</span><b id="pfId">—</b></div>
+            <div><span>角色</span><b id="pfRole">—</b></div>
+            <div><span>分组</span><b id="pfGroup">—</b></div>
+            <div><span>邀请码</span><b id="pfAff" class="mono">—</b></div>
+            <div><span>注册时间</span><b id="pfCreated">—</b></div>
+          </div>
+          <label>用户名（登录名）</label>
+          <input id="pfUsername" placeholder="2-32 位，不能重名">
+          <button class="btn-primary" id="btnSaveUsername" style="margin-top:10px">保存用户名</button>
+          <label style="margin-top:14px">昵称 / 显示名</label>
+          <input id="pfName" placeholder="用于界面展示">
+          <button class="btn-primary" id="btnSaveName" style="margin-top:10px">保存昵称</button>
+        </div>
+
+        <div class="panel">
+          <h3>🔒 修改密码</h3>
+          <p class="muted">修改后当前会话立即失效，请用新密码重新登录。</p>
+          <label>当前密码</label>
+          <input id="pwOld" type="password" placeholder="请输入当前密码" autocomplete="current-password">
+          <label>新密码（至少 6 位）</label>
+          <input id="pwNew" type="password" placeholder="请输入新密码" autocomplete="new-password">
+          <label>确认新密码</label>
+          <input id="pwNew2" type="password" placeholder="再次输入新密码" autocomplete="new-password">
+          <div id="pwMsg" class="auth-msg"></div>
+          <button class="btn-primary" id="btnChangePw">修改密码</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 文档 -->
+    <section class="page hidden" id="page-docs">
+
+      <!-- 1. 什么是平台 key -->
+      <div class="panel">
+        <h3>① 平台 key 是什么</h3>
+        <p class="muted">平台 key（形如 <code>sk-xxxxxxxx</code>）是本平台签发的<strong>代理凭证</strong>。它<strong>不是</strong>任何上游厂商的密钥——真正调用上游时，网关会自动换成服务端配置的上游密钥。</p>
+        <pre class="code">你的程序 ──sk-平台key──▶ 本平台网关 ──换成上游真key──▶ Ollama / SLCH / 算力节点
+                                    │
+                                    └─ 鉴权 · 路由 · 熔断 · 计费 · 日志</pre>
+        <ul class="doc-list">
+          <li>✅ <strong>上游密钥永不外泄</strong>：你只拿到平台 key，随时可禁用/删除，不动上游</li>
+          <li>✅ <strong>按令牌计量计费</strong>：谁用了多少、花了多少，一目了然</li>
+          <li>✅ <strong>模型白名单</strong>：一个令牌可限定只能用某几个模型</li>
+          <li>✅ <strong>多渠道故障转移</strong>：上游挂了自动切下一个，并跳过熔断渠道</li>
+          <li>✅ <strong>限流 / 额度 / IP 白名单 / 过期时间</strong>，全部可配</li>
+        </ul>
+        <p class="muted">💡 一句话：<strong>平台 key = 受控的代理凭证</strong>。你把它当 OpenAI key 用即可，实际请求都经本平台转发。</p>
+      </div>
+
+      <!-- 1.5 复制即用 -->
+      <div class="panel">
+        <h3>⭐ 复制即用（把 sk-你的令牌 换成你自己的 key 即可）</h3>
+        <p class="muted">把下面片段里的 <code>sk-你的令牌</code> 替换成你在「令牌」页创建的 key，直接粘贴到对应工具里就能用。</p>
+        <div class="preset-grid">
+
+          <div class="preset-card">
+            <h4>🔧 通用配置（任何 OpenAI 兼容客户端）</h4>
+            <div class="code-wrap"><button class="copy-btn" onclick="copyBlock('cp1')">复制</button><pre class="code" id="cp1">Base URL: <span class="docBase">http://127.0.0.1:58881</span>/v1
+API Key:  sk-你的令牌
+Model:    deepseek-v4.1-flash</pre></div>
+          </div>
+
+          <div class="preset-card">
+            <h4>💬 curl（最快验证）</h4>
+            <div class="code-wrap"><button class="copy-btn" onclick="copyBlock('cp2')">复制</button><pre class="code" id="cp2">curl <span class="docBase">http://127.0.0.1:58881</span>/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-你的令牌" \
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"你好"}]}'</pre></div>
+          </div>
+
+          <div class="preset-card">
+            <h4>🐍 Python（openai SDK）</h4>
+            <div class="code-wrap"><button class="copy-btn" onclick="copyBlock('cp3')">复制</button><pre class="code" id="cp3">from openai import OpenAI
+client = OpenAI(
+    base_url="<span class="docBase">http://127.0.0.1:58881</span>/v1",
+    api_key="sk-你的令牌",
+)
+print(client.chat.completions.create(
+    model="deepseek-v4.1-flash",
+    messages=[{"role":"user","content":"你好"}],
+).choices[0].message.content)</pre></div>
+          </div>
+
+          <div class="preset-card">
+            <h4>🟩 Node.js（openai SDK）</h4>
+            <div class="code-wrap"><button class="copy-btn" onclick="copyBlock('cp4')">复制</button><pre class="code" id="cp4">import OpenAI from 'openai';
+const client = new OpenAI({
+  baseURL: '<span class="docBase">http://127.0.0.1:58881</span>/v1',
+  apiKey: 'sk-你的令牌',
+});
+const r = await client.chat.completions.create({
+  model: 'deepseek-v4.1-flash',
+  messages: [{ role: 'user', content: '你好' }],
+});
+console.log(r.choices[0].message.content);</pre></div>
+          </div>
+
+        </div>
+        <p class="muted">💡 客户端推荐：Cherry Studio / NextChat / LobeChat / ChatBox / Cursor / Continue / Dify —— 选「OpenAI 兼容」类型，填上面三项即可。</p>
+      </div>
+
+      <!-- 2. 快速开始 -->
+      <div class="panel">
+        <h3>② 快速开始</h3>
+        <p class="muted">只需两样东西：<strong>base_url</strong> 指向本平台，<strong>api_key</strong> 换成你的 <code>sk-</code> 令牌。无需改动任何调用代码。</p>
+        <pre class="code">curl <span class="docBase">http://127.0.0.1:58881</span>/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-你的令牌" \
+  -d '{
+    "model": "deepseek-v4.1-flash",
+    "messages": [{"role":"user","content":"你好"}],
+    "stream": false
+  }'</pre>
+        <p class="muted">先验证连通性（列出令牌可见的全部模型）：</p>
+        <div class="code-wrap"><button class="copy-btn" onclick="copyBlock('cq2')">复制</button><pre class="code" id="cq2">curl <span class="docBase">http://127.0.0.1:58881</span>/v1/models \
+  -H "Authorization: Bearer sk-你的令牌"</pre></div>
+      </div>
+
+      <!-- 3. 各语言示例 -->
+      <div class="panel">
+        <h3>③ 各语言接入示例</h3>
+
+        <p class="muted"><strong>Python（官方 openai SDK）</strong></p>
+        <pre class="code">from openai import OpenAI
+
+client = OpenAI(
+    base_url="<span class="docBase">http://127.0.0.1:58881</span>/v1",
+    api_key="sk-你的令牌",
+)
+
+r = client.chat.completions.create(
+    model="deepseek-v4.1-flash",
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(r.choices[0].message.content)
+
+# 流式
+for chunk in client.chat.completions.create(
+    model="deepseek-v4.1-flash",
+    messages=[{"role": "user", "content": "讲个笑话"}],
+    stream=True,
+):
+    print(chunk.choices[0].delta.content or "", end="")</pre>
+
+        <p class="muted"><strong>Node.js（官方 openai SDK）</strong></p>
+        <pre class="code">import OpenAI from 'openai';
+
+const client = new OpenAI({
+  baseURL: '<span class="docBase">http://127.0.0.1:58881</span>/v1',
+  apiKey: 'sk-你的令牌',
+});
+
+const r = await client.chat.completions.create({
+  model: 'deepseek-v4.1-flash',
+  messages: [{ role: 'user', content: '你好' }],
+});
+console.log(r.choices[0].message.content);</pre>
+
+        <p class="muted"><strong>任意 OpenAI 兼容客户端</strong>（Cherry Studio / NextChat / LobeChat / Cursor / Continue / Dify …）</p>
+        <ul class="doc-list">
+          <li>API 地址（Base URL）：<code><span class="docBase">http://127.0.0.1:58881</span>/v1</code></li>
+          <li>API Key：<code>sk-你的令牌</code></li>
+          <li>模型：填本平台「模型目录」里的名称（如 <code>deepseek-v4.1-flash</code>）</li>
+        </ul>
+      </div>
+
+      <!-- 4. 端点 -->
+      <div class="panel">
+        <h3>④ 可用端点</h3>
+        <ul class="doc-list">
+          <li><code>GET /v1/models</code> — 列出令牌可见模型</li>
+          <li><code>POST /v1/chat/completions</code> — 对话补全（支持 <code>stream</code>）</li>
+          <li><code>POST /v1/completions</code> — 文本补全</li>
+          <li><code>POST /v1/embeddings</code> — 向量</li>
+          <li><code>POST /v1/audio/*</code> — 音频（取决于上游渠道是否支持）</li>
+        </ul>
+        <p class="muted">全部为 OpenAI 兼容格式，请求/响应结构与官方一致。</p>
+      </div>
+
+      <!-- 5. 令牌能力 -->
+      <div class="panel">
+        <h3>⑤ 令牌能力与用法</h3>
+        <ul class="doc-list">
+          <li><strong>模型白名单</strong>：在「令牌」页给令牌填「限定模型」（逗号分隔），留空 = 不限；越权模型返回 <code>403</code></li>
+          <li><strong>额度</strong>：可设「不限额度」或「固定金额」；令牌额度用尽返回 <code>402</code>。用户账户余额为 0 同样 <code>402</code></li>
+          <li><strong>IP 白名单</strong>：填允许的 IP（逗号分隔），留空 = 不限；非白名单来源 <code>403</code></li>
+          <li><strong>过期时间</strong>：可设令牌到期时间，过期后 <code>401</code></li>
+          <li><strong>限流</strong>：按令牌滑动窗口限流（阈值见「系统设置」），超限返回 <code>429</code> 并带 <code>Retry-After</code> 头</li>
+          <li><strong>启用/禁用</strong>：随时在「令牌」页开关，禁用后立即 <code>403</code></li>
+        </ul>
+        <p class="muted">🔑 令牌明文<strong>仅在创建时显示一次</strong>，请立即保存；平台仅存哈希，无法找回，丢了就重新生成。</p>
+      </div>
+
+      <!-- 6. 计费 -->
+      <div class="panel">
+        <h3>⑥ 计费说明</h3>
+        <ul class="doc-list">
+          <li>按 <strong>输入 + 输出 tokens</strong> 计费，单价见「模型目录」（USD / 1M tokens）</li>
+          <li>优先采用<strong>上游返回的真实 usage</strong>；上游未返回时按中文≈1 token/字、英文≈1 token/4 字符估算兜底</li>
+          <li>扣费三方同步：<strong>用户余额</strong> · <strong>令牌用量</strong> · <strong>渠道用量</strong>，并写日志</li>
+          <li>可在「日志」页查看每次调用的 tokens / 花费 / 用时，并<strong>导出 Excel</strong></li>
+        </ul>
+      </div>
+
+      <!-- 7. 故障转移 -->
+      <div class="panel">
+        <h3>⑦ 路由与故障转移</h3>
+        <ul class="doc-list">
+          <li>同一模型可由<strong>多个渠道</strong>提供时，按渠道优先级择优，同级按权重随机分流</li>
+          <li>某渠道失败会<strong>自动切换到下一个</strong>可用渠道</li>
+          <li>渠道连续失败达阈值会<strong>自动熔断</strong>（冷却期内不再被选中），恢复后自动放行探测</li>
+          <li>全部渠道不可用时返回 <code>502/503</code></li>
+        </ul>
+        <p class="muted">💡 若某模型返回「没有可用渠道」，通常是该模型专属渠道正在短暂熔断，稍后重试即可。</p>
+      </div>
+
+      <!-- 8. 错误码 -->
+      <div class="panel">
+        <h3>⑧ 错误码</h3>
+        <ul class="doc-list">
+          <li><code>401</code> — 缺少 / 无效 / 过期令牌</li>
+          <li><code>402</code> — 用户余额不足，或令牌额度已用尽</li>
+          <li><code>403</code> — 令牌被禁用 / 无权访问该模型 / IP 不在白名单 / 用户被禁用</li>
+          <li><code>429</code> — 触发限流（响应头带 <code>Retry-After</code>，单位秒）</li>
+          <li><code>502 / 503</code> — 上游全部不可用（已尝试全部渠道）</li>
+        </ul>
+        <p class="muted">错误体为 <code>{"error":{"message":"...","type":"..."}}</code>，与 OpenAI 一致，可直接用 SDK 捕获。</p>
+      </div>
+
+      <!-- 9. FAQ -->
+      <div class="panel">
+        <h3>⑨ 常见问题</h3>
+        <ul class="doc-list">
+          <li><strong>能用上游厂商的原生 key 直接调本平台吗？</strong>　不能，返回 <code>401 Invalid token</code>。本平台只认自己签发的 <code>sk-</code> 令牌。</li>
+          <li><strong>请求会被转发到哪？</strong>　由平台按模型自动路由到已配置的上游渠道（Ollama 云端 / SLCH / 算力节点等）；你不必关心具体落到哪一家。</li>
+          <li><strong>换了模型名调用失败？</strong>　请用「模型目录」页列出的名称；不同上游对同一模型的命名可能不同，平台已做统一映射。</li>
+          <li><strong>响应里 content 为空但有 reasoning？</strong>　部分模型是推理模型，思考过程在 <code>reasoning</code> 字段，最终答案在 <code>content</code>；可适当调大 <code>max_tokens</code>。</li>
+          <li><strong>怎么换 key / 吊销？</strong>　在「令牌」页禁用或删除即可，立即生效，不影响上游。</li>
+        </ul>
+      </div>
+
+    </section>
+  </main>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<div id="dlProgress" class="toast hidden" style="top:auto;bottom:24px;width:min(520px,90vw)">  <div id="dlText" style="margin-bottom:8px">正在生成文件…</div>
+  <div style="height:8px;background:var(--panel2,#222);border-radius:4px;overflow:hidden"><div id="dlBar" style="height:100%;width:0%;background:var(--accent,#4a9);border-radius:4px;transition:width .3s"></div></div></div>
+<div id="modal" class="modal hidden"><div class="modal-box" id="modalBox"></div></div>
+<script src="/app.js"></script>
+</body>
+</html>

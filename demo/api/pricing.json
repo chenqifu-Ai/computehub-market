@@ -1,0 +1,376 @@
+{
+  "_comment": "价格表 USD / 1M tokens；三档 input(非缓存输入)/output(补全)/cached(缓存读)；可选 peak 时段倍率 {windows,multiplier}（对齐上游 SLCH 9-12/14-18 ×2）。chat 模型按 SLCH 真实成本 ×1.02（保本）核算。未列出走 default。",
+  "deepseek-v4-flash": {
+    "input": 0.27247,
+    "output": 0.8174,
+    "cached": 0.00908
+  },
+  "deepseek-v4-pro": {
+    "input": 0.8174,
+    "output": 2.45219,
+    "cached": 0.02725
+  },
+  "deepseek-v4.1-flash": {
+    "input": 0.13973,
+    "output": 0.5589,
+    "cached": 0.00279,
+    "peak": {
+      "windows": [
+        [
+          9,
+          12
+        ],
+        [
+          14,
+          18
+        ]
+      ],
+      "multiplier": 2
+    }
+  },
+  "glm-5.2": {
+    "input": 1.11781,
+    "output": 3.91233,
+    "cached": 0.27945
+  },
+  "doubao-seed-2.0-pro": {
+    "input": 0.44717,
+    "output": 2.23564,
+    "cached": 0.08943
+  },
+  "doubao-seed-2.1-pro": {
+    "input": 0.73775,
+    "output": 3.68877,
+    "cached": 0.14755
+  },
+  "kimi-k3": {
+    "input": 2.79455,
+    "output": 13.97262,
+    "cached": 0.27945
+  },
+  "Qwen3.8-27B": {
+    "input": 0.3,
+    "output": 0.9,
+    "cached": 0.03
+  },
+  "deepseek-v3.1:671b": {
+    "input": 0.3,
+    "output": 0.9,
+    "cached": 0.03
+  },
+  "deepseek-v3.2": {
+    "input": 0.3,
+    "output": 0.9,
+    "cached": 0.03
+  },
+  "cy-Deepseek-V4-Flash": {
+    "input": 0.1,
+    "output": 0.3,
+    "cached": 0.01
+  },
+  "cy-doubao-seed-2.0-pro": {
+    "input": 0.3,
+    "output": 1.2,
+    "cached": 0.03
+  },
+  "cy-doubao-seed-2.1-pro": {
+    "input": 0.35,
+    "output": 1.4,
+    "cached": 0.035
+  },
+  "cy-glm-5.2": {
+    "input": 0.6,
+    "output": 2.2,
+    "cached": 0.06
+  },
+  "glm-5": {
+    "input": 0.6,
+    "output": 2.2,
+    "cached": 0.06
+  },
+  "MiniMax-H3": {
+    "input": 0.3,
+    "output": 1.2,
+    "cached": 0.03
+  },
+  "minimax-m3": {
+    "input": 0.3,
+    "output": 1.2,
+    "cached": 0.03
+  },
+  "minimax-m2.7": {
+    "input": 0.3,
+    "output": 1.2,
+    "cached": 0.03
+  },
+  "minimax-m2.1": {
+    "input": 0.3,
+    "output": 1.2,
+    "cached": 0.03
+  },
+  "kimi-k2.5": {
+    "input": 0.6,
+    "output": 2.5,
+    "cached": 0.06
+  },
+  "kimi-k2.6": {
+    "input": 0.6,
+    "output": 2.5,
+    "cached": 0.06
+  },
+  "gpt-oss:20b": {
+    "input": 0.05,
+    "output": 0.2,
+    "cached": 0.005
+  },
+  "gpt-oss:120b": {
+    "input": 0.15,
+    "output": 0.6,
+    "cached": 0.015
+  },
+  "gemma4:31b": {
+    "input": 0.05,
+    "output": 0.15,
+    "cached": 0.005
+  },
+  "gemma4:26b": {
+    "input": 0.05,
+    "output": 0.15,
+    "cached": 0.005
+  },
+  "gemma3:12b": {
+    "input": 0.03,
+    "output": 0.1,
+    "cached": 0.003
+  },
+  "gemma3:4b": {
+    "input": 0.02,
+    "output": 0.06,
+    "cached": 0.002
+  },
+  "mistral-large-3:675b": {
+    "input": 0.6,
+    "output": 1.8,
+    "cached": 0.06
+  },
+  "mistral-large-4": {
+    "input": 0.6,
+    "output": 1.8,
+    "cached": 0.06
+  },
+  "nemotron-3-super": {
+    "input": 0.2,
+    "output": 0.6,
+    "cached": 0.02
+  },
+  "nemotron-3-nano:30b": {
+    "input": 0.05,
+    "output": 0.15,
+    "cached": 0.005
+  },
+  "qwen3:8b": {
+    "input": 0.02,
+    "output": 0.06,
+    "cached": 0.002
+  },
+  "qwen3:4b": {
+    "input": 0.01,
+    "output": 0.03,
+    "cached": 0.001
+  },
+  "qwen3.6-35b": {
+    "input": 0.15,
+    "output": 0.45,
+    "cached": 0.015
+  },
+  "qwen3.6-35b-common": {
+    "input": 0.15,
+    "output": 0.45,
+    "cached": 0.015
+  },
+  "qwen2.5:7b": {
+    "input": 0.02,
+    "output": 0.06,
+    "cached": 0.002
+  },
+  "qwen2.5:0.5b": {
+    "input": 0.005,
+    "output": 0.02,
+    "cached": 0.0005
+  },
+  "qwen2.5-coder:7b": {
+    "input": 0.02,
+    "output": 0.06,
+    "cached": 0.002
+  },
+  "llava:7b": {
+    "input": 0.02,
+    "output": 0.06,
+    "cached": 0.002
+  },
+  "gemma4:26b:cloud": {
+    "input": 0.05,
+    "output": 0.15,
+    "cached": 0.005
+  },
+  "nomic-embed-text:latest": {
+    "input": 0.01,
+    "output": 0,
+    "cached": 0.001
+  },
+  "deepseek-v4-pro:0813": {
+    "input": 0.55,
+    "output": 2.19,
+    "cached": 0.055
+  },
+  "glm-5.3": {
+    "input": 0.6,
+    "output": 2.2,
+    "cached": 0.06
+  },
+  "glm-5.3-flash": {
+    "input": 0.15,
+    "output": 0.5,
+    "cached": 0.015
+  },
+  "kimi-k2.7-code": {
+    "input": 0.6,
+    "output": 2.5,
+    "cached": 0.06
+  },
+  "nemotron-3-ultra": {
+    "input": 0.5,
+    "output": 1.5,
+    "cached": 0.05
+  },
+  "deepseek-r1:7b": {
+    "input": 0.02,
+    "output": 0.06,
+    "cached": 0.002
+  },
+  "llama3.2-vision:latest": {
+    "input": 0.02,
+    "output": 0.06,
+    "cached": 0.002
+  },
+  "claude-fable-5-1": {
+    "input": 15,
+    "output": 75,
+    "cached": 1.5
+  },
+  "claude-fable-5": {
+    "input": 15,
+    "output": 75,
+    "cached": 1.5
+  },
+  "claude-opus-4-5-20251101": {
+    "input": 15,
+    "output": 75,
+    "cached": 1.5
+  },
+  "claude-opus-4-6": {
+    "input": 15,
+    "output": 75,
+    "cached": 1.5
+  },
+  "claude-opus-4-7": {
+    "input": 15,
+    "output": 75,
+    "cached": 1.5
+  },
+  "claude-opus-4-8": {
+    "input": 15,
+    "output": 75,
+    "cached": 1.5
+  },
+  "claude-opus-5-5": {
+    "input": 15,
+    "output": 75,
+    "cached": 1.5
+  },
+  "claude-opus-5": {
+    "input": 15,
+    "output": 75,
+    "cached": 1.5
+  },
+  "claude-sonnet-5-5": {
+    "input": 3,
+    "output": 15,
+    "cached": 0.3
+  },
+  "claude-sonnet-5": {
+    "input": 3,
+    "output": 15,
+    "cached": 0.3
+  },
+  "claude-sonnet-4-6": {
+    "input": 3,
+    "output": 15,
+    "cached": 0.3
+  },
+  "claude-sonnet-4-5-20250929": {
+    "input": 3,
+    "output": 15,
+    "cached": 0.3
+  },
+  "claude-haiku-4-5-20251001": {
+    "input": 0.8,
+    "output": 4,
+    "cached": 0.08
+  },
+  "claude-haiku-5-5": {
+    "input": 0.8,
+    "output": 4,
+    "cached": 0.08
+  },
+  "codex-auto-review": {
+    "input": 0.204,
+    "output": 1.224,
+    "cached": 0.0204
+  },
+  "gpt-5.6-luna": {
+    "input": 0.204,
+    "output": 1.224,
+    "cached": 0.0204
+  },
+  "gpt-5.6-sol": {
+    "input": 5.1,
+    "output": 30.6,
+    "cached": 0.51
+  },
+  "gpt-5.6-terra": {
+    "input": 2.04,
+    "output": 12.24,
+    "cached": 0.204
+  },
+  "gpt-6-astra": {
+    "input": 10.2,
+    "output": 51.0,
+    "cached": 1.02
+  },
+  "gpt-6-luna": {
+    "input": 0.102,
+    "output": 0.51,
+    "cached": 0.0102
+  },
+  "gpt-6-sol": {
+    "input": 2.04,
+    "output": 10.2,
+    "cached": 0.204
+  },
+  "gpt-6.1-sol": {
+    "input": 2.04,
+    "output": 10.2,
+    "cached": 0.102
+  },
+  "gpt-reserve": {
+    "input": 2.55,
+    "output": 15.3,
+    "cached": 0.255
+  },
+  "default": {
+    "input": 0.5,
+    "output": 1.5,
+    "cached": 0.05
+  }
+}
