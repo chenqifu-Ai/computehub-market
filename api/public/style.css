@@ -17,7 +17,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
 .auth-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px;
   background:radial-gradient(900px 500px at 50% -10%,#1a2440 0%,var(--bg) 60%)}
 .auth-card{width:100%;max-width:400px;background:var(--panel);border:1px solid var(--border);border-radius:18px;padding:34px 30px}
-.auth-logo{width:52px;height:52px;border-radius:14px;background:linear-gradient(135deg,var(--accent),var(--accent2));
+.auth-logo{width:52px;height:52px;border-radius:14px;overflow:hidden;
   display:flex;align-items:center;justify-content:center;font-size:26px;margin-bottom:16px}
 .auth-card h1{font-size:22px;margin-bottom:6px}
 .auth-sub{color:var(--dim);font-size:13px;margin-bottom:22px}
@@ -43,7 +43,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
 #appView{display:flex;min-height:100vh}
 .side{width:210px;background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0}
 .side-logo{display:flex;align-items:center;gap:9px;padding:20px 18px;font-weight:600;font-size:14.5px;border-bottom:1px solid var(--border)}
-.side-logo span{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.side-logo span{width:30px;height:30px;border-radius:9px;overflow:hidden;display:flex;align-items:center;justify-content:center;flex-shrink:0}
 .side-nav{flex:1;padding:12px 10px;display:flex;flex-direction:column;gap:3px;overflow-y:auto}
 .side-nav a{padding:10px 12px;border-radius:9px;color:var(--dim);font-size:13.5px;transition:.12s}
 .side-nav a:hover{background:var(--panel2);color:var(--txt)}
