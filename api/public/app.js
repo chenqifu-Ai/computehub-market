@@ -1097,7 +1097,7 @@ async function loadUsers() {
       <td class="actions">
         <button class="btn-ghost sm" onclick="editUser(${u.id},'${esc(u.username)}',${u.status},${u.role},'${esc(u.remark || '')}')">管理</button>
         <button class="btn-ghost sm" onclick="downloadSettle(${u.id})">结算</button>
-        <button class="btn-ghost sm" title="导出该帐号全部数据（令牌/日志/流水/签到），用于迁移到其他实例" onclick="exportAccount(${u.id},'${esc(u.username)}')">📦迁移</button>
+        <button class="btn-ghost sm" title="导出该帐号全部数据（令牌/日志/流水/签到），用于迁移到其他实例" onclick="exportAccount(${u.id},'${esc(u.username)}','${u.log_count || 0}')">📦迁移</button>
         ${u.role >= 100 ? '' : `<button class="btn-ghost sm btn-danger" onclick="deleteUser(${u.id},'${esc(u.username)}')">删除</button>`}
       </td>
     </tr>`).join('');
@@ -1107,11 +1107,19 @@ async function loadUsers() {
 
 // ---------- 帐号数据迁移 ----------
 // 一键导出单个帐号：流式下载 JSONL（令牌含明文 key / 全量日志 / 资金流水 / 签到 / 审计）
-async function exportAccount(id, name) {
-  const ok = confirm(`导出帐号 ${name}(#${id}) 的全部数据？\n\n包含：余额/角色/代理信息、API 令牌（含明文 key）、全部调用日志、资金流水、签到记录。\n\n文件为 .jsonl，导入到另一台实例后该帐号即可正常使用。`);
+async function exportAccount(id, name, logCount) {
+  const lc = parseInt(logCount || 0, 10);
+  // 【2026-10-22】预估耗时：包 ~530B/行；生成 ~0.21s/万行(大帐号游批优化后 ~21s封顶210s)；传输 ECS→浏览器 ~6.1MB/s
+  const estSizeMB = lc * 530 / 1048576;
+  const estGenS = lc === 0 ? 0 : Math.min(210, Math.max(0.3, lc / 10000 * 0.21));
+  const estDlS = estSizeMB / 6.1;
+  const fmtT = s => s < 1 ? '<1s' : s < 60 ? Math.round(s) + 's' : Math.round(s / 6) / 10 + ' 分钟';
+  const estMsg = lc === 0 ? '包几乎为空，秒下'
+    : `包 ≈${estSizeMB.toFixed(0)}MB · 生成 ${fmtT(estGenS)} + 传输 ${fmtT(estDlS)} ≈ ${fmtT(estGenS + estDlS)}`;
+  const ok = confirm(`导出帐号 ${name}(#${id}) 的全部数据？\n\n包含：余额/角色/代理信息、API 令牌（含明文 key）、全部调用日志、资金流水、签到记录。\n\n文件为 .jsonl，导入到另一台实例后该帐号即可正常使用。\n\n⏱️ 预计：${estMsg}（中断自动从断点续传，无需重来）`);
   if (!ok) return;
   // 【2026-10-22 断点续传版】中断自动从已收字节续传（最多 6 次）；服务端落盘保留 24h
-  showMigrateProgress('正在导出 ' + name + ' …');
+  showMigrateProgress(`正在导出 ${name} …（⏱️ ${estMsg}）`);
   const parts = [];
   let got = 0, total = 0, fname = 'account-migration-' + id + '.jsonl';
   const dec = new TextDecoder();

@@ -272,6 +272,7 @@ async function createUser(db, username, password, opts = {}) {
   return getUserById(db, Number(info.lastInsertRowid));
 }
 function publicUser(db, u) {
+  const logCnt = db.prepare('SELECT COUNT(*) c FROM logs WHERE user_id=?').get(u.id).c;
   return {
     id: u.id,
     username: u.username,
@@ -279,6 +280,7 @@ function publicUser(db, u) {
     quota: u.quota,
     used_quota: u.used_quota,
     request_count: u.request_count,
+    log_count: logCnt,   // 【2026-10-22】迁移弹窗预估导出耗时用
     group: u.group_name,
     role: u.role,
     status: u.status,
