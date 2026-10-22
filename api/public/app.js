@@ -1109,47 +1109,61 @@ async function loadUsers() {
 // 一键导出单个帐号：流式下载 JSONL（令牌含明文 key / 全量日志 / 资金流水 / 签到 / 审计）
 async function exportAccount(id, name, logCount) {
   const lc = parseInt(logCount || 0, 10);
-  // 【2026-10-22】预估耗时：包 ~530B/行；生成 ~21s/百万行封顶；传输 ECS→浏览器 ~6.1MB/s
-  const estSizeMB = lc * 530 / 1048576;
+  // 预估：jsonl ~530B/行；gz 压缩后 ~13%（实测 394MB→52MB）
+  const estMB = lc * 530 / 1048576;
+  const estGzMB = estMB * 0.15 + 0.5;
   const estGenS = lc === 0 ? 0 : Math.min(210, Math.max(0.3, lc / 10000 * 0.21));
-  const estDlS = estSizeMB / 6.1;
   const fmtT = s => s < 1 ? '<1s' : s < 60 ? Math.round(s) + 's' : Math.round(s / 6) / 10 + ' 分钟';
-  const estMsg = lc === 0 ? '包几乎为空，秒下'
-    : `包 ≈${estSizeMB.toFixed(0)}MB · 生成 ${fmtT(estGenS)} + 传输 ${fmtT(estDlS)} ≈ ${fmtT(estGenS + estDlS)}`;
-  const ok = confirm(`导出帐号 ${name}(#${id}) 的全部数据？\n\n包含：余额/角色/代理信息、API 令牌（含明文 key）、全部调用日志、资金流水、签到记录。\n\n文件为 .jsonl，导入到另一台实例后该帐号即可正常使用。\n\n⏱️ 预计：${estMsg}\n📥 走浏览器下载管理器：断线自动续传、后台下载不占内存，中断后重试同一链接即续传`);
-  if (!ok) return;
-  // 【2026-10-22 v3】大包改走浏览器原生下载器（fetch 流式读 412MB 会把手机/弱机浏览器内存撑爆而"导出失败"）。
-  // 原生下载器优势：内存零占用 + 系统级断点续传 + 后台运行接电话也不停。
-  // 流程：先 probe（有包=秒传；无包=先触发生成等完再下载）→ 用带 token 的 URL 建 <a download> 触发。
-  if (!SESSION) { toast('请先登录', 'err'); return; }
-  if (lc > 50000) showMigrateProgress(`正在准备 ${name} 的导出…（⏱️ ${estMsg}）`);
-  try {
-    // 1) probe 是否有现成包
-    let hasFile = false, fileSize = 0;
+  // 【2026-10-22 v4 正经版】弹一个真下载面板（不是 confirm），给两个按钮：
+  //   📦 .gz 压缩包（推荐，52MB 级传输快） / 📄 .jsonl 原始包
+  // 都走 <a download> 浏览器原生下载器：零 JS 内存 + 系统级断点续传 + 通知栏进度
+  const hasGz = estMB > 5;   // >5MB 提供 gz 选项
+  openModal(`
+    <h3>📦 导出迁移包 — ${esc(name)}（#${id}）</h3>
+    <p class="muted">包含：余额/角色/代理 · API 令牌（明文 key）· 全部日志 · 资金流水 · 签到<br>
+       ⏱️ 原始包 ≈${estMB.toFixed(0)}MB${hasGz ? ' · 压缩包 ≈' + estGzMB.toFixed(0) + 'MB' : ''}${lc ? '（' + lc.toLocaleString() + ' 行日志）' : ''} · ${estGenS < 1 ? '已就绪秒下' : '首次生成约 ' + fmtT(estGenS)}
+    </p>
+    <p class="muted" style="margin-top:6px">📥 下载走浏览器下载管理器（系统级断点续传；中断重新点同一按钮即续传）</p>
+    <div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap">
+      ${hasGz ? `<button class="btn-primary" id="migGzBtn">📦 下载压缩包 .gz（≈${estGzMB.toFixed(0)}MB，快）</button>` : ''}
+      <button class="btn-ghost ${hasGz ? '' : 'btn-primary'}" id="migRawBtn">📄 原始包 .jsonl（≈${estMB.toFixed(0)}MB）</button>
+    </div>
+    <div id="migSt" class="muted" style="margin-top:12px"></div>
+  `);
+  const st = $('migSt');
+  const doDl = async (gz) => {
+    const btn = gz ? $('migGzBtn') : $('migRawBtn');
+    if (btn) btn.disabled = true;
+    st.textContent = '检查服务器包状态…';
     try {
-      const pj = await (await api(`/api/admin/user/export?id=${id}&probe=1`));
-      hasFile = !!pj.hasFile; fileSize = pj.size || 0;
-    } catch {}
-    // 2) 无包 → 先 wait=1 生成落盘（不下载 body，只等服务器生成完）
-    if (!hasFile) {
-      if (lc > 50000) setMigrateProgress(`服务器无现成包，正在生成（⏱️ 生成约 ${fmtT(estGenS)}）…`);
-      const gr = await fetch(`/api/admin/user/export?id=${id}&wait=1&nostream=1`, { headers: { Authorization: SCHEME + SESSION } });
-      if (gr.ok) {
-        const gj = await gr.json().catch(() => null);
-        if (gj && gj.ok) { hasFile = true; fileSize = gj.size || 0; }
-      }
+      // probe
+      let hasFile = false, size = 0, gzReady = false, gzSize = 0;
+      const pj = await api(`/api/admin/user/export?id=${id}&probe=1`);
+      if (pj) { hasFile = !!pj.hasFile; size = pj.size || 0; gzReady = !!pj.gzReady; gzSize = pj.gzSize || 0; }
+      st.textContent = gz ? (gzReady ? `压缩包已就绪（${(gzSize / 1048576).toFixed(1)}MB），开始下载…` : '服务器正在压缩（几十秒），完成后自动开始下载…')
+                          : (hasFile ? `原始包已就绪（${(size / 1048576).toFixed(1)}MB），开始下载…` : '服务器正在生成包，完成后自动开始下载…');
+      // 无包 → 触发服务端生成/压缩（等完成返回才继续）
+      const prep = gz ? 'prepare-gz' : 'prepare';
+      const pr = await api(`/api/admin/user/export?${prep}=1&id=${id}`);
+      if (!pr || (pr.ok === false && pr.success === false)) throw new Error((pr && pr.message) || '准备失败');
+      if (gz && pr.gzSize) st.textContent = `压缩完成（${(pr.gzSize / 1048576).toFixed(1)}MB），开始下载…`;
+      // 交浏览器下载器
+      const url = gz
+        ? `/api/admin/user/export-gz?id=${id}&resume=1&offset=0&token=${encodeURIComponent(SESSION)}`
+        : `/api/admin/user/export?id=${id}&resume=1&offset=0&token=${encodeURIComponent(SESSION)}`;
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = gz ? `帐号迁移_${name}_${id}.jsonl.gz` : `帐号迁移_${name}_${id}.jsonl`;
+      document.body.appendChild(a); a.click(); a.remove();
+      st.innerHTML = '📥 已交给浏览器下载——请看<b>浏览器下载栏/系统通知</b>的进度。断线后重新点本页按钮即自动续传。';
+      if (btn) btn.disabled = false;
+    } catch (e) {
+      st.innerHTML = '<span style="color:#f66">❌ ' + esc(e.message) + '</span>';
+      if (btn) btn.disabled = false;
     }
-    // 3) 触发浏览器原生下载（token 走 URL 参数；服务器支持 Range → 断线自动续传）
-    const a = document.createElement('a');
-    a.href = `/api/admin/user/export?id=${id}&resume=1&offset=0&token=${encodeURIComponent(SESSION)}`;
-    a.download = `帐号迁移_${name}_${id}.jsonl`;
-    document.body.appendChild(a); a.click(); a.remove();
-    if (lc > 50000) { setTimeout(hideMigrateProgress, 3000); toast(`已交由浏览器下载：${name}（${(estSizeMB || fileSize / 1048576).toFixed(0)}MB）\n断线请重新点击「📦迁移」续传`, 'ok'); }
-    else toast(`已开始下载：${name}`, 'ok');
-  } catch (e) {
-    hideMigrateProgress();
-    toast('导出失败：' + e.message, 'err');
-  }
+  };
+  if ($('migGzBtn')) $('migGzBtn').onclick = () => doDl(true);
+  if ($('migRawBtn')) $('migRawBtn').onclick = () => doDl(false);
 }
 
 // 导入帐号：上传 .jsonl（可另存新帐号，或合并到已有帐号）

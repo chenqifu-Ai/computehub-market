@@ -939,10 +939,12 @@ const server = http.createServer(async (req, res) => {
       const disposition = `attachment; filename="account-migration-${target.id}.jsonl"; filename*=UTF-8''${encodeURIComponent(fname)}`;
 
       // ---- 续传分支：文件已存在 → 直接从 offset 发（不重新生成）----
-      // 【2026-10-22】probe=1 只探测是否有现成包（不触发重新生成）：有包 hasFile:true，无包 noFile:true
+      // 【2026-10-22】probe=1 只探测（不生成/不压缩）：hasFile+size / gzReady+gzSize
       if (query.get('probe') === '1') {
-        if (fs.existsSync(migFile)) return json(res, 200, { success: true, hasFile: true, size: fs.statSync(migFile).size });
-        return json(res, 200, { success: true, noFile: true });
+        const r = { success: true };
+        if (fs.existsSync(migFile)) { r.hasFile = true; r.size = fs.statSync(migFile).size; } else r.noFile = true;
+        if (fs.existsSync(migFile + '.gz')) { r.gzReady = true; r.gzSize = fs.statSync(migFile + '.gz').size; }
+        return json(res, 200, r);
       }
       const resumeOffset = parseInt(query.get('resume') === '1' ? (query.get('offset') || '0') : '-1', 10);
       if (resumeOffset >= 0 && fs.existsSync(migFile)) {
@@ -999,6 +1001,37 @@ const server = http.createServer(async (req, res) => {
           }
         })();
       };
+
+      // 【2026-10-22 v4】prepare=1 / prepare-gz=1：只准备（生成/压缩），返回 JSON 不传输文件。
+      // 前端拿到 ok 后用 <a download> 触发浏览器原生下载器。
+      if (query.get('prepare') === '1' || query.get('prepare-gz') === '1') {
+        const wantGz = query.get('prepare-gz') === '1';
+        if (!fs.existsSync(migFile)) {
+          if (lc > 0) {} // noop for linter
+          await new Promise((resolve) => finalize(() => resolve()));
+        }
+        if (!fs.existsSync(migFile)) return json(res, 500, { success: false, message: '包生成失败' });
+        const out = { success: true, ok: true, size: fs.statSync(migFile).size };
+        if (wantGz) {
+          const gzP = migFile + '.gz';
+          if (!fs.existsSync(gzP) || fs.statSync(gzP).mtimeMs < fs.statSync(migFile).mtimeMs) {
+            await new Promise((resolve) => {
+              const zin = fs.createReadStream(migFile);
+              const zout = zlib.createGzip({ level: 6 });
+              const fout = fs.createWriteStream(gzP);
+              zin.pipe(zout).pipe(fout);
+              fout.on('finish', resolve);
+              fout.on('error', () => resolve());
+              zin.on('error', () => resolve());
+            });
+          }
+          if (!fs.existsSync(gzP)) return json(res, 500, { success: false, message: '压缩失败' });
+          out.gzSize = fs.statSync(gzP).size;
+          out.ok = true;
+        }
+        console.log(`[migrate] ${u.username} prepare${wantGz ? '-gz' : ''} ${target.username}(#${target.id}) → ${wantGz ? out.gzSize + 'b gz' : out.size + 'b'}`);
+        return json(res, 200, out);
+      }
 
       // wait=1&nostream=1：只生成落盘，返回 JSON {ok:true,size}（配合前端把下载交给浏览器原生下载器）
       if (query.get('wait') === '1' && query.get('nostream') === '1') {
