@@ -1110,28 +1110,60 @@ async function loadUsers() {
 async function exportAccount(id, name) {
   const ok = confirm(`导出帐号 ${name}(#${id}) 的全部数据？\n\n包含：余额/角色/代理信息、API 令牌（含明文 key）、全部调用日志、资金流水、签到记录。\n\n文件为 .jsonl，导入到另一台实例后该帐号即可正常使用。`);
   if (!ok) return;
+  // 【2026-10-22 断点续传版】中断自动从已收字节续传（最多 6 次）；服务端落盘保留 24h
   showMigrateProgress('正在导出 ' + name + ' …');
+  const parts = [];
+  let got = 0, total = 0, fname = 'account-migration-' + id + '.jsonl';
+  const dec = new TextDecoder();
+  const t0 = Date.now();
+  const MAX_RETRY = 6;
   try {
-    const r = await fetch(`/api/admin/user/export?id=${id}`, { headers: { Authorization: SCHEME + SESSION } });
-    if (!r.ok) { hideMigrateProgress(); const j = await r.json().catch(() => ({})); return toast('导出失败：' + (j.message || r.status), 'err'); }
-    const disp = r.headers.get('Content-Disposition') || '';
-    let fname = 'account-migration-' + id + '.jsonl';
-    const m = disp.match(/filename\*=UTF-8''([^;]+)/);
-    if (m) { try { fname = decodeURIComponent(m[1]); } catch {} }
-    // 流式读：单次请求，边下边刷进度；缓冲拼回 blob 触发下载（大帐号 ~几十MB，内存可承受）
-    const reader = r.body.getReader();
-    const parts = [];
-    let got = 0, lines = 0, chunk = '';
-    const dec = new TextDecoder();
-    const t0 = Date.now();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      parts.push(value);
-      got += value.length;
-      chunk += dec.decode(value, { stream: true });
-      let i; while ((i = chunk.indexOf('\n')) >= 0) { chunk = chunk.slice(i + 1); lines++; }
-      setMigrateProgress(`${name}：${(got / 1048576).toFixed(2)}MB / ${lines} 行 / 已用 ${((Date.now() - t0) / 1000).toFixed(0)}s（日志大的帐号请耐心，请勿关页面）`);
+    for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
+      // 重试时不重新发起“边生成边发”，改走 resume=1 模式从文件续传
+      const url = attempt === 0
+        ? `/api/admin/user/export?id=${id}&wait=1`
+        : `/api/admin/user/export?id=${id}&resume=1&offset=${got}`;
+      let r;
+      try {
+        r = await fetch(url, { headers: { Authorization: SCHEME + SESSION } });
+      } catch (e) {
+        if (attempt < MAX_RETRY && got > 0) {
+          setMigrateProgress(`⚠️ 网络中断，从 ${(got / 1048576).toFixed(1)}MB 断点续传（第 ${attempt} 次重试）…`);
+          await new Promise(res => setTimeout(res, 2000 * attempt));
+          continue;
+        }
+        throw e;
+      }
+      if (r.status === 416) { hideMigrateProgress(); toast('服务器文件已过期（保留 24 小时），请重新导出', 'err'); return; }
+      if (!r.ok && r.status !== 206) { const j = await r.json().catch(() => ({})); throw new Error(j.message || r.status); }
+      const disp = r.headers.get('Content-Disposition') || '';
+      const m = disp.match(/filename\*=UTF-8''([^;]+)/);
+      if (m) { try { fname = decodeURIComponent(m[1]); } catch {} }
+      total = parseInt(r.headers.get('X-Migrate-Total') || '0', 10) || total;
+      if (r.status === 206) {
+        const cr = r.headers.get('Content-Range') || '';
+        const cm = cr.match(/\/(\d+)$/);
+        if (cm) total = parseInt(cm[1], 10);
+      }
+      if (!r.body) { const blob = await r.blob(); parts.push(blob); break; }
+      const reader = r.body.getReader();
+      let broken = false, lines = 0, chunk = '';
+      while (true) {
+        let rd;
+        try { rd = await reader.read(); } catch (e) { broken = true; break; }
+        const { done, value } = rd;
+        if (done) break;
+        parts.push(value);
+        got += value.length;
+        chunk += dec.decode(value, { stream: true });
+        let i; while ((i = chunk.indexOf('\n')) >= 0) { chunk = chunk.slice(i + 1); lines++; }
+        setMigrateProgress(`${name}：${(got / 1048576).toFixed(2)}MB${total ? ' / ' + (total / 1048576).toFixed(1) + 'MB' : ''} / 已用 ${((Date.now() - t0) / 1000).toFixed(0)}s（中断自动续传，请勿关页面太久）`);
+      }
+      try { reader.releaseLock(); } catch {}
+      if (!broken) break;
+      if (attempt >= MAX_RETRY) throw new Error('网络中断且重试 ' + MAX_RETRY + ' 次未成功（已收 ' + (got / 1048576).toFixed(1) + 'MB，刷新页面重新点继续）');
+      setMigrateProgress(`⚠️ 网络中断，正在从 ${(got / 1048576).toFixed(1)}MB 续传…`);
+      await new Promise(res => setTimeout(res, 2000 * (attempt + 1)));
     }
     hideMigrateProgress();
     const b2 = new Blob(parts, { type: 'application/x-ndjson' });

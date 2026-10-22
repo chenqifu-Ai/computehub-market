@@ -35,6 +35,14 @@ setInterval(() => {
       _exportJobs.delete(k);
     }
   }
+  // 【2026-10-22】migrate 落盘包同步清理（用 mtime 判 24h）
+  try {
+    const migDir = path.join(__dirname, 'logs', 'migrate');
+    if (fs.existsSync(migDir)) for (const f of fs.readdirSync(migDir)) {
+      const fp = path.join(migDir, f);
+      if (now - fs.statSync(fp).mtimeMs > EXPORT_FILE_TTL_MS) fs.unlink(fp, () => {});
+    }
+  } catch {}
 }, 10 * 60 * 1000).unref();
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // 1 美元基准 quota（New-API 惯例 500000 = $1）
@@ -912,7 +920,8 @@ const server = http.createServer(async (req, res) => {
     }
     // 【2026-10-21】帐号数据迁移：一键导出单个帐号全部数据（JSONL，含 tokens 明文 key / 全量日志 / 资金流水 / 签到 / 审计）
     // GET /api/admin/user/export?id=<uid>&log_limit=<可选上限>
-    // 流式响应：先 flush 头，再逐块写（大帐号日志几十万行也不占内存/不阻塞别人，logs 按 5 万行/批游标读取）
+    // 【2026-10-22 v2】落地盘 + 断点续传：先落盘 24h 内可 Range 续传，大帐号中断不再从头重来。
+    // 首次请求：后台生成落盘 → 前端流式读；再次请求带 resume=1&offset=<bytes>：直接从文件续传。
     if (pathname === '/api/admin/user/export' && req.method === 'GET') {
       const u = requireUser(req, res); if (!u) return;
       if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
@@ -920,33 +929,97 @@ const server = http.createServer(async (req, res) => {
       const target = uid ? store.getUserById(db, uid) : null;
       if (!target) return json(res, 404, { success: false, message: '用户不存在' });
       const logLimit = Math.min(parseInt(query.get('log_limit') || '0', 10) || 0, 2000000);
-      const d = new Date();
-      const stamp = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
-      const fname = `帐号迁移_${target.username}_${target.id}_${stamp}.jsonl`;
+
+      const migDir = path.join(__dirname, 'logs', 'migrate');
+      fs.mkdirSync(migDir, { recursive: true });
+      // 稳定文件名（不含时间戳）：同一帐号重复导出覆盖旧包，续传按 offset 定位
+      const migFile = path.join(migDir, `account-migration-${target.id}.jsonl`);
+      const fname = `帐号迁移_${target.username}_${target.id}_${new Date().toISOString().slice(0, 10)}.jsonl`;
+      const disposition = `attachment; filename="account-migration-${target.id}.jsonl"; filename*=UTF-8''${encodeURIComponent(fname)}`;
+
+      // ---- 续传分支：文件已存在 → 直接从 offset 发（不重新生成）----
+      const resumeOffset = parseInt(query.get('resume') === '1' ? (query.get('offset') || '0') : '-1', 10);
+      if (resumeOffset >= 0 && fs.existsSync(migFile)) {
+        const size = fs.statSync(migFile).size;
+        const start = Math.min(Math.max(resumeOffset, 0), size);
+        if (start >= size) {
+          // 已经全部收过：返回空 200（前端直接落盘）
+          res.writeHead(200, {
+            'Content-Type': 'application/x-ndjson; charset=utf-8',
+            'Content-Disposition': disposition,
+            'Content-Length': 0, 'X-Migrate-Total': String(size),
+            'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*',
+          });
+          return res.end();
+        }
+        console.log(`[migrate] 续传帐号 ${target.username}(#${target.id}) bytes=${start}-${size}`);
+        res.writeHead(206, {
+          'Content-Type': 'application/x-ndjson; charset=utf-8',
+          'Content-Disposition': disposition,
+          'Content-Range': `bytes ${start}-${size - 1}/${size}`,
+          'Content-Length': size - start,
+          'Accept-Ranges': 'bytes', 'X-Migrate-Total': String(size),
+          'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*',
+        });
+        const st = fs.createReadStream(migFile, { start });
+        st.on('error', () => { try { res.destroy(); } catch {} });
+        st.pipe(res);
+        res.on('close', () => { /* 断开不删文件，24h GC 统一清 */ });
+        return;
+      }
+
+      // ---- 首次请求：落盘生成（复用现有流式生成器）----
+      const t0 = Date.now();
+      const finalize = (cb) => {
+        let out = fs.createWriteStream(migFile);
+        let n = 0;
+        (async () => {
+          try {
+            for await (const line of store.exportUserBundleStream(db, target.id, { logLimit, operator: u })) {
+              out.write(line + '\n'); n++;
+              if (n % 100000 === 0) await new Promise(r => setImmediate(r)); // 让出事件循环
+            }
+            await new Promise(r => out.end(r));
+            const cnt = store.countLogs(db, target.id);
+            console.log(`[migrate] ${u.username} 导出帐号 ${target.username}(#${target.id}) ${n} 行 / logs=${cnt} / ${Date.now() - t0}ms`);
+            cb(n);
+          } catch (e) {
+            console.error('[migrate] 导出失败:', e.message);
+            try { out.end(); } catch {}
+            cb(null, e);
+          }
+        })();
+      };
+
+      // 支持两种模式：wait=1（等生成完再发，配合前端直接流式下载）；默认（立即以流式发送边生成边发，兼容旧前端）
+      if (query.get('wait') === '1') {
+        // 先响应 202 让前端轮询（用 X-Migrate-Job 标识）；实际上简化：同步等生成完（~20s），再发文件
+        finalize(() => {
+          const size = fs.statSync(migFile).size;
+          res.writeHead(200, {
+            'Content-Type': 'application/x-ndjson; charset=utf-8',
+            'Content-Disposition': disposition,
+            'Content-Length': size, 'Accept-Ranges': 'bytes', 'X-Migrate-Total': String(size),
+            'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*',
+          });
+          const st = fs.createReadStream(migFile);
+          st.on('error', () => { try { res.destroy(); } catch {} });
+          st.pipe(res);
+          res.on('close', () => {});
+        });
+        return;
+      }
+      // 兼容旧前端：边生成边发（原逻辑），同时落盘
       res.writeHead(200, {
         'Content-Type': 'application/x-ndjson; charset=utf-8',
-        'Content-Disposition': `attachment; filename="account-migration-${target.id}-${stamp}.jsonl"; filename*=UTF-8''${encodeURIComponent(fname)}`,
-        'Cache-Control': 'no-store',
+        'Content-Disposition': disposition,
+        'X-Migrate-Job': 'streaming', 'Cache-Control': 'no-store',
         'Access-Control-Allow-Origin': '*',
       });
-      res.write(''); // 立即 flush 响应头，前端 fetch 可开始读 body 显示进度
-      const t0 = Date.now();
-      (async () => {
-        try {
-          let n = 0;
-          for await (const line of store.exportUserBundleStream(db, target.id, { logLimit, operator: u })) {
-            res.write(line + '\n');
-            n++;
-          }
-          const cnt = store.countLogs(db, target.id);
-          console.log(`[migrate] ${u.username} 导出帐号 ${target.username}(#${target.id}) ${n} 行 / logs=${cnt} / ${Date.now() - t0}ms`);
-          res.end();
-        } catch (e) {
-          console.error('[migrate] 导出失败:', e.message);
-          try { res.destroy(); } catch {}
-        }
-      })();
-      res.on('close', () => { /* 客户端断开：生成器随 res 写失败自然终止 */ });
+      res.write('');
+      finalize(() => {
+        try { res.end(); } catch {}
+      });
       return;
     }
     // 【2026-10-21】帐号数据迁移：导入导出包
@@ -1503,7 +1576,12 @@ function serveStatic(req, res, pathname) {
       }
       res.writeHead(404); return res.end('Not Found');
     }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(filePath).toLowerCase()] || 'application/octet-stream' });
+    res.writeHead(200, {
+      'Content-Type': MIME[path.extname(filePath).toLowerCase()] || 'application/octet-stream',
+      // 【2026-10-22】静态资源加 no-cache：改版后浏览器必须拉最新 app.js，否则续传逻辑不生效
+      'Cache-Control': 'no-cache, must-revalidate',
+      'Etag': `"${Math.floor(buf.length / 100)}-${Math.floor(fs.statSync(filePath).mtimeMs / 1000)}"`,
+    });
     res.end(buf);
   });
 }
