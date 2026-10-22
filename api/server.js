@@ -12,6 +12,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const zlib = require('node:zlib');
 const { DatabaseSync } = require('node:sqlite');
 const store = require('./lib/store');
 const relay = require('./lib/relay');
@@ -1071,6 +1072,75 @@ const server = http.createServer(async (req, res) => {
       });
       return;
     }
+    // 【2026-10-22】迁移包 gzip 版：/api/admin/user/export-gz?id=N&token=***
+    // 直发 logs/migrate/account-migration-N.jsonl.gz；无 .gz 现场从 .jsonl 压（gzip -k 同步）。配合浏览器原生下载器。
+    if (pathname === '/api/admin/user/export-gz' && req.method === 'GET') {
+      const u = requireUser(req, res); if (!u) return;
+      if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
+      const uid = parseInt(query.get('id') || '0', 10);
+      const target = uid ? store.getUserById(db, uid) : null;
+      if (!target) return json(res, 404, { success: false, message: '用户不存在' });
+      const migDir = path.join(__dirname, 'logs', 'migrate');
+      fs.mkdirSync(migDir, { recursive: true });
+      const raw = path.join(migDir, `account-migration-${target.id}.jsonl`);
+      const gz = path.join(migDir, `account-migration-${target.id}.jsonl.gz`);
+      // 有 .jsonl 无 .gz → 同步压（大文件 ~30s，node zlib 流式）
+      if (!fs.existsSync(gz) && fs.existsSync(raw)) {
+        await new Promise((resolve) => {
+          const zin = fs.createReadStream(raw);
+          const zout = zlib.createGzip({ level: 6 });
+          const fout = fs.createWriteStream(gz);
+          zin.pipe(zout).pipe(fout);
+          fout.on('finish', resolve);
+          fout.on('error', resolve);
+          zin.on('error', resolve);
+        });
+      }
+      if (!fs.existsSync(gz)) return json(res, 404, { success: false, message: '包不存在（先点一次迁移导出生成）' });
+      const size = fs.statSync(gz).size;
+      const gfname = `帐号迁移_${target.username}_${target.id}.jsonl.gz`;
+      const gdisposition = `attachment; filename="account-migration-${target.id}.jsonl.gz"; filename*=UTF-8''${encodeURIComponent(gfname)}`;
+      // Range 续传
+      const rangeHdr = req.headers['range'];
+      if (rangeHdr) {
+        const m = String(rangeHdr).match(/^bytes=(\d+)-(\d*)$/);
+        if (m) {
+          const start = parseInt(m[1], 10);
+          const end = m[2] ? Math.min(parseInt(m[2], 10), size - 1) : size - 1;
+          if (start >= size || start > end) {
+            res.writeHead(416, { 'Content-Range': `bytes */${size}`, 'Cache-Control': 'no-store' });
+            return res.end();
+          }
+          res.writeHead(206, {
+            'Content-Type': 'application/gzip',
+            'Content-Disposition': gdisposition,
+            'Content-Range': `bytes ${start}-${end}/${size}`,
+            'Content-Length': end - start + 1,
+            'Accept-Ranges': 'bytes',
+            'ETag': `"gz-${target.id}-${size}"`, 'Last-Modified': fs.statSync(gz).mtime.toUTCString(),
+            'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*',
+          });
+          const st = fs.createReadStream(gz, { start, end });
+          st.on('error', () => { try { res.destroy(); } catch {} });
+          st.pipe(res);
+          return;
+        }
+      }
+      console.log(`[migrate] ${u.username} 下载 gz 包 ${target.username}(#${target.id}) ${size}b`);
+      res.writeHead(200, {
+        'Content-Type': 'application/gzip',
+        'Content-Disposition': gdisposition,
+        'Content-Length': size,
+        'Accept-Ranges': 'bytes',
+        'ETag': `"gz-${target.id}-${size}"`, 'Last-Modified': fs.statSync(gz).mtime.toUTCString(),
+        'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*',
+      });
+      const st = fs.createReadStream(gz);
+      st.on('error', () => { try { res.destroy(); } catch {} });
+      st.pipe(res);
+      return;
+    }
+
     // 【2026-10-21】帐号数据迁移：导入导出包
     // POST /api/admin/user/import  body: JSONL 文本（application/json 包一层 {"data": "..."} 或原始文本）
     //   ?mode=new（默认，新建用户，重名自动 _2/_3）| merge&target_id=<uid>（合并到已有帐号）
