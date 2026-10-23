@@ -231,7 +231,24 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/api/user/self') {
       const u = requireUser(req, res); if (!u) return;
-      return json(res, 200, { success: true, data: store.publicUser(db, u) });
+      // 生效「指定渠道」：沿邀请链向上找最近的代理指派（普通用户也能看到自己走哪条线）
+      let pinned = null;
+      try {
+        const p = store.agentChannelForUser(db, u.id);
+        if (p) {
+          const ch = store.getChannel(db, p.channel_id);
+          if (ch) {
+            // 渠道支持的对外模型名 = models 列表 + model_mapping 的键
+            const allowed = new Set();
+            (ch.models || '').split(',').map(s => s.trim()).filter(Boolean).forEach(m => allowed.add(m));
+            try { Object.keys(JSON.parse(ch.model_mapping || '{}')).forEach(m => allowed.add(m)); } catch {}
+            pinned = { channel_id: ch.id, channel_name: ch.name, status: ch.status,
+              owner_id: p.owner_id, owner_name: p.owner_name, depth: p.depth,
+              is_owner: p.owner_id === u.id, models_allowed: [...allowed] };
+          }
+        }
+      } catch {}
+      return json(res, 200, { success: true, data: store.publicUser(db, u), pinned_channel: pinned });
     }
     if (pathname === '/api/user/update' && req.method === 'POST') {
       const u = requireUser(req, res); if (!u) return;
@@ -323,14 +340,51 @@ const server = http.createServer(async (req, res) => {
     // 我的团队（含整棵下级树 + 各级统计）
     if (pathname === '/api/agent/team') {
       const u = requireUser(req, res); if (!u) return;
+      // 生效指定渠道（自己或祖代理设置的）：代理中心展示「我的专属专线」
+      let pinned = null;
+      try {
+        const p = store.agentChannelForUser(db, u.id);
+        if (p) {
+          const ch = store.getChannel(db, p.channel_id);
+          if (ch) {
+            const allowed = new Set();
+            (ch.models || '').split(',').map(s => s.trim()).filter(Boolean).forEach(m => allowed.add(m));
+            try { Object.keys(JSON.parse(ch.model_mapping || '{}')).forEach(m => allowed.add(m)); } catch {}
+            pinned = { channel_id: ch.id, channel_name: ch.name, status: ch.status,
+              owner_id: p.owner_id, owner_name: p.owner_name, depth: p.depth,
+              is_owner: p.owner_id === u.id, models_allowed: [...allowed] };
+          }
+        }
+      } catch {}
       return json(res, 200, {
         success: true,
         data: {
           me: { id: u.id, username: u.username, agent_level: u.agent_level, agent_name: u.agent_name, quota: u.quota, used_quota: u.used_quota, request_count: u.request_count, status: u.status },
           stats: store.teamStats(db, u.id),
-          downline: store.listDownline(db, u.id, { maxDepth: 5 }),
-          subtree: store.subtreeOf(db, u.id, 5),   // 以我为首的嵌套树
+          // 以我为首的嵌套树（每个节点附生效专线）
+          subtree: (() => {
+            const withChan = (n) => {
+              let ep = null;
+              try {
+                const p = store.agentChannelForUser(db, n.id);
+                if (p) { const c = store.getChannel(db, p.channel_id); if (c) ep = { channel_id: c.id, channel_name: c.name, owner_name: p.owner_name, depth: p.depth }; }
+              } catch {}
+              return { ...n, effective_channel: ep, children: (n.children || []).map(withChan) };
+            };
+            const st = store.subtreeOf(db, u.id, 5);
+            return st ? withChan(st) : null;
+          })(),
           upline: store.getUpline(db, u.id, 3).map(p => ({ id: p.id, username: p.username, agent_level: p.agent_level, agent_name: p.agent_name })),
+          pinned_channel: pinned,   // 我的生效专线（谁设置的、哪些模型可用）
+          // 每个下级的生效专线（沿其邀请链向上解析，供代理中心列表展示）
+          downline: store.listDownline(db, u.id, { maxDepth: 5 }).map(m => {
+            let ep = null;
+            try {
+              const p = store.agentChannelForUser(db, m.id);
+              if (p) { const c = store.getChannel(db, p.channel_id); if (c) ep = { channel_id: c.id, channel_name: c.name, owner_name: p.owner_name, depth: p.depth }; }
+            } catch {}
+            return { ...m, effective_channel: ep };
+          }),
         },
       });
     }
@@ -339,9 +393,9 @@ const server = http.createServer(async (req, res) => {
       const u = requireUser(req, res); if (!u) return;
       if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
       // 根节点 = 无上级的用户
-      const roots = db.prepare('SELECT id,username,agent_level,agent_name,quota,used_quota,status,role,remark,inviter_id FROM users WHERE inviter_id=0 ORDER BY id').all();
+      const roots = db.prepare('SELECT id,username,agent_level,agent_name,agent_channel_id,quota,used_quota,status,role,remark,inviter_id FROM users WHERE inviter_id=0 ORDER BY id').all();
       const build = (n) => {
-        const kids = db.prepare('SELECT id,username,agent_level,agent_name,quota,used_quota,status,role,remark,inviter_id FROM users WHERE inviter_id=? ORDER BY id').all(n.id);
+        const kids = db.prepare('SELECT id,username,agent_level,agent_name,agent_channel_id,quota,used_quota,status,role,remark,inviter_id FROM users WHERE inviter_id=? ORDER BY id').all(n.id);
         return { ...n, children: kids.map(build) };
       };
       return json(res, 200, { success: true, data: roots.map(build) });

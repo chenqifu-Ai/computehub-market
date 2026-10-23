@@ -1787,6 +1787,18 @@ async function loadTeam() {
   const j = await api('/api/agent/team');
   if (!j.success) { $('teamBody').innerHTML = `<tr><td colspan="9" class="empty">${esc(j.message)}</td></tr>`; return; }
   const d = j.data, s = d.stats, by = s.byDepth || {};
+  // 专线横幅：我或祖代理设置的指定渠道 + 我自己若为代理是否有自设专线
+  const pinBanner = $('tmPinBanner');
+  if (pinBanner) {
+    const pc = d.pinned_channel;
+    if (pc) {
+      pinBanner.classList.remove('hidden');
+      const who = pc.is_owner ? '你（本代理）' : `上级代理「${esc(pc.owner_name)}」`;
+      pinBanner.innerHTML = `🔌 <b>生效专线</b>：${who}指定的渠道「<b>${esc(pc.channel_name)}</b>」· 名下所有调用强制走此渠道 · ${pc.status === 1 ? '<span class="tag on">渠道正常</span>' : '<span class="tag off">渠道已禁用（调用将报错）</span>'} · 可用模型 ${pc.models_allowed.length} 个`;
+    } else {
+      pinBanner.classList.add('hidden');
+    }
+  }
   $('tmDirect').textContent = s.direct;
   $('tmTotal').textContent = s.total;
   $('tmReward').textContent = fmtUsd(s.reward_total);
@@ -1810,6 +1822,7 @@ async function loadTeam() {
           <span class="tlevel">${n.agent_level ? 'L' + n.agent_level + (n.agent_name ? ' · ' + esc(n.agent_name) : '') : '普通用户'}</span>
           <span class="tmeta">ID ${n.id}</span>
           <span class="tmeta">余额 ${fmtUsd(n.quota || 0)} | 已用 ${fmtUsd(n.used_quota || 0)}</span>
+          ${n.effective_channel ? `<span class="tag on" title="由${esc(n.effective_channel.owner_name)}设置">🔌 ${esc(n.effective_channel.channel_name)}</span>` : ''}
           ${n.id !== d.me.id ? `<button class="btn-ghost sm" onclick="openTransfer(${n.id},'${esc(n.username)}')">💰划转</button>` : ''}
         </div>
         ${hasKids ? `<div class="tree-children">${kids.map(rnode).join('')}</div>` : ''}
@@ -1818,12 +1831,13 @@ async function loadTeam() {
     $('teamTreeBox').innerHTML = st ? rnode(st) : '<div class="empty">暂无团队</div>';
     initTreeCollapse('teamTreeBox');
   }
-  if (!d.downline.length) { $('teamBody').innerHTML = '<tr><td colspan="9" class="empty">暂无下级成员</td></tr>'; return; }
+  if (!d.downline.length) { $('teamBody').innerHTML = '<tr><td colspan="10" class="empty">暂无下级成员</td></tr>'; return; }
   $('teamBody').innerHTML = d.downline.map(m => `
     <tr>
       <td>${m.id}</td><td>${esc(m.username)}</td>
       <td><span class="tree-badge">L${m.depth}</span></td>
       <td>${m.agent_level ? ('L' + m.agent_level + ' ' + esc(m.agent_name || '')) : '—'}</td>
+      <td>${m.effective_channel ? `<span class="tag on" title="由${esc(m.effective_channel.owner_name)}设置，深度${m.effective_channel.depth}">🔌 ${esc(m.effective_channel.channel_name)}</span>` : '<span class="muted">通用路由</span>'}</td>
       <td>${fmtUsd(m.quota)}</td><td>${fmtUsd(m.used_quota)}</td><td>${fmtMe(m.request_count)}</td>
       <td><span class="tag ${m.status === 1 ? 'on' : 'off'}">${m.status === 1 ? '正常' : '禁用'}</span></td>
       <td class="actions">${m.depth === 1 ? `<button class="btn-ghost sm" onclick="reassignDown(${m.id},'${esc(m.username)}')">切层级</button>` : ''}<button class="btn-ghost sm" onclick="openTransfer(${m.id},'${esc(m.username)}')">💰划转</button></td>
@@ -1890,6 +1904,10 @@ async function saveReassign(id) {
 async function loadAgentTree() {
   const j = await api('/api/admin/agent/tree');
   if (!j.success) { $('treeBox').innerHTML = `<div class="empty">${esc(j.message)}</div>`; return; }
+  // 渠道缓存：代理树上显示「指定渠道」名称
+  if (!CH_LIST.length) { try { const cc = await api('/api/channel/'); if (cc.success) CH_LIST = cc.data; } catch {} }
+  const chNames = {};
+  CH_LIST.forEach(c => chNames[c.id] = c.name);
   const st = await api('/api/settings');
   if (st.success) {
     $('cfgR1').textContent = (parseFloat(st.data.invite_reward_rate || 0) * 100).toFixed(0) + '%';
@@ -1907,6 +1925,7 @@ async function loadAgentTree() {
           : '<span class="tree-toggle empty">·</span>'}
         <span class="tname">${esc(n.username)}</span>
         <span class="tlevel">${n.agent_level ? '代理L' + n.agent_level + (n.agent_name ? ' · ' + esc(n.agent_name) : '') : '普通用户'}</span>
+        ${n.agent_channel_id ? `<span class="tag on" title="名下调用强制走此渠道">🔌 ${esc(chNames[n.agent_channel_id] || ('渠道#' + n.agent_channel_id))}</span>` : ''}
         <span class="tmeta">ID ${n.id}</span>
         ${n.quota !== undefined ? `<span class="tmeta">余额 ${fmtUsd(n.quota)} | 已用 ${fmtUsd(n.used_quota || 0)}</span>` : ''}
         <button class="btn-ghost sm" onclick="downloadSettle(${n.id})">结算</button>
