@@ -100,10 +100,14 @@ function tokenFromReq(req) {
   const u = new URL(req.url, 'http://x');
   return u.searchParams.get('token');
 }
-function requireUser(req, res) {
+function requireUser(req, res, opts = {}) {
   const t = tokenFromReq(req);
   const s = store.getSession(db, t);
-  if (!s) { json(res, 401, { success: false, message: '未登录或会话已过期' }); return null; }
+  if (!s) {
+    if (opts.silent) return null;   // 供公开接口可选读取登录态：未登录不拦
+    json(res, 401, { success: false, message: '未登录或会话已过期' });
+    return null;
+  }
   return store.getUserById(db, s.user_id);
 }
 
@@ -233,21 +237,7 @@ const server = http.createServer(async (req, res) => {
       const u = requireUser(req, res); if (!u) return;
       // 生效「指定渠道」：沿邀请链向上找最近的代理指派（普通用户也能看到自己走哪条线）
       let pinned = null;
-      try {
-        const p = store.agentChannelForUser(db, u.id);
-        if (p) {
-          const ch = store.getChannel(db, p.channel_id);
-          if (ch) {
-            // 渠道支持的对外模型名 = models 列表 + model_mapping 的键
-            const allowed = new Set();
-            (ch.models || '').split(',').map(s => s.trim()).filter(Boolean).forEach(m => allowed.add(m));
-            try { Object.keys(JSON.parse(ch.model_mapping || '{}')).forEach(m => allowed.add(m)); } catch {}
-            pinned = { channel_id: ch.id, channel_name: ch.name, status: ch.status,
-              owner_id: p.owner_id, owner_name: p.owner_name, depth: p.depth,
-              is_owner: p.owner_id === u.id, models_allowed: [...allowed] };
-          }
-        }
-      } catch {}
+      try { pinned = store.pinnedChannelInfo(db, u.id); } catch {}
       return json(res, 200, { success: true, data: store.publicUser(db, u), pinned_channel: pinned });
     }
     if (pathname === '/api/user/update' && req.method === 'POST') {
@@ -342,20 +332,7 @@ const server = http.createServer(async (req, res) => {
       const u = requireUser(req, res); if (!u) return;
       // 生效指定渠道（自己或祖代理设置的）：代理中心展示「我的专属专线」
       let pinned = null;
-      try {
-        const p = store.agentChannelForUser(db, u.id);
-        if (p) {
-          const ch = store.getChannel(db, p.channel_id);
-          if (ch) {
-            const allowed = new Set();
-            (ch.models || '').split(',').map(s => s.trim()).filter(Boolean).forEach(m => allowed.add(m));
-            try { Object.keys(JSON.parse(ch.model_mapping || '{}')).forEach(m => allowed.add(m)); } catch {}
-            pinned = { channel_id: ch.id, channel_name: ch.name, status: ch.status,
-              owner_id: p.owner_id, owner_name: p.owner_name, depth: p.depth,
-              is_owner: p.owner_id === u.id, models_allowed: [...allowed] };
-          }
-        }
-      } catch {}
+      try { pinned = store.pinnedChannelInfo(db, u.id); } catch {}
       return json(res, 200, {
         success: true,
         data: {
@@ -366,8 +343,8 @@ const server = http.createServer(async (req, res) => {
             const withChan = (n) => {
               let ep = null;
               try {
-                const p = store.agentChannelForUser(db, n.id);
-                if (p) { const c = store.getChannel(db, p.channel_id); if (c) ep = { channel_id: c.id, channel_name: c.name, owner_name: p.owner_name, depth: p.depth }; }
+                const p = store.pinnedChannelInfo(db, n.id);
+                if (p) ep = { channel_id: p.channel_id, channel_name: p.channel_name, owner_name: p.owner_name, depth: p.depth };
               } catch {}
               return { ...n, effective_channel: ep, children: (n.children || []).map(withChan) };
             };
@@ -380,8 +357,8 @@ const server = http.createServer(async (req, res) => {
           downline: store.listDownline(db, u.id, { maxDepth: 5 }).map(m => {
             let ep = null;
             try {
-              const p = store.agentChannelForUser(db, m.id);
-              if (p) { const c = store.getChannel(db, p.channel_id); if (c) ep = { channel_id: c.id, channel_name: c.name, owner_name: p.owner_name, depth: p.depth }; }
+              const p = store.pinnedChannelInfo(db, m.id);
+              if (p) ep = { channel_id: p.channel_id, channel_name: p.channel_name, owner_name: p.owner_name, depth: p.depth };
             } catch {}
             return { ...m, effective_channel: ep };
           }),
@@ -676,12 +653,24 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---------- 模型 / 渠道（对外目录：不含密钥） ----------
+    // 专线用户（代理指定渠道）只见专线支持的模型；控制台目录页与 /v1/models 口径一致
+    // 接口公开可访问：未登录（无 u）= 全量目录；登录用户若有生效专线则按专线裁剪
     if (pathname === '/api/models') {
-      return json(res, 200, { success: true, data: store.publicModelCatalog(db) });
+      const me = requireUser(req, res, { silent: true });   // 未登录不挡，返回 null
+      const pin = me ? store.pinnedChannelInfo(db, me.id) : null;
+      const cat = store.publicModelCatalog(db);
+      const models = pin && pin.status === 1 ? pin.models_allowed : cat.models;
+      return json(res, 200, { success: true, data: { models, count: models.length, groups: ['default'], object: 'list',
+        pinned: pin && pin.status === 1 ? { channel_id: pin.channel_id, channel_name: pin.channel_name, owner_name: pin.owner_name } : null } });
     }
     if (pathname === '/api/pricing') {
       // 模型目录：渠道聚合出的在售模型 + billing 真实价（未定价的标 priced=false，走 default）
-      const list = store.pricingCatalog(db).map(x => {
+      // 专线用户只看专线支持模型的价格；未登录全量
+      const me = requireUser(req, res, { silent: true });
+      const pin = me ? store.pinnedChannelInfo(db, me.id) : null;
+      const allowSet = pin && pin.status === 1 ? new Set(pin.models_allowed) : null;
+      const listRaw = store.pricingCatalog(db).filter(x => !allowSet || allowSet.has(x.model));
+      const list = listRaw.map(x => {
         const p = billing.priceOf(x.model);
         return { ...x, input: p.input, output: p.output, cached: p.cached, peak: p.peak,
                  peak_now: billing.peakMultiplier(x.model), priced: billing.isPriced(x.model) };

@@ -128,15 +128,9 @@ async function handle(ctx, req, res, pathname, query) {
     if (a.err) return ctx.json(res, a.code, { error: { message: a.err, type: 'invalid_request_error' } });
     let models;
     // 代理指定渠道：目录只展示该专线支持的模型（避免选了模型却被专线拒收 503）
-    const pin = ctx.store.agentChannelForUser(ctx.db, a.user.id);
-    if (pin) {
-      const ch = ctx.store.getChannel(ctx.db, pin.channel_id);
-      const set = new Set();
-      if (ch && ch.status === 1) {
-        (ch.models || '').split(',').map(s => s.trim()).filter(Boolean).forEach(m => set.add(m));
-        try { Object.keys(JSON.parse(ch.model_mapping || '{}')).forEach(m => set.add(m)); } catch {}
-      }
-      models = [...set].sort();
+    const pinCh = ctx.store.pinnedChannelInfo(ctx.db, a.user.id);
+    if (pinCh && pinCh.status === 1) {
+      models = pinCh.models_allowed.slice().sort();
     } else {
       const cat = ctx.store.publicModelCatalog(ctx.db);
       models = cat.models;

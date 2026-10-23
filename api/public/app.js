@@ -400,6 +400,17 @@ async function loadModels() {
   (p.success ? p.data : []).forEach(x => priceMap[x.model] = x);
   allModels = m.data.models.map(name => ({ name, ...(priceMap[name] || {}) }));
   $('modelCount').textContent = allModels.length + ' 个';
+  // 专线用户：目录顶横幅提示「你走的是指定渠道，目录已按专线裁剪」
+  const pinBox = $('modelPinBanner');
+  if (pinBox) {
+    const pin = m.data.pinned;
+    if (pin) {
+      pinBox.classList.remove('hidden');
+      pinBox.innerHTML = `🔌 <b>你所在的团队使用指定渠道「${esc(pin.channel_name)}」</b>（由 ${esc(pin.owner_name)} 设定），模型目录已按该渠道裁剪；不在列表中的模型将无法调用。`;
+    } else {
+      pinBox.classList.add('hidden');
+    }
+  }
   if (p.success && p.default && $('defaultPrice')) {
     $('defaultPrice').textContent = `（默认 $${fmtPrice(p.default.input)} / $${fmtPrice(p.default.output)}）`;
   }

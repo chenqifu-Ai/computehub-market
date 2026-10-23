@@ -510,6 +510,28 @@ function publicChannelView(c) {
   return { ...rest, api_key: maskKey(c.api_key || ''), base_url_masked: true };
 }
 function getChannel(db, id) { return db.prepare('SELECT * FROM channels WHERE id=?').get(id) || null; }
+/** 渠道对外可用模型名（models 字段 + model_mapping 键），已禁用返回空 */
+function channelPublicModels(db, channelId) {
+  const c = getChannel(db, channelId);
+  if (!c || c.status !== 1) return [];
+  const set = new Set();
+  (c.models || '').split(',').map(s => s.trim()).filter(Boolean).forEach(m => set.add(m));
+  try { Object.keys(JSON.parse(c.model_mapping || '{}')).forEach(m => set.add(m)); } catch {}
+  return [...set].sort();
+}
+/** 用户「生效指定渠道」完整信息（含可用模型名）；无专线/渠道已删返回 null */
+function pinnedChannelInfo(db, userId) {
+  const p = agentChannelForUser(db, userId);
+  if (!p) return null;
+  const ch = getChannel(db, p.channel_id);
+  if (!ch) return null;
+  return {
+    channel_id: ch.id, channel_name: ch.name, status: ch.status,
+    owner_id: p.owner_id, owner_name: p.owner_name, depth: p.depth,
+    is_owner: p.owner_id === userId,
+    models_allowed: channelPublicModels(db, p.channel_id),
+  };
+}
 function addChannelUsage(db, id, quota) {
   db.prepare('UPDATE channels SET used_quota = used_quota + ? WHERE id=?').run(quota, id);
 }
@@ -1272,6 +1294,7 @@ module.exports = {
   createSession, getSession, deleteSession,
   createToken, getToken, getTokenByPlain, listTokens, updateToken, deleteToken, touchToken, addTokenUsage,
   listChannels, listChannelsRaw, getChannel, publicChannelView, channelsForModel, addChannelUsage,
+  channelPublicModels, pinnedChannelInfo,
   addChannel, updateChannel, deleteChannel, touchChannel,
   publicModelCatalog, pricingCatalog, maskKey,
   insertLog, listLogs, logStatsByModel, exportLogs, exportLogsIter, exportSummary,
