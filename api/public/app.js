@@ -1915,7 +1915,7 @@ async function saveReassign(id) {
 async function loadAgentTree() {
   const j = await api('/api/admin/agent/tree');
   if (!j.success) { $('treeBox').innerHTML = `<div class="empty">${esc(j.message)}</div>`; return; }
-  // 渠道缓存：代理树上显示「指定渠道」名称
+  // 渠道缓存：代理树上显示「指定渠道」名称（多选）
   if (!CH_LIST.length) { try { const cc = await api('/api/channel/'); if (cc.success) CH_LIST = cc.data; } catch {} }
   const chNames = {};
   CH_LIST.forEach(c => chNames[c.id] = c.name);
@@ -1936,11 +1936,11 @@ async function loadAgentTree() {
           : '<span class="tree-toggle empty">·</span>'}
         <span class="tname">${esc(n.username)}</span>
         <span class="tlevel">${n.agent_level ? '代理L' + n.agent_level + (n.agent_name ? ' · ' + esc(n.agent_name) : '') : '普通用户'}</span>
-        ${n.agent_channel_id ? `<span class="tag on" title="名下调用强制走此渠道">🔌 ${esc(chNames[n.agent_channel_id] || ('渠道#' + n.agent_channel_id))}</span>` : ''}
+        ${(() => { const ids = String(n.agent_channel_ids || '').split(',').map(s=>parseInt(s,10)).filter(x=>x>0); return ids.length ? `<span class="tag on" title="名下调用强制走这些渠道">🔌 ${ids.map(i => esc(chNames[i] || ('渠道#' + i))).join(' + ')}</span>` : ''; })()}
         <span class="tmeta">ID ${n.id}</span>
         ${n.quota !== undefined ? `<span class="tmeta">余额 ${fmtUsd(n.quota)} | 已用 ${fmtUsd(n.used_quota || 0)}</span>` : ''}
         <button class="btn-ghost sm" onclick="downloadSettle(${n.id})">结算</button>
-        <button class="btn-ghost sm" onclick="editAgent(${n.id},'${esc(n.username)}',${n.agent_level || 0},'${esc(n.agent_name || '')}',${n.agent_channel_id || 0})">设置</button>
+        <button class="btn-ghost sm" onclick="editAgent(${n.id},'${esc(n.username)}',${n.agent_level || 0},'${esc(n.agent_name || '')}','${esc(n.agent_channel_ids || '')}')">设置</button>
       </div>
       ${hasKids ? `<div class="tree-children">${kids.map(c => render(c, lvl + 1)).join('')}</div>` : ''}
     </div>`;
@@ -2014,12 +2014,15 @@ function doAgentSettleExport() {
   downloadAuthed(qs, '正在导出全部代理结算清单（' + scopeTxt + '）…');
 }
 
-async function editAgent(id, name, level, aname, chId) {
+async function editAgent(id, name, level, aname, chIdsStr) {
   if (!CH_LIST.length) {
     try { const jc = await api('/api/channel/'); if (jc.success) CH_LIST = jc.data; } catch (e) {}
   }
+  // 已选渠道（多选兼容：新多选串优先，回退旧单选值）
+  const selIds = String(chIdsStr || '').split(',').map(s => parseInt(s, 10)).filter(n => n > 0);
+  const selSet = new Set(selIds);
   const chOpts = CH_LIST.map(c =>
-    `<option value="${c.id}" data-cname="${esc(c.name)}" ${Number(chId) === c.id ? 'selected' : ''}>#${c.id} ${esc(c.name)}${c.status === 1 ? '' : '（已禁用）'}</option>`).join('');
+    `<label class="chk-line" style="display:flex;align-items:center;gap:8px;padding:4px 2px"><input type="checkbox" class="agChk" value="${c.id}" ${selSet.has(c.id) ? 'checked' : ''}> <span>#${c.id} ${esc(c.name)}${c.status === 1 ? '' : ' <span class="tag off">已禁用</span>'}</span></label>`).join('');
   openModal(`
     <h3>设置代理「${esc(name)}」(ID ${id})</h3>
     <label>上级用户 ID（0 = 无上级/平台直营）</label>
@@ -2033,24 +2036,27 @@ async function editAgent(id, name, level, aname, chId) {
     </select>
     <label>代理名称（可选）</label>
     <input id="agName" value="${esc(aname || '')}" placeholder="例如：杭州联登科技">
-    <label>指定渠道供应商（该代理名下调用强制走此渠道）</label>
-    <select id="agChannel">
-      <option value="0" ${!chId ? 'selected' : ''}>— 不指定（走通用路由：优先级+权重+故障转移）—</option>
+    <label>指定渠道供应商（可多选；该代理名下调用强制在这组渠道内路由）</label>
+    <div style="max-height:180px;overflow:auto;border:1px solid var(--bd);border-radius:8px;padding:6px 10px">
       ${chOpts}
-    </select>
-    <p class="muted" style="font-size:12px">指定后，此代理及其名下所有成员的请求只会走该渠道；若该渠道不支持所请求的模型或已熔断，将直接报错（不会回退到其他渠道）。</p>
+    </div>
+    <div style="display:flex;gap:6px;margin-top:4px">
+      <button type="button" class="btn-ghost sm" onclick="document.querySelectorAll('.agChk').forEach(x=>x.checked=false)">全不选</button>
+    </div>
+    <p class="muted" style="font-size:12px">勾选 1 条 = 独占专线；勾选多条 = 该代理名下请求只在这几条渠道内按优先级+权重路由（可互相故障转移）；全不选 = 走通用路由。组的模型目录 = 各渠道模型的并集。</p>
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closeModal()">取消</button>
       <button class="btn-primary" onclick="saveAgent(${id})">保存</button>
     </div>`);
 }
 async function saveAgent(id) {
+  const ids = [...document.querySelectorAll('.agChk:checked')].map(x => parseInt(x.value, 10)).filter(n => n > 0);
   const b = {
     user_id: id,
     inviter_id: parseInt($('agUp').value || '0', 10),
     agent_level: parseInt($('agLevel').value, 10),
     agent_name: $('agName').value.trim(),
-    agent_channel_id: parseInt(($('agChannel') && $('agChannel').value) || '0', 10),
+    agent_channel_ids: ids,
   };
   const j = await api('/api/admin/agent/set', { method: 'POST', body: JSON.stringify(b) });
   if (!j.success) return toast(j.message, 'err');

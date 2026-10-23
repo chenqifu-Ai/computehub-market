@@ -344,7 +344,7 @@ const server = http.createServer(async (req, res) => {
               let ep = null;
               try {
                 const p = store.pinnedChannelInfo(db, n.id);
-                if (p) ep = { channel_id: p.channel_id, channel_name: p.channel_name, owner_name: p.owner_name, depth: p.depth };
+                if (p) ep = { channel_id: p.channel_id, channel_id_list: p.channel_ids, channel_name: p.channel_name, channel_names: p.channel_names, owner_name: p.owner_name, depth: p.depth };
               } catch {}
               return { ...n, effective_channel: ep, children: (n.children || []).map(withChan) };
             };
@@ -358,7 +358,7 @@ const server = http.createServer(async (req, res) => {
             let ep = null;
             try {
               const p = store.pinnedChannelInfo(db, m.id);
-              if (p) ep = { channel_id: p.channel_id, channel_name: p.channel_name, owner_name: p.owner_name, depth: p.depth };
+              if (p) ep = { channel_id: p.channel_id, channel_id_list: p.channel_ids, channel_name: p.channel_name, channel_names: p.channel_names, owner_name: p.owner_name, depth: p.depth };
             } catch {}
             return { ...m, effective_channel: ep };
           }),
@@ -370,9 +370,9 @@ const server = http.createServer(async (req, res) => {
       const u = requireUser(req, res); if (!u) return;
       if (!store.isAdmin(u)) return json(res, 403, { success: false, message: '需要管理员权限' });
       // 根节点 = 无上级的用户
-      const roots = db.prepare('SELECT id,username,agent_level,agent_name,agent_channel_id,quota,used_quota,status,role,remark,inviter_id FROM users WHERE inviter_id=0 ORDER BY id').all();
+      const roots = db.prepare('SELECT id,username,agent_level,agent_name,agent_channel_id,agent_channel_ids,quota,used_quota,status,role,remark,inviter_id FROM users WHERE inviter_id=0 ORDER BY id').all();
       const build = (n) => {
-        const kids = db.prepare('SELECT id,username,agent_level,agent_name,agent_channel_id,quota,used_quota,status,role,remark,inviter_id FROM users WHERE inviter_id=? ORDER BY id').all(n.id);
+        const kids = db.prepare('SELECT id,username,agent_level,agent_name,agent_channel_id,agent_channel_ids,quota,used_quota,status,role,remark,inviter_id FROM users WHERE inviter_id=? ORDER BY id').all(n.id);
         return { ...n, children: kids.map(build) };
       };
       return json(res, 200, { success: true, data: roots.map(build) });
@@ -389,12 +389,14 @@ const server = http.createServer(async (req, res) => {
         const r = store.setInviterSafe(db, uid, parseInt(b.inviter_id || 0, 10));
         if (!r.ok) return json(res, 400, { success: false, message: r.message });
       }
-      if (b.agent_level !== undefined || b.agent_name !== undefined || b.agent_channel_id !== undefined) {
-        store.setAgentInfo(db, uid, { agent_level: b.agent_level, agent_name: b.agent_name, agent_channel_id: b.agent_channel_id });
+      if (b.agent_level !== undefined || b.agent_name !== undefined || b.agent_channel_ids !== undefined || b.agent_channel_id !== undefined) {
+        store.setAgentInfo(db, uid, { agent_level: b.agent_level, agent_name: b.agent_name, agent_channel_ids: b.agent_channel_ids });
       }
       const after = store.getUserById(db, uid);
       // 审计
-      if (before.inviter_id !== after.inviter_id || before.agent_level !== after.agent_level || before.agent_name !== after.agent_name || (before.agent_channel_id || 0) !== (after.agent_channel_id || 0)) {
+      const chChanged = (b.agent_channel_ids !== undefined || b.agent_channel_id !== undefined) &&
+        (String(after.agent_channel_ids || '') !== String(before.agent_channel_ids || '') || (before.agent_channel_id || 0) !== (after.agent_channel_id || 0));
+      if (chChanged) {
         const oi = before.inviter_id ? store.getUserById(db, before.inviter_id) : null;
         const ni = after.inviter_id ? store.getUserById(db, after.inviter_id) : null;
         store.addAgentAudit(db, {
@@ -405,7 +407,7 @@ const server = http.createServer(async (req, res) => {
           op_user_id: u.id, op_username: u.username, op_role: '管理员', ip: clientIp(req),
         });
       }
-      console.log(`[agent] ${u.username} 设置 uid=${uid} inviter=${b.inviter_id ?? '-'} level=${b.agent_level ?? '-'} channel=${b.agent_channel_id ?? '-'}`);
+      console.log(`[agent] ${u.username} 设置 uid=${uid} inviter=${b.inviter_id ?? '-'} level=${b.agent_level ?? '-'} channels=${after.agent_channel_ids || '-'}`);
       return json(res, 200, { success: true, data: store.publicUser(db, after) });
     }
 
@@ -661,7 +663,7 @@ const server = http.createServer(async (req, res) => {
       const cat = store.publicModelCatalog(db);
       const models = pin && pin.status === 1 ? pin.models_allowed : cat.models;
       return json(res, 200, { success: true, data: { models, count: models.length, groups: ['default'], object: 'list',
-        pinned: pin && pin.status === 1 ? { channel_id: pin.channel_id, channel_name: pin.channel_name, owner_name: pin.owner_name } : null } });
+        pinned: pin && pin.status === 1 ? { channel_ids: pin.channel_ids, channel_names: pin.channel_names, channel_name: pin.channel_name, owner_name: pin.owner_name } : null } });
     }
     if (pathname === '/api/pricing') {
       // 模型目录：渠道聚合出的在售模型 + billing 真实价（未定价的标 priced=false，走 default）

@@ -204,8 +204,14 @@ function migrate(db) {
   if (!cols.includes('reward_l1')) db.exec('ALTER TABLE users ADD COLUMN reward_l1 INTEGER NOT NULL DEFAULT 0');
   if (!cols.includes('reward_l2')) db.exec('ALTER TABLE users ADD COLUMN reward_l2 INTEGER NOT NULL DEFAULT 0');
   if (!cols.includes('reward_l3')) db.exec('ALTER TABLE users ADD COLUMN reward_l3 INTEGER NOT NULL DEFAULT 0');
-  // 代理指定渠道供应商：该代理（及其名下）的调用强制走此渠道（0=不指定，走通用路由）
+  // 代理指定渠道供应商：该代理（及其名下）的调用强制走这些渠道（空=不指定，走通用路由）
+  // 【2026-10-23 多选】新增 agent_channel_ids（TEXT，逗号分隔渠道ID）；兼容旧 agent_channel_id（单选值自动迁入）
   if (!cols.includes('agent_channel_id')) db.exec('ALTER TABLE users ADD COLUMN agent_channel_id INTEGER NOT NULL DEFAULT 0');
+  if (!cols.includes('agent_channel_ids')) {
+    db.exec('ALTER TABLE users ADD COLUMN agent_channel_ids TEXT NOT NULL DEFAULT ""');
+    // 幂等迁移：把旧单选值搬进多选字段（只处理多选字段还是空的行）
+    db.exec("UPDATE users SET agent_channel_ids = CAST(agent_channel_id AS TEXT) WHERE agent_channel_id > 0 AND (agent_channel_ids = '' OR agent_channel_ids IS NULL)");
+  }
 
   // logs 增量迁移：记录类型（consume/recharge/reward/system/admin）
   const lcols = db.prepare('PRAGMA table_info(logs)').all().map(c => c.name);
@@ -290,6 +296,7 @@ function publicUser(db, u) {
     agent_level: u.agent_level || 0,
     agent_name: u.agent_name || '',
     agent_channel_id: u.role >= 100 ? (u.agent_channel_id || 0) : 0,   // 渠道指派仅管理员可见
+    agent_channel_ids: u.role >= 100 ? String(u.agent_channel_ids || '') : '',   // 多选专线（admin 可见）
     remark: u.remark,
     created_at: u.created_at,
   };
@@ -519,17 +526,28 @@ function channelPublicModels(db, channelId) {
   try { Object.keys(JSON.parse(c.model_mapping || '{}')).forEach(m => set.add(m)); } catch {}
   return [...set].sort();
 }
-/** 用户「生效指定渠道」完整信息（含可用模型名）；无专线/渠道已删返回 null */
+/** 多个渠道的可用模型并集（排序） */
+function channelsUnionModels(db, channelIds) {
+  const set = new Set();
+  for (const id of (channelIds || [])) channelPublicModels(db, id).forEach(m => set.add(m));
+  return [...set].sort();
+}
+/** 用户「生效指定渠道组」完整信息（含可用模型并集）；无专线/渠道全删返回 null */
 function pinnedChannelInfo(db, userId) {
   const p = agentChannelForUser(db, userId);
-  if (!p) return null;
-  const ch = getChannel(db, p.channel_id);
-  if (!ch) return null;
+  if (!p || !p.channel_ids.length) return null;
+  // 过滤掉已不存在的渠道；全部不存在才返回 null
+  const chans = p.channel_ids.map(id => getChannel(db, id)).filter(Boolean);
+  if (!chans.length) return null;
   return {
-    channel_id: ch.id, channel_name: ch.name, status: ch.status,
+    channel_ids: chans.map(c => c.id),
+    channel_names: chans.map(c => c.name),
+    // 单渠道兼容字段（前端旧渲染）
+    channel_id: chans[0].id, channel_name: chans.map(c => c.name).join(' + '),
+    status: chans.some(c => c.status === 1) ? 1 : 0,
     owner_id: p.owner_id, owner_name: p.owner_name, depth: p.depth,
     is_owner: p.owner_id === userId,
-    models_allowed: channelPublicModels(db, p.channel_id),
+    models_allowed: channelsUnionModels(db, chans.filter(c => c.status === 1).map(c => c.id)),
   };
 }
 function addChannelUsage(db, id, quota) {
@@ -568,6 +586,22 @@ function touchChannel(db, id) { db.prepare('UPDATE channels SET tested_at=? WHER
 function channelsForModel(db, model, onlyChannelId) {
   let all = listChannelsRaw(db).filter(c => c.status === 1);
   if (onlyChannelId) all = all.filter(c => c.id === parseInt(onlyChannelId, 10));
+  const hit = [];
+  for (const c of all) {
+    let list = [];
+    try { list = c.models ? c.models.split(',').map(s => s.trim()).filter(Boolean) : []; } catch {}
+    let map = {};
+    try { map = c.model_mapping ? JSON.parse(c.model_mapping) : {}; } catch {}
+    const names = new Set([...list, ...Object.keys(map)]);
+    if (names.size === 0 || names.has(model)) hit.push(c);
+  }
+  return hit;
+}
+/** 多渠道版本（代理多选专线）：只在指定渠道组内选可用渠道；空数组/null = 不限 */
+function channelsForModelMulti(db, model, onlyChannelIds) {
+  const ids = (onlyChannelIds || []).map(n => parseInt(n, 10)).filter(n => n > 0);
+  if (!ids.length) return channelsForModel(db, model, 0);
+  let all = listChannelsRaw(db).filter(c => c.status === 1 && ids.includes(c.id));
   const hit = [];
   for (const c of all) {
     let list = [];
@@ -913,25 +947,43 @@ function setInviterSafe(db, userId, inviterId) {
   db.prepare('UPDATE users SET inviter_id=? WHERE id=?').run(inviterId || 0, userId);
   return { ok: true };
 }
-/** 设置代理等级/名称/指定渠道 */
-function setAgentInfo(db, userId, { agent_level, agent_name, agent_channel_id }) {
+/** 设置代理等级/名称/指定渠道（支持多选：agent_channel_ids 数组或逗号串；清理时同步旧字段） */
+function setAgentInfo(db, userId, { agent_level, agent_name, agent_channel_id, agent_channel_ids }) {
   const f = [], v = [];
   if (agent_level !== undefined) { f.push('agent_level=?'); v.push(parseInt(agent_level, 10) || 0); }
   if (agent_name !== undefined) { f.push('agent_name=?'); v.push(String(agent_name)); }
-  if (agent_channel_id !== undefined) { f.push('agent_channel_id=?'); v.push(parseInt(agent_channel_id, 10) || 0); }
+  if (agent_channel_ids !== undefined || agent_channel_id !== undefined) {
+    // 归一化：数组/逗号串 → 去重的正整数 ID 列表；旧单选字段取第一个作为兼容值
+    let ids = [];
+    const raw = agent_channel_ids !== undefined ? agent_channel_ids : agent_channel_id;
+    if (Array.isArray(raw)) ids = raw;
+    else if (raw !== undefined && raw !== null) ids = String(raw).split(',');
+    ids = [...new Set(ids.map(s => parseInt(s, 10)).filter(n => n > 0))];
+    f.push('agent_channel_ids=?'); v.push(ids.join(','));
+    f.push('agent_channel_id=?'); v.push(ids[0] || 0);   // 旧字段兼容存首个
+  }
   if (f.length) { v.push(userId); db.prepare(`UPDATE users SET ${f.join(',')} WHERE id=?`).run(...v); }
   return getUserById(db, userId);
 }
 
 /**
- * 解析某用户「生效的指定渠道」：从自己沿 inviter_id 链向上，取最近一个设了 agent_channel_id 的代理。
- * 返回 { channel_id, owner_id, owner_name, depth }（自己 depth=0）或 null。
+ * 解析某用户「生效的指定渠道组」：从自己沿 inviter_id 链向上，取最近一个设了指定渠道的代理。
+ * 返回 { channel_ids:[id,...], owner_id, owner_name, depth }（自己 depth=0）或 null。
+ * 兼容旧单选字段 agent_channel_id（多选字段为空时回读旧值）。
  */
 function agentChannelForUser(db, userId, maxDepth = 6) {
   let cur = getUserById(db, userId);
   for (let d = 0; cur && d <= maxDepth; d++) {
-    const cid = parseInt(cur.agent_channel_id, 10) || 0;
-    if (cid > 0) return { channel_id: cid, owner_id: cur.id, owner_name: cur.username, depth: d };
+    let ids = [];
+    const multi = String(cur.agent_channel_ids || '').trim();
+    if (multi) {
+      ids = multi.split(',').map(s => parseInt(s, 10)).filter(n => n > 0);
+    } else {
+      const single = parseInt(cur.agent_channel_id, 10) || 0;
+      if (single > 0) ids = [single];
+    }
+    ids = [...new Set(ids)];
+    if (ids.length) return { channel_ids: ids, owner_id: cur.id, owner_name: cur.username, depth: d };
     if (!cur.inviter_id) break;
     cur = getUserById(db, cur.inviter_id);
   }
@@ -995,6 +1047,7 @@ function subtreeOf(db, userId, maxDepth = 5) {
       id: u.id, username: u.username, agent_level: u.agent_level, agent_name: u.agent_name,
       quota: u.quota, used_quota: u.used_quota, request_count: u.request_count, status: u.status,
       agent_channel_id: u.role >= 100 ? (u.agent_channel_id || 0) : 0,
+      agent_channel_ids: u.role >= 100 ? String(u.agent_channel_ids || '') : '',
       depth, children: [],
     };
     if (depth < maxDepth) {
@@ -1067,6 +1120,7 @@ async function* exportUserBundleStream(db, userId, { logLimit = 0, operator = nu
       agent_level: u.agent_level || 0, agent_name: u.agent_name || '',
       reward_l1: u.reward_l1 || 0, reward_l2: u.reward_l2 || 0, reward_l3: u.reward_l3 || 0,
       agent_channel_id: u.agent_channel_id || 0,
+      agent_channel_ids: String(u.agent_channel_ids || ''),
       created_at: u.created_at,
     },
   });
@@ -1181,11 +1235,11 @@ async function importUserBundle(db, text, { mode = 'new', targetUserId = 0, opUs
       });
       newUserId = created.id;
       db.prepare(`UPDATE users SET status=?, aff_code=?, remark=?, invite_reward=?,
-        reward_l1=?, reward_l2=?, reward_l3=?, agent_channel_id=?, created_at=? WHERE id=?`).run(
+        reward_l1=?, reward_l2=?, reward_l3=?, agent_channel_id=?, agent_channel_ids=?, created_at=? WHERE id=?`).run(
         parseInt(u.status || 1, 10), String(u.aff_code || ''), String(u.remark || ''),
         parseInt(u.invite_reward || 0, 10),
         parseInt(u.reward_l1 || 0, 10), parseInt(u.reward_l2 || 0, 10), parseInt(u.reward_l3 || 0, 10),
-        parseInt(u.agent_channel_id || 0, 10), parseInt(u.created_at || Date.now(), 10), newUserId);
+        parseInt(u.agent_channel_id || 0, 10), String(u.agent_channel_ids || ''), parseInt(u.created_at || Date.now(), 10), newUserId);
     }
 
     // tokens（明文 key → 重算 hash）
@@ -1293,8 +1347,8 @@ module.exports = {
   setPassword: setPasswordReal, touchLogin, addUserUsage, addUserQuota, transferQuota, userDashboard,
   createSession, getSession, deleteSession,
   createToken, getToken, getTokenByPlain, listTokens, updateToken, deleteToken, touchToken, addTokenUsage,
-  listChannels, listChannelsRaw, getChannel, publicChannelView, channelsForModel, addChannelUsage,
-  channelPublicModels, pinnedChannelInfo,
+  listChannels, listChannelsRaw, getChannel, publicChannelView, channelsForModel, addChannelUsage, channelsForModelMulti,
+  channelPublicModels, pinnedChannelInfo, channelsUnionModels,
   addChannel, updateChannel, deleteChannel, touchChannel,
   publicModelCatalog, pricingCatalog, maskKey,
   insertLog, listLogs, logStatsByModel, exportLogs, exportLogsIter, exportSummary,
